@@ -1,0 +1,130 @@
+{
+  "2": {
+    "inputs": {
+      "analysis_mode": "balanced",
+      "seed": 231310302151835,
+      "director_selection_json": "{\"version\":1,\"blocks\":[{\"kind\":\"reference\",\"role\":\"character_a\",\"category\":\"character\",\"label\":\"Character A\"},{\"kind\":\"modifier\",\"category\":\"camera\",\"text\":\"low angle\",\"label\":\"Camera\"},{\"kind\":\"modifier\",\"category\":\"lighting\",\"text\":\"soft light\",\"label\":\"Lighting\"},{\"kind\":\"modifier\",\"category\":\"style\",\"text\":\"photoreal\",\"label\":\"Style\"}]}",
+      "clip": [
+        "5",
+        0
+      ],
+      "toobusy_bundle": [
+        "7",
+        0
+      ]
+    },
+    "class_type": "ToobusyFlux2KleinPromptDirector",
+    "_meta": {
+      "title": "toobusy Flux2 Klein Prompt Director"
+    }
+  },
+  "3": {
+    "inputs": {
+      "model_name": "FLUX2\\flux-2-klein-9b-kv-fp8.safetensors",
+      "clip_name": "qwenLayerwiseForKlein9b_fp8FP32.safetensors",
+      "vae_name": "flux2DevFP8GGUF_flux2DevVAE.safetensors",
+      "positive": "",
+      "size_mode": "from reference",
+      "ratio_preset": "1:1",
+      "megapixels": 1,
+      "divisible_by": 32,
+      "batch_size": 1,
+      "seed": 45326191073283,
+      "steps": 4,
+      "sampler_name": "euler",
+      "lora_slots": 0,
+      "reference_slots": 3,
+      "bundle_reference_order": "auto",
+      "lora_1_enable": false,
+      "lora_1_name": "None",
+      "lora_1_strength": 1,
+      "lora_2_enable": false,
+      "lora_2_name": "None",
+      "lora_2_strength": 1,
+      "lora_3_enable": false,
+      "lora_3_name": "None",
+      "lora_3_strength": 1,
+      "lora_4_enable": false,
+      "lora_4_name": "None",
+      "lora_4_strength": 1,
+      "lora_5_enable": false,
+      "lora_5_name": "None",
+      "lora_5_strength": 1,
+      "use_bundle_prompt": true,
+      "use_bundle_loras": true,
+      "width": 0,
+      "height": 0,
+      "toobusy_bundle": [
+        "8",
+        0
+      ]
+    },
+    "class_type": "ToobusyFlux2Klein",
+    "_meta": {
+      "title": "toobusy Flux2 Klein"
+    }
+  },
+  "4": {
+    "inputs": {
+      "filename_prefix": "ComfyUI",
+      "format": "png",
+      "format.bit_depth": "8-bit",
+      "format.input_color_space": "sRGB",
+      "images": [
+        "3",
+        0
+      ]
+    },
+    "class_type": "SaveImageAdvanced",
+    "_meta": {
+      "title": "Save Image (Advanced)"
+    }
+  },
+  "5": {
+    "inputs": {
+      "clip_name": "gemma4_e4b_it_fp8_scaled.safetensors",
+      "type": "stable_diffusion",
+      "device": "default"
+    },
+    "class_type": "CLIPLoader",
+    "_meta": {
+      "title": "Load CLIP"
+    }
+  },
+  "6": {
+    "inputs": {
+      "source": [
+        "2",
+        1
+      ]
+    },
+    "class_type": "PreviewAny",
+    "_meta": {
+      "title": "Preview as Text"
+    }
+  },
+  "7": {
+    "inputs": {
+      "board_json": "{\"version\":1,\"global_note\":\"\",\"items\":[]}"
+    },
+    "class_type": "ToobusyReferenceBoard",
+    "_meta": {
+      "title": "toobusy Reference Board"
+    }
+  },
+  "8": {
+    "inputs": {
+      "empty_cache": true,
+      "gc_collect": true,
+      "unload_all_models": true,
+      "any_input": [
+        "2",
+        0
+      ]
+    },
+    "class_type": "VRAM_Debug",
+    "_meta": {
+      "title": "VRAM Debug"
+    }
+  }
+}

@@ -1,0 +1,19 @@
+{
+  "telegram_token": "여기에_BotFather에서_받은_토큰",
+  "telegram_chat_id": 0,
+  "llm_model": "qwen3.5-35b-a3b-uncensored-hauhaucs-aggressive",
+  "comfy_api": "http://127.0.0.1:8188",
+  "lmstudio_api": "http://127.0.0.1:1234",
+  "comfy_output_dir": "",
+  "comfy_input_dir": "",
+  "send_upscaled": true,
+  "zit_lora": false,
+  "video_width": 0,
+  "dashboard_port": 8910,
+  "models": {
+    "zit": "ZIT\\zImageTurbo_turbo.safetensors",
+    "ltx_gguf": "LTX23\\ltx23DEVGGUFUnsloth_q4km.gguf",
+    "klein": "FLUX2\\flux-2-klein-9b-kv-fp8.safetensors",
+    "ace": "aceStepAudioGen_v15XLTurbo.safetensors"
+  }
+}

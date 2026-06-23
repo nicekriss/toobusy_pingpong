@@ -1,0 +1,157 @@
+```
+   🦗 너무바쁜베짱이 STUDIO 🦗
+   P I N G - P O N G   B O T
+   ░▒▓ made by 코다 & 크룩스 ▓▒░
+```
+
+# 🏓 핑퐁 봇 (VRAM Ping-Pong Bot)
+
+> **너무바쁜베짱이** 제작 · 코다 & 크룩스 🦗
+
+텔레그램으로 명령을 보내면, **로컬 LLM이 프롬프트를 짜고 → 비켜주고 → ComfyUI가 풀 VRAM으로 생성 → 결과를 텔레그램으로** 보내주는 봇.
+24GB 단일 GPU(RTX 3090급)에서 로컬 LLM과 ComfyUI가 **VRAM을 번갈아 쓰는(핑퐁)** 구조라 둘 다 무리 없이 돌아갑니다.
+
+**기능:** 이미지(ZIT) · 영상(LTX) · 음악(ACE) · 인물합성/편집(Flux2 Klein) · 페이스 스왑
+
+---
+
+## 1. 필요한 것 (먼저 갖춰야 함)
+
+### 하드웨어
+- **NVIDIA GPU VRAM 24GB 권장** (RTX 3090/4090). 더 적으면 모델·해상도 조정 필요.
+
+### 소프트웨어
+| 프로그램 | 용도 | 비고 |
+|---|---|---|
+| **ComfyUI Desktop** | 실제 생성 | 켜져 있어야 함 (포트 8188) |
+| **LM Studio** | 프롬프트 작성용 로컬 LLM | GUI는 안 켜도 됨. `lms` CLI가 자동 기동 |
+| **Python 3.10+** | 봇 스크립트 | 설치 시 "Add to PATH" 체크 |
+| **텔레그램 봇 토큰** | 입출력 | @BotFather → `/newbot` |
+
+---
+
+## 2. ComfyUI 커스텀 노드 (이게 없으면 해당 기능 안 됨)
+
+ComfyUI Manager 등으로 설치. **봇을 켜면 사전점검이 "뭐가 없는지" 콕 집어줍니다.**
+
+- **이미지(ZIT):** `ToobusyZImageTurbo`, `ToobusyHiresUpscale`
+- **인물합성/스왑(Klein):** `ToobusyFlux2Klein`, `ToobusyFlux2KleinPromptDirector`, `ToobusyReferenceBoard`
+- **영상(LTX 2.3):** `LTXDirector` 계열, `UnetLoaderGGUF`(ComfyUI-GGUF), `VAEDecodeTiled`, KJNodes(`VAELoaderKJ` 등)
+- **음악(ACE Step 1.5):** `TextEncodeAceStepAudio1.5`, `EmptyAceStep1.5LatentAudio` 등
+
+---
+
+## 3. 모델 파일 (ComfyUI `models` 폴더에)
+
+워크플로가 참조하는 파일명·하위폴더 그대로 있어야 합니다.
+
+- **ZIT:** `ZIT/zImageTurbo_turbo.safetensors`, `ZIT/zImageTurbo_turbo_txt.safetensors`, `zImageTurboVAE_v10.safetensors`, (LoRA) `ZIT/ZIT_normal_girl01.safetensors`, (업스케일) `4x-ClearRealityV1_Soft.pth`
+- **Flux2 Klein:** `FLUX2/flux-2-klein-9b-kv-fp8.safetensors`, `qwenLayerwiseForKlein9b_fp8FP32.safetensors`, `flux2DevFP8GGUF_flux2DevVAE.safetensors`, `gemma4_e4b_it_fp8_scaled.safetensors`
+- **LTX 2.3:** `LTX23/ltx23DEVGGUFUnsloth_q4km.gguf`, `LTX23/ltx-2.3-22b-distilled-lora-384-1.1.safetensors`, `LTX23/taeltx2_3.safetensors`, `LTX23/ltx23FP4_*VideoVae/AudioVae/TextProjection`, `gemma_3_12B_it_fp4_mixed.safetensors`, `ltx-2.3-spatial-upscaler-x2-1.1.safetensors`
+- **ACE Step 1.5:** `aceStepAudioGen_v15XLTurbo.safetensors`, `aceStepAudioGen_tencQwen06bAce15.safetensors`, `aceStepAudioGen_tencQwen4bAce15.safetensors`, `aceStepAudioGen_vae.safetensors`
+- **로컬 LLM (LM Studio):** 무검열 코딩 모델 1개 (예: `qwen3.5-35b-a3b-uncensored`). LM Studio에서 미리 다운로드해 두기.
+
+> 파일명이 다르면 `workflows/` 안의 해당 JSON에서 모델명을 본인 것으로 바꾸세요.
+
+---
+
+## 4. 설치 (3단계)
+
+1. 이 폴더를 아무 데나 둠 (경로 무관)
+2. **`설치.bat`** 더블클릭 → requests 설치 + 설정 마법사
+   - 텔레그램 토큰 붙여넣기
+   - 봇에게 메시지 한 번 보내기 → chat_id 자동 인식
+   - ComfyUI 경로 자동 감지, LM 모델 선택
+   - → `config.json` 자동 작성
+3. **`핑퐁시작.bat`** 더블클릭 → 봇 가동
+
+이후엔 **ComfyUI 켜고 → 핑퐁시작.bat** 만 하면 됩니다.
+
+---
+
+## 5. 사용법 (텔레그램)
+
+하단 버튼 또는 번호로 선택:
+- **1️⃣ 이미지** / **2️⃣ 영상** / **3️⃣ 음악** → 버튼 누르면 설명을 물어봄
+- **4️⃣ 인물합성/편집** → 사진 1장 (+ 원하는 장면)
+- **5️⃣ 페이스스왑** → 사진 2장 (몸 → 얼굴 순서)
+- 사진을 그냥 보내면 → "뭘 할까요?" 물어봄
+- 취소: `/취소`
+
+---
+
+## 5-1. VRAM이 다를 때 (고급)
+
+기본값은 24GB(RTX 3090급) 기준이에요. VRAM이 다르면 **`config.json`의 `models` 한 줄만** 자기 파일명으로 바꾸면 됩니다. (워크플로 JSON은 건드릴 필요 없음)
+
+```json
+"models": {
+  "zit":      "ZIT\\zImageTurbo_turbo.safetensors",
+  "ltx_gguf": "LTX23\\ltx23DEVGGUFUnsloth_q4km.gguf",   ← 더 작은 gguf로 교체 가능
+  "klein":    "FLUX2\\flux-2-klein-9b-kv-fp8.safetensors",
+  "ace":      "aceStepAudioGen_v15XLTurbo.safetensors"
+}
+```
+
+- **규칙: 형식(로더)은 그대로.** gguf 자리엔 gguf(q4km→q3=VRAM↓, q6/q8=↑), safetensors 자리엔 safetensors.
+- 봇을 켜면 **사전점검이 "그 파일 있는지" 확인**하고, 없으면 기대 파일명을 알려줘요.
+- 영상이 무거우면 `video_width`를 낮추세요(예: 세로숏 `640`).
+
+## 5-2. 갤러리 대시보드 (선택)
+
+생성물을 한눈에 보고, 브라우저에서 바로 생성도 할 수 있는 레트로 대시보드.
+
+- **`대시보드.bat`** 더블클릭 → 브라우저에서 `http://127.0.0.1:8910` 자동 열림
+- 생성된 이미지가 카드로 쌓임(호버 확대 / 클릭 크게보기 / 좌우 이동 / 숨김·삭제)
+- 상단 CRT 모니터로 영상 감상 + 영상 리스트
+- 하단 BGM 플레이어로 생성한 음악 재생
+- 입력칸 + 생성 버튼으로 대시보드에서 직접 생성 요청
+- 우상단 도트 하트 = 봇 동작 표시 (ONLINE / GENERATING / OFFLINE)
+
+> **생성은 봇이 처리해요.** 대시보드의 생성 요청은 공유 큐(`queue/`)에 들어가고, **`핑퐁시작.bat`(봇)이 켜져 있어야** 순서대로 처리됩니다(텔레그램 요청과 같은 줄에 서서 GPU 충돌 방지). 삭제는 바로 지우지 않고 `.trash` 폴더로 이동돼요.
+
+## 6. 문제 해결
+
+- **봇 창이 바로 닫힘** → `config.json` 없음. `설치.bat` 먼저 실행.
+- **"⚠️ ○○ 노드 없음"** → 해당 커스텀 노드 미설치. ComfyUI Manager로 설치.
+- **생성은 되는데 결과가 이상** → 모델 파일명이 워크플로와 다름. `workflows/` JSON에서 모델명 수정.
+- **OOM/멈춤** → VRAM 부족. 영상 해상도(`config.json`의 `video_width`)를 낮추거나 더 작은 모델 사용.
+- **봇이 두 번 응답** → 핑퐁 루프가 두 개 떠 있음. 검은 창을 모두 닫고 하나만 다시 시작.
+
+---
+
+## 구조
+
+```
+pingpong/
+├─ 설치.bat            # 최초 1회: 설정 마법사
+├─ 핑퐁시작.bat         # 봇 켜기 (생성 처리)
+├─ 대시보드.bat         # 갤러리 대시보드 열기
+├─ 배포만들기.bat       # 배포 zip 생성(config 제외)
+├─ setup.py            # 설정 마법사 본체
+├─ pingpong.py         # 봇 오케스트레이터 (+공유 큐 처리)
+├─ dashboard.py        # 갤러리 대시보드 서버
+├─ config.example.json # 설정 예시 (복사해서 config.json)
+├─ workflows/          # ComfyUI 워크플로 4종 (API 포맷)
+└─ (config.json, queue/ 등은 .gitignore 처리)
+```
+
+## 7. GitHub로 배포 (제작자용)
+
+이 폴더는 git 레포로 만들어 배포하면 편해요. **`config.json`은 토큰이 들어있어 `.gitignore`로 제외**됩니다.
+
+```bash
+git init
+git add .
+git commit -m "first release"
+git branch -M main
+git remote add origin https://github.com/<유저명>/<레포명>.git
+git push -u origin main
+```
+
+받는 사람은: 레포를 clone/다운 → `설치.bat` 실행(→ config.json 자동 생성) → `핑퐁시작.bat`.
+(모델·커스텀노드는 용량 때문에 레포에 못 넣어요 — 위 2·3절 목록대로 각자 준비, 사전점검이 빠진 걸 알려줍니다.)
+
+---
+
+🦗 **너무바쁜베짱이 STUDIO** — made by **코다 & 크룩스**

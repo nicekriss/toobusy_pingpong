@@ -1,0 +1,155 @@
+{
+  "1": {
+    "inputs": {
+      "model_name": "ZIT\\zImageTurbo_turbo.safetensors",
+      "clip_name": "ZIT\\zImageTurbo_turbo_txt.safetensors",
+      "vae_name": "zImageTurboVAE_v10.safetensors",
+      "positive": "A premium beauty portrait of an elegant young woman standing by the sea, long dark wavy hair blowing in the breeze, glowing skin, refined natural makeup, calm confident expression, wearing a flowing silky white robe with a deep neckline, luxury fragrance campaign mood, soft ocean background with shimmering sunlight on the water, minimal and clean composition, cinematic beauty photography, fresh and sophisticated seaside atmosphere, photorealistic, high-end fashion editorial style.",
+      "negative": "",
+      "ratio_preset": "3:4",
+      "megapixels": 1,
+      "divisible_by": 32,
+      "batch_size": 1,
+      "seed": 1001186289001688,
+      "steps": 8,
+      "cfg": 1,
+      "sampler_name": "res_multistep",
+      "scheduler": "simple",
+      "denoise": 1,
+      "aura_shift": 3,
+      "lora_slots": 1,
+      "lora_1_enable": true,
+      "lora_1_name": "ZIT\\ZIT_normal_girl01.safetensors",
+      "lora_1_strength": 0.6,
+      "lora_2_enable": false,
+      "lora_2_name": "None",
+      "lora_2_strength": 1,
+      "lora_3_enable": false,
+      "lora_3_name": "None",
+      "lora_3_strength": 1,
+      "lora_4_enable": false,
+      "lora_4_name": "None",
+      "lora_4_strength": 1,
+      "lora_5_enable": false,
+      "lora_5_name": "None",
+      "lora_5_strength": 1,
+      "width": 0,
+      "height": 0
+    },
+    "class_type": "ToobusyZImageTurbo",
+    "_meta": {
+      "title": "toobusy Z-Image Turbo"
+    }
+  },
+  "2": {
+    "inputs": {
+      "filename_prefix": "해커스제출\\ZIT",
+      "images": [
+        "1",
+        0
+      ]
+    },
+    "class_type": "SaveImage",
+    "_meta": {
+      "title": "Save Image"
+    }
+  },
+  "3": {
+    "inputs": {
+      "upscale_model_name": "4x-ClearRealityV1_Soft.pth",
+      "downscale_method": "lanczos",
+      "scale_by": 0.5,
+      "image": [
+        "1",
+        0
+      ],
+      "vae": [
+        "1",
+        7
+      ]
+    },
+    "class_type": "ToobusyHiresUpscale",
+    "_meta": {
+      "title": "toobusy Hires Upscale"
+    }
+  },
+  "4": {
+    "inputs": {
+      "model_name": "ZIT\\zImageTurbo_turbo.safetensors",
+      "clip_name": "ZIT\\zImageTurbo_turbo_txt.safetensors",
+      "vae_name": "zImageTurboVAE_v10.safetensors",
+      "positive": "A premium beauty portrait of an elegant young woman standing by the sea, long dark wavy hair blowing in the breeze, glowing skin, refined natural makeup, calm confident expression, wearing a flowing silky white robe with a deep neckline, luxury fragrance campaign mood, soft ocean background with shimmering sunlight on the water, minimal and clean composition, cinematic beauty photography, fresh and sophisticated seaside atmosphere, photorealistic, high-end fashion editorial style.",
+      "negative": "",
+      "ratio_preset": "3:4",
+      "megapixels": 1,
+      "divisible_by": 32,
+      "batch_size": 1,
+      "seed": 215950929964980,
+      "steps": 4,
+      "cfg": 1,
+      "sampler_name": "res_multistep",
+      "scheduler": "beta",
+      "denoise": 0.5,
+      "aura_shift": 3,
+      "lora_slots": 0,
+      "lora_1_enable": false,
+      "lora_1_name": "None",
+      "lora_1_strength": 1,
+      "lora_2_enable": false,
+      "lora_2_name": "None",
+      "lora_2_strength": 1,
+      "lora_3_enable": false,
+      "lora_3_name": "None",
+      "lora_3_strength": 1,
+      "lora_4_enable": false,
+      "lora_4_name": "None",
+      "lora_4_strength": 1,
+      "lora_5_enable": false,
+      "lora_5_name": "None",
+      "lora_5_strength": 1,
+      "width": 0,
+      "height": 0,
+      "model_override": [
+        "1",
+        4
+      ],
+      "clip_override": [
+        "1",
+        6
+      ],
+      "vae_override": [
+        "1",
+        7
+      ],
+      "positive_override": [
+        "1",
+        8
+      ],
+      "negative_override": [
+        "1",
+        9
+      ],
+      "latent_override": [
+        "3",
+        1
+      ]
+    },
+    "class_type": "ToobusyZImageTurbo",
+    "_meta": {
+      "title": "toobusy Z-Image Turbo"
+    }
+  },
+  "5": {
+    "inputs": {
+      "filename_prefix": "해커스제출\\ZIT_UPS",
+      "images": [
+        "4",
+        0
+      ]
+    },
+    "class_type": "SaveImage",
+    "_meta": {
+      "title": "Save Image"
+    }
+  }
+}
