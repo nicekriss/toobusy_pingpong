@@ -13,6 +13,8 @@
 
 **기능:** 이미지(ZIT) · 영상(LTX) · 음악(ACE) · 인물합성/편집(Flux2 Klein) · 페이스 스왑
 
+> ⚠️ 이 도구는 로컬 PC 전용으로 설계되어 있으며, 대시보드는 `127.0.0.1`에서만 실행됩니다. 포트포워딩이나 외부 공개는 권장하지 않습니다.
+
 ---
 
 ## 1. 필요한 것 (먼저 갖춰야 함)
@@ -138,7 +140,9 @@ pingpong/
 │                      # 한글 호환용 실행 래퍼
 ├─ setup.py            # 설정 마법사 본체
 ├─ pingpong.py         # 봇 오케스트레이터 (+공유 큐 처리)
+├─ pingpong_safe.py    # 안전 실행 래퍼 (queue/running/failed 처리)
 ├─ dashboard.py        # 갤러리 대시보드 서버
+├─ dashboard_safe.py   # 대시보드 실행 래퍼
 ├─ config.example.json # 설정 예시 (복사해서 config.json)
 ├─ workflows/          # ComfyUI 워크플로 4종 (API 포맷)
 └─ (config.json, queue/ 등은 .gitignore 처리)
