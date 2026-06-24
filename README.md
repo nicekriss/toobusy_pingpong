@@ -55,17 +55,22 @@ ComfyUI Manager 등으로 설치. **봇을 켜면 사전점검이 "뭐가 없는
 
 ---
 
-## 4. 설치 (3단계)
+## 4. 설정 (3단계)
 
 1. 이 폴더를 아무 데나 둠 (경로 무관)
-2. **`설치.bat`** 더블클릭 → requests 설치 + 설정 마법사
+2. **`설치.bat`** 더블클릭 → Python 패키지 설치 + 설정 마법사
+   - 터미널에서 직접 하려면:
+   ```bat
+   python -m pip install -r requirements.txt
+   python setup.py
+   ```
    - 텔레그램 토큰 붙여넣기
    - 봇에게 메시지 한 번 보내기 → chat_id 자동 인식
    - ComfyUI 경로 자동 감지, LM 모델 선택
    - → `config.json` 자동 작성
-3. **`핑퐁시작.bat`** 더블클릭 → 봇 가동
+3. **`run_bot.bat`** 더블클릭 → 봇 가동
 
-이후엔 **ComfyUI 켜고 → 핑퐁시작.bat** 만 하면 됩니다.
+이후엔 **ComfyUI 켜고 → `run_bot.bat`** 만 하면 됩니다.
 
 ---
 
@@ -101,18 +106,18 @@ ComfyUI Manager 등으로 설치. **봇을 켜면 사전점검이 "뭐가 없는
 
 생성물을 한눈에 보고, 브라우저에서 바로 생성도 할 수 있는 레트로 대시보드.
 
-- **`대시보드.bat`** 더블클릭 → 브라우저에서 `http://127.0.0.1:8910` 자동 열림
+- **`run_dashboard.bat`** 더블클릭 → 브라우저에서 `http://127.0.0.1:8910` 자동 열림
 - 생성된 이미지가 카드로 쌓임(호버 확대 / 클릭 크게보기 / 좌우 이동 / 숨김·삭제)
 - 상단 CRT 모니터로 영상 감상 + 영상 리스트
 - 하단 BGM 플레이어로 생성한 음악 재생
 - 입력칸 + 생성 버튼으로 대시보드에서 직접 생성 요청
 - 우상단 도트 하트 = 봇 동작 표시 (ONLINE / GENERATING / OFFLINE)
 
-> **생성은 봇이 처리해요.** 대시보드의 생성 요청은 공유 큐(`queue/`)에 들어가고, **`핑퐁시작.bat`(봇)이 켜져 있어야** 순서대로 처리됩니다(텔레그램 요청과 같은 줄에 서서 GPU 충돌 방지). 삭제는 바로 지우지 않고 `.trash` 폴더로 이동돼요.
+> **생성은 봇이 처리해요.** 대시보드의 생성 요청은 공유 큐(`queue/`)에 들어가고, **`run_bot.bat`(봇)이 켜져 있어야** 순서대로 처리됩니다(텔레그램 요청과 같은 줄에 서서 GPU 충돌 방지). 삭제는 바로 지우지 않고 `.trash` 폴더로 이동돼요.
 
 ## 6. 문제 해결
 
-- **봇 창이 바로 닫힘** → `config.json` 없음. `설치.bat` 먼저 실행.
+- **봇 창이 바로 닫힘** → `config.json` 없음. `python setup.py` 먼저 실행.
 - **"⚠️ ○○ 노드 없음"** → 해당 커스텀 노드 미설치. ComfyUI Manager로 설치.
 - **생성은 되는데 결과가 이상** → 모델 파일명이 워크플로와 다름. `workflows/` JSON에서 모델명 수정.
 - **OOM/멈춤** → VRAM 부족. 영상 해상도(`config.json`의 `video_width`)를 낮추거나 더 작은 모델 사용.
@@ -124,10 +129,12 @@ ComfyUI Manager 등으로 설치. **봇을 켜면 사전점검이 "뭐가 없는
 
 ```
 pingpong/
-├─ 설치.bat            # 최초 1회: 설정 마법사
-├─ 핑퐁시작.bat         # 봇 켜기 (생성 처리)
-├─ 대시보드.bat         # 갤러리 대시보드 열기
-├─ 배포만들기.bat       # 배포 zip 생성(config 제외)
+├─ 설치.bat            # 최초 1회: 패키지 설치 + 설정 마법사
+├─ run_bot.bat         # 봇 켜기 (생성 처리)
+├─ run_dashboard.bat   # 갤러리 대시보드 열기
+├─ requirements.txt    # Python 의존성
+├─ 핑퐁시작.bat / 대시보드.bat
+│                      # 한글 호환용 실행 래퍼
 ├─ setup.py            # 설정 마법사 본체
 ├─ pingpong.py         # 봇 오케스트레이터 (+공유 큐 처리)
 ├─ dashboard.py        # 갤러리 대시보드 서버
@@ -149,9 +156,47 @@ git remote add origin https://github.com/<유저명>/<레포명>.git
 git push -u origin main
 ```
 
-받는 사람은: 레포를 clone/다운 → `설치.bat` 실행(→ config.json 자동 생성) → `핑퐁시작.bat`.
+받는 사람은: 레포를 clone/다운 → `설치.bat` 실행(→ config.json 자동 생성) → `run_bot.bat`.
 (모델·커스텀노드는 용량 때문에 레포에 못 넣어요 — 위 2·3절 목록대로 각자 준비, 사전점검이 빠진 걸 알려줍니다.)
 
 ---
 
 🦗 **너무바쁜베짱이 STUDIO** — made by **코다 & 크룩스**
+---
+
+## 커스텀 워크플로 추가하기
+
+코드를 수정하지 않고 `config.json` 선언만으로 새 텍스트 프롬프트형 ComfyUI 워크플로를 봇 명령으로 추가할 수 있습니다.
+
+1. ComfyUI에서 워크플로를 **Save (API Format)** 으로 저장한 뒤 `workflows/` 폴더에 넣습니다.
+2. 저장한 JSON에서 프롬프트, 시드, `filename_prefix`, 결과 저장 노드 id를 확인합니다. 노드 id는 문자열 키입니다.
+3. `config.json`의 `custom_workflows`에 아래처럼 선언합니다.
+4. 봇을 재시작한 뒤 `trigger` 명령으로 사용합니다. 예: `/스티커 고양이`
+
+```json
+"custom_workflows": {
+  "스티커": {
+    "file": "workflows/my_sticker.json",
+    "trigger": "/스티커",
+    "type": "image",
+    "llm": "image",
+    "prompt_nodes": [["6", "text"]],
+    "seed_nodes": [["3", "seed"]],
+    "prefix_node": ["9", "filename_prefix"],
+    "prefix": "pingpong/sticker_",
+    "output_node": "9"
+  }
+}
+```
+
+- `file`: 리포 루트 기준 워크플로 API-format JSON 경로
+- `trigger`: 텔레그램 명령 프리픽스
+- `type`: `image`, `video`, `audio` 중 하나이며 전송 방식을 결정합니다.
+- `llm`: `image`는 이미지 프롬프트 생성, `video`는 영상 프롬프트 생성, `none`은 사용자 텍스트를 그대로 사용합니다.
+- `prompt_nodes`: 최종 프롬프트 문자열을 넣을 `[노드id, 필드명]` 목록
+- `image_nodes`: 대시보드에서 첨부한 이미지를 넣을 `[노드id, 필드명]` 목록입니다. 예: `LoadImage`의 `image`
+- `seed_nodes`: 랜덤 시드를 넣을 `[노드id, 필드명]` 목록이며 생략할 수 있습니다.
+- `set_nodes`: 고정값을 넣을 `[노드id, 필드명, 값]` 목록이며 해상도/옵션 기본값을 박아둘 때 씁니다.
+- `prefix_node`: `filename_prefix`를 넣을 `[노드id, 필드명]`이며 생략할 수 있습니다.
+- `prefix`: `filename_prefix` 앞부분입니다. 뒤에 타임스탬프가 자동으로 붙습니다.
+- `output_node`: ComfyUI 실행 결과에서 우선 확인할 저장 노드 id

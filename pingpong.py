@@ -12,7 +12,7 @@ VRAM 핑퐁 오케스트레이터 (멀티모드)
 핵심: 24GB 단일 GPU에서 LLM과 ComfyUI가 번갈아 VRAM 점유.
  LLM 올리기 전 ComfyUI /free 필수(동시 상주 시 OOM). LLM은 '생각하는 순간'만 VRAM.
 """
-import os, sys, json, copy, time, random, subprocess, traceback, re
+import os, sys, json, copy, time, random, subprocess, traceback, re, threading
 import requests
 
 try:  # 윈도우 cp949 콘솔에서 이모지/한글 출력 시 크래시 방지
@@ -48,6 +48,7 @@ LMAPI    = CFG.get("lmstudio_api", "http://127.0.0.1:1234").rstrip("/")
 MODEL    = CFG["llm_model"]
 OUTDIR   = CFG.get("comfy_output_dir") or _auto_out
 INPUTDIR = CFG.get("comfy_input_dir") or _auto_in
+DASHBOARD_PORT = int(CFG.get("dashboard_port", 8910))
 
 # VRAM 급에 맞게 갈아끼울 수 있는 모델 파일명 (config "models"로 덮어쓰기, 없으면 기본값)
 DEFAULT_MODELS = {
@@ -57,8 +58,18 @@ DEFAULT_MODELS = {
     "ace":      "aceStepAudioGen_v15XLTurbo.safetensors",
 }
 MODELS = CFG.get("models", {}) or {}
+CUSTOM = CFG.get("custom_workflows", {}) or {}
 def model_of(key):
     return MODELS.get(key) or DEFAULT_MODELS[key]
+
+def current_llm_model():
+    global MODEL
+    try:
+        latest = json.load(open(CFG_PATH, encoding="utf-8"))
+        MODEL = latest.get("llm_model") or MODEL
+    except Exception as e:
+        log("config reload failed:", e)
+    return MODEL
 
 ALIVE_FILE = os.path.join(OUTDIR, "pingpong", ".alive")
 def beat_alive():
@@ -69,13 +80,26 @@ def beat_alive():
     except Exception:
         pass
 
+def start_heartbeat():
+    def loop():
+        while True:
+            beat_alive()
+            time.sleep(15)
+    threading.Thread(target=loop, daemon=True).start()
+
 # 공유 작업 큐 (대시보드가 job json을 떨궈두면 봇이 순서대로 처리 → GPU 충돌 방지)
 QUEUE_DIR = os.path.join(HERE, "queue")
 def run_job(job):
     m = job.get("mode")
     txt = (job.get("text") or "").strip()
-    if m in ("image", "video", "song"):
-        do_text(m, txt or "a creative, beautiful scene")
+    if isinstance(m, str) and m.startswith("custom:"):
+        do_custom_text(m, txt, job.get("image_refs") or [])
+    elif m == "image_fanout":
+        fanout_image_jobs(txt, int(job.get("count") or requested_image_count(txt)))
+    elif m == "image_direct":
+        do_image_direct(txt, job.get("request") or txt)
+    elif m in ("image", "video", "song"):
+        do_text(m, txt or "a creative, beautiful scene", job.get("director_assets") or [])
     elif m == "klein":
         _klein_core(job["char_rel"], txt)
     elif m == "faceswap":
@@ -124,6 +148,13 @@ SONG_SYS = (
     "TAGS: <comma-separated English genre/mood/instrument/vocal tags>\n"
     "LYRICS:\n<full song lyrics with [Verse]/[Chorus]/[Bridge] section tags>"
 )
+MULTI_IMAGE_SYS = (
+    "You create multiple distinct prompts for a photorealistic text-to-image diffusion model. "
+    "Given the user's request, return ONLY a JSON array of strings. "
+    "Each string must be a different vivid English image prompt under 80 words. "
+    "Vary subject details, setting, composition, lighting, camera, and mood while staying on theme. "
+    "Do not include markdown, numbering, commentary, or any text outside the JSON array."
+)
 
 TG_BANNER = ("🦗▸ 너무바쁜베짱이 STUDIO ◂🦗\n"
              "🕹️ P I N G · P O N G  B O T 🕹️\n"
@@ -142,9 +173,58 @@ HELP = (
     "🦗 너무바쁜베짱이 · 코다 & 크룩스"
 )
 
+def help_text():
+    if not CUSTOM:
+        return HELP
+    triggers = []
+    for spec in CUSTOM.values():
+        trigger = spec.get("trigger")
+        if trigger:
+            triggers.append(trigger)
+    if not triggers:
+        return HELP
+    return HELP + "\n커스텀: " + "  ".join(triggers)
+
 def log(*a): print("[pingpong]", *a, flush=True)
 def tag_now(): return time.strftime("%m%d_%H%M%S")
 def rseed(): return random.randint(0, 2**40)
+
+def requested_image_count(text):
+    t = text or ""
+    m = re.search(r"(?<!\d)(10|[2-9])\s*(?:장|개|컷|枚|images?|pics?|pictures?)", t, flags=re.I)
+    if m:
+        return max(1, min(10, int(m.group(1))))
+    kor = {"두": 2, "세": 3, "네": 4, "다섯": 5, "여섯": 6, "일곱": 7, "여덟": 8, "아홉": 9, "열": 10}
+    for word, n in kor.items():
+        if re.search(word + r"\s*(?:장|개|컷)", t):
+            return n
+    return 1
+
+def enqueue_job(job):
+    os.makedirs(QUEUE_DIR, exist_ok=True)
+    job["source"] = job.get("source", "pingpong")
+    seq = int(job.get("idx") or 0)
+    fn = "%d_%03d_%04d.json" % (int(time.time() * 1000), seq, int.from_bytes(os.urandom(2), "big"))
+    json.dump(job, open(os.path.join(QUEUE_DIR, fn), "w", encoding="utf-8"), ensure_ascii=False)
+
+def start_dashboard():
+    url = f"http://127.0.0.1:{DASHBOARD_PORT}/api/status"
+    try:
+        requests.get(url, timeout=1)
+        log("dashboard already running")
+        return
+    except Exception:
+        pass
+    try:
+        flags = 0
+        if os.name == "nt":
+            flags = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS
+        subprocess.Popen([sys.executable, os.path.join(HERE, "dashboard.py")],
+                         cwd=HERE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         creationflags=flags)
+        log("dashboard started", f"http://127.0.0.1:{DASHBOARD_PORT}")
+    except Exception as e:
+        log("dashboard start fail:", e)
 
 # ---------- Telegram ----------
 MENU_KB = {"keyboard": [["1️⃣ 이미지", "2️⃣ 영상"],
@@ -164,9 +244,9 @@ def tg_send(text, kb=None):
 def send_menu(msg="👇 아래 버튼으로 골라주세요"):
     tg_send(msg, MENU_KB)
 
-PHOTO_KB = {"keyboard": [["🎭 인물합성/편집", "🔀 페이스스왑"], ["❎ 취소"]],
+PHOTO_KB = {"keyboard": [["🎭 인물합성/편집", "🔀 페이스스왑"],
+                         ["🎬 사진으로 영상", "❎ 취소"]],
             "resize_keyboard": True}
-
 def tg_send_file(kind, path, caption=""):
     method = {"photo": "sendPhoto", "video": "sendVideo", "audio": "sendAudio"}[kind]
     field  = kind
@@ -190,9 +270,10 @@ def lms(*args):
     return subprocess.run(["lms", *args], capture_output=True, text=True, encoding="utf-8")
 
 def llm_up():
+    model = current_llm_model()
     lms("server", "start")
-    log("lms load", MODEL)
-    r = lms("load", MODEL, "-y", "--gpu", "max")
+    log("lms load", model)
+    r = lms("load", model, "-y", "--gpu", "max")
     if r.returncode != 0:
         raise RuntimeError(f"lms load failed: {r.stderr or r.stdout}")
     for _ in range(30):
@@ -225,14 +306,105 @@ def _chat(model_id, system, user, max_tokens=800, temp=0.5, no_think=True):
 
 def llm_prompt(model_id, system, user):
     out = _chat(model_id, system, user)
-    lines = [l.strip().strip('"').strip("*").strip() for l in out.splitlines() if l.strip()]
-    if lines:
-        out = max(lines, key=len)
-    out = re.sub(r'^[\*\s\-]*(?:attempt|draft|final|version|option|prompt|here(?:\s+is)?)\s*\d*\s*[:\*\-]+\s*',
-                 '', out, flags=re.I)
-    out = re.sub(r'\s*\(\s*\d+\s*\)', '', out)   # 단어 카운터 "(1) (2)..." 제거
-    out = re.sub(r'\s{2,}', ' ', out)            # 중복 공백 정리
-    return out.strip().strip('"').strip("*").strip()
+    return clean_llm_prompt(out)
+
+def clean_llm_prompt(out):
+    text = (out or "").replace("\r", "\n").strip()
+    text = re.sub(r"<think>[\s\S]*?</think>", " ", text, flags=re.I)
+    text = re.sub(r"```(?:json|text)?|```", " ", text, flags=re.I)
+    text = re.sub(r"^\s*(?:under\s+\d+\s+words?\??\s*)?(?:let'?s\s+count|word\s+count)\s*[:\-]\s*", "", text, flags=re.I)
+    text = re.sub(r"\s*\(\s*\d+\s+words?\s*\)\s*\.?\s*$", "", text, flags=re.I)
+    text = re.sub(r'^[\*\s\-]*(?:attempt|draft|final|version|option|prompt|answer|output|here(?:\s+is)?)\s*\d*\s*[:\*\-]+\s*',
+                  '', text, flags=re.I)
+    markers = [
+        r"\bfinal\s+prompt\s*[:\-]",
+        r"\bprompt\s*[:\-]",
+        r"\boutput\s*[:\-]",
+        r"\banswer\s*[:\-]",
+    ]
+    for pat in markers:
+        hits = list(re.finditer(pat, text, flags=re.I))
+        if hits:
+            text = text[hits[-1].end():].strip()
+            break
+    bad = re.compile(
+        r"(?:\b(wait|actually|however|therefore|usually|given|instruction|system prompt|the input|the user|"
+        r"i should|i will|i need|let'?s|this means|looking at|since it|if i|we need|missing elements|under \d+ words?|word count)\b"
+        r"|^\s*(style|missing elements)\s*:)",
+        re.I,
+    )
+    parts = re.split(r"(?<=[.!?])\s+", text.replace("\n", " "))
+    good = [p.strip().strip('"').strip("*").strip() for p in parts if p.strip() and not bad.search(p)]
+    if good:
+        text = " ".join(good[:3])
+    else:
+        lines = [l.strip().strip('"').strip("*").strip() for l in text.splitlines() if l.strip()]
+        usable = [l for l in lines if not bad.search(l)] or lines
+        text = usable[-1] if usable else text
+    text = re.sub(r"\s*\(\s*\d+\s*\)", "", text)
+    text = re.sub(r"\s*\(\s*\d+\s+words?\s*\)\s*\.?\s*$", "", text, flags=re.I)
+    text = re.sub(r"\s+", " ", text).strip().strip('"').strip("*").strip()
+    if len(text) > 900:
+        text = text[:900].rsplit(" ", 1)[0].strip()
+    return text
+
+def llm_image_variations(model_id, user, count):
+    out = _chat(model_id, MULTI_IMAGE_SYS, f"Create exactly {count} prompts for: {user}", max_tokens=1800, temp=0.8)
+    try:
+        data = json.loads(out)
+    except Exception:
+        m = re.search(r"\[[\s\S]*\]", out)
+        data = json.loads(m.group(0)) if m else []
+    prompts = []
+    for item in data:
+        if isinstance(item, str):
+            p = clean_llm_prompt(item)
+            if p:
+                prompts.append(p)
+        if len(prompts) >= count:
+            break
+    if len(prompts) < count:
+        base = llm_prompt(model_id, IMAGE_SYS, user)
+        while len(prompts) < count:
+            prompts.append(base + f", variation {len(prompts) + 1}, unique composition and details")
+    return prompts[:count]
+
+def fanout_image_jobs(body, count):
+    count = max(2, min(10, int(count or 2)))
+    tg_send(f"🧠▸ 이미지 {count}장용 프롬프트 분해 중... 한 장당 한 큐로 보낼게요.")
+    comfy_free()
+    mid = llm_up()
+    try:
+        prompts = llm_image_variations(mid, body, count)
+    finally:
+        llm_down()
+    for i, prompt in enumerate(prompts, 1):
+        enqueue_job({"mode": "image_direct", "text": prompt, "request": body, "source": "fanout", "idx": i, "total": count})
+    tg_send("📦▸ 독립 이미지 큐 " + str(len(prompts)) + "개 추가 완료\n" + "\n".join(f"{i}. {p[:80]}" for i, p in enumerate(prompts, 1)))
+
+def write_generation_meta(files, mode, request_text="", generated_prompt=""):
+    meta = {
+        "mode": mode,
+        "request": request_text or "",
+        "generated": generated_prompt or "",
+        "time": time.strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    for path in files or []:
+        try:
+            with open(path + ".pingpong.json", "w", encoding="utf-8") as f:
+                json.dump(meta, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            log("meta write fail:", e)
+
+def do_image_direct(prompt, request_text=None):
+    prompt = (prompt or "a creative, beautiful scene").strip()
+    tg_send(f"🎨▸ 큐 이미지 생성 중 ░▒▓█▓▒░ ✧\n{prompt}")
+    comfy_free()
+    wf, save = inject_zit(prompt)
+    files = comfy_run(wf, save)
+    write_generation_meta(files, "image", request_text or prompt, prompt)
+    tg_send_file("photo", files[0], caption=prompt[:1000])
+    comfy_free()
 
 def llm_song(model_id, user):
     # 구조화 작업이라 추론 허용(no_think=False) + 넉넉한 토큰
@@ -295,6 +467,27 @@ def _files_from(node_out):
 def load_wf(name):
     return json.load(open(os.path.join(HERE, "workflows", name), encoding="utf-8"))
 
+def inject_custom(spec, prompt, image_refs=None):
+    wf_path = os.path.join(HERE, spec["file"])
+    wf = json.load(open(wf_path, encoding="utf-8"))
+    tag = tag_now()
+    for node, field in spec.get("prompt_nodes", []):
+        wf[str(node)]["inputs"][field] = prompt
+    image_refs = image_refs or []
+    for i, pair in enumerate(spec.get("image_nodes", [])):
+        if i >= len(image_refs):
+            break
+        node, field = pair
+        wf[str(node)]["inputs"][field] = image_refs[i]
+    for node, field in spec.get("seed_nodes", []):
+        wf[str(node)]["inputs"][field] = rseed()
+    for node, field, value in spec.get("set_nodes", []):
+        wf[str(node)]["inputs"][field] = value
+    if spec.get("prefix_node"):
+        node, field = spec["prefix_node"]
+        wf[str(node)]["inputs"][field] = spec.get("prefix", "pingpong/custom_") + tag
+    return wf, str(spec["output_node"])
+
 def inject_zit(prompt):
     wf = load_wf("toobusy_zimgt.json"); tag = tag_now()
     for n in ("1", "4"):
@@ -310,10 +503,70 @@ def inject_zit(prompt):
     save = "5" if CFG.get("send_upscaled", True) else "2"
     return wf, save
 
-def inject_ltx(prompt):
+def _apply_ltx_director_assets(td, assets, duration_frames):
+    assets = assets or []
+    images = [a for a in assets if a.get("kind") == "image"]
+    videos = [a for a in assets if a.get("kind") == "video"]
+    audios = [a for a in assets if a.get("kind") == "audio"]
+    def frames(a, fallback_start=0, fallback_length=None):
+        fallback_length = duration_frames if fallback_length is None else fallback_length
+        try:
+            start = int(a.get("start", fallback_start))
+        except Exception:
+            start = fallback_start
+        try:
+            length = int(a.get("length", fallback_length))
+        except Exception:
+            length = fallback_length
+        start = max(0, min(duration_frames - 1, start))
+        length = max(1, min(duration_frames - start, length))
+        try:
+            trim = max(0, int(a.get("trimStart", 0)))
+        except Exception:
+            trim = 0
+        return start, length, trim
+    if images:
+        step = max(1, duration_frames // len(images))
+        td["segments"] = []
+        for i, a in enumerate(images):
+            start, length, trim = frames(a, min(duration_frames - 1, i * step), max(1, duration_frames - min(duration_frames - 1, i * step)))
+            td["segments"].append({
+                "type": "image",
+                "imageFile": a["rel"],
+                "start": start,
+                "length": length,
+                "trimStart": trim,
+            })
+    if videos:
+        td["motionSegments"] = []
+        for a in videos:
+            start, length, trim = frames(a)
+            td["motionSegments"].append({
+                "videoFile": a["rel"],
+                "start": start,
+                "length": length,
+                "trimStart": trim,
+                "videoStrength": float(a.get("videoStrength", 1.0)),
+                "videoAttentionStrength": float(a.get("videoAttentionStrength", 0.65)),
+                "resampleMode": a.get("resampleMode", "nearest"),
+            })
+    if audios:
+        td["audioSegments"] = []
+        for a in audios:
+            start, length, trim = frames(a)
+            td["audioSegments"].append({
+                "audioFile": a["rel"],
+                "start": start,
+                "length": length,
+                "trimStart": trim,
+            })
+    return td
+
+def inject_ltx(prompt, director_assets=None):
     wf = load_wf("LTX_Director_2_Workflow_ggufdis_API.json"); tag = tag_now()
     td = json.loads(wf["131"]["inputs"]["timeline_data"])
     td["global_prompt"] = prompt
+    _apply_ltx_director_assets(td, director_assets, int(wf["131"]["inputs"].get("duration_frames", 120)))
     wf["131"]["inputs"]["timeline_data"] = json.dumps(td, ensure_ascii=False)
     w = CFG.get("video_width", 0)
     if w:
@@ -391,15 +644,58 @@ def detect_mode(text):
     for kw, mode in table:
         if low.startswith(kw):
             return mode, text[len(kw):].strip()
+    for name, spec in CUSTOM.items():
+        trigger = (spec.get("trigger") or "").strip()
+        if trigger and low.startswith(trigger.lower()):
+            return "custom:" + name, text[len(trigger):].strip()
     return "image", text
 
 # ---------- 핸들러 ----------
-def do_text(mode, body):
+def do_custom_text(mode, body, image_refs=None):
+    name = mode.split(":", 1)[1]
+    try:
+        spec = CUSTOM[name]
+        kind = {"image": "photo", "video": "video", "audio": "audio"}[spec["type"]]
+        image_refs = image_refs or []
+        required_images = len(spec.get("image_nodes", []))
+        if required_images and len(image_refs) < required_images:
+            tg_send(f"⚠️ {name} 워크플로는 이미지 {required_images}장이 필요해요. 대시보드에서 이미지를 첨부해 실행해주세요.")
+            return
+        comfy_free()
+        if spec.get("llm", "none") == "none":
+            prompt = body
+        else:
+            tg_send("🧠▸ 두뇌 가동...")
+            mid = llm_up()
+            try:
+                sys_p = VIDEO_SYS if spec["llm"] == "video" else IMAGE_SYS
+                prompt = llm_prompt(mid, sys_p, body)
+            finally:
+                llm_down()
+        tg_send("▸ 생성 중 ░▒▓ : " + prompt[:120])
+        wf, out = inject_custom(spec, prompt, image_refs)
+        files = comfy_run(wf, out)
+        write_generation_meta(files, "custom:" + name, body, prompt)
+        tg_send_file(kind, files[0], caption=prompt[:1000])
+        comfy_free()
+    except (KeyError, IndexError, TypeError, json.JSONDecodeError, OSError) as e:
+        tg_send(f"⚠️ 커스텀 워크플로 설정 오류: {e}")
+        log("custom workflow config error:", traceback.format_exc())
+
+def do_text(mode, body, director_assets=None):
     if mode == "help" or not body:
-        tg_send(HELP); return
+        tg_send(help_text()); return
+    if mode.startswith("custom:"):
+        do_custom_text(mode, body)
+        return
     if mode == "klein":
         tg_send("🎭 Klein 인물합성은 사진을 첨부해서 보내주세요 (캡션에 원하는 장면).")
         return
+    if mode == "image":
+        count = requested_image_count(body)
+        if count > 1:
+            fanout_image_jobs(body, count)
+            return
     tg_send(f"🧠▸ 두뇌 가동... ░▒▓ ({mode})\n> {body}")
     comfy_free()
     mid = llm_up()
@@ -418,12 +714,16 @@ def do_text(mode, body):
         wf, save = inject_ace(tags, lyrics); kind = "audio"
         tg_send(f"🎼▸ 작곡 중 ░▒▓█▓▒░ ♪♬\n{payload_desc}")
     elif mode == "video":
-        wf, save = inject_ltx(prompt); kind = "video"
+        wf, save = inject_ltx(prompt, director_assets); kind = "video"
         tg_send(f"🎬▸ 필름 감는 중 📼 (수 분 소요) ░▒▓\n{prompt}")
     else:
         wf, save = inject_zit(prompt); kind = "photo"
         tg_send(f"🎨▸ 그리는 중 ░▒▓█▓▒░ ✧\n{prompt}")
     files = comfy_run(wf, save)
+    if mode == "song":
+        write_generation_meta(files, mode, body, payload_desc)
+    else:
+        write_generation_meta(files, mode, body, prompt)
     tg_send_file(kind, files[0], caption=payload_desc)
     comfy_free()
 
@@ -440,17 +740,24 @@ def _klein_core(rel, caption):
     comfy_free()
     wf, save = inject_klein(rel, caption)
     files = comfy_run(wf, save)
+    write_generation_meta(files, "klein", caption or "", caption or "")
     tg_send_file("photo", files[0], caption=caption or "✦ 합성 완료 ✦")
     comfy_free()
 
 def do_klein(file_id, caption):
     _klein_core(download_ref(file_id), caption)
 
+def do_video_from_photo(file_id, caption):
+    rel = download_ref(file_id)
+    prompt = caption or "animate this image into a short cinematic video with natural motion"
+    do_text("video", prompt, [{"kind": "image", "rel": rel}])
+
 def do_faceswap(char_rel, face_rel, goal):
     tg_send(f"🔀▸ 얼굴 교체 중 ░▒▓█▓▒░ 👤↔👤\n장면: {goal or '(원본 장면 유지)'}")
     comfy_free()
     wf, save = inject_klein_faceswap(char_rel, face_rel, goal)
     files = comfy_run(wf, save)
+    write_generation_meta(files, "faceswap", goal or "", goal or "")
     tg_send_file("photo", files[0], caption="✦ 페이스 스왑 완료 ✦ 👤↔👤")
     comfy_free()
 
@@ -498,34 +805,46 @@ def handle_message(msg):
 
     # 메뉴/도움말
     if low in ("/start", "/메뉴", "/menu", "메뉴"):
-        send_menu("🏓 핑퐁 봇\n" + HELP); return
+        send_menu("🏓 핑퐁 봇\n" + help_text()); return
 
     # 사진을 받고 '뭘 할지' 고르는 단계 (메뉴매칭보다 먼저 처리)
     if f == "photo_action":
-        if "페이스스왑" in text:
+        if "페이스스왑" in text or "faceswap" in low:
             STATE["char_rel"] = download_ref(STATE["pending_photo"])
             STATE["flow"] = "swap_face"; STATE["pending_photo"] = None
-            tg_send("✅ 이 사진을 '몸'으로 쓸게요. 이제 '얼굴' 담당 사진을 보내주세요 (2/2)"); return
+            tg_send("🔀 몸/장면 사진 접수! 이제 얼굴 사진을 보내주세요. (2/2)"); return
         if ("인물합성" in text) or ("편집" in text):
             cap = STATE["pending_cap"]; fid = STATE["pending_photo"]
             if cap:
                 reset_state(); do_klein(fid, cap); send_menu("✦･ﾟ: 완성! :ﾟ･✦  ヽ(•‿•)ノ  다음은?"); return
             STATE["flow"] = "await_klein_scene"
-            tg_send("✏️ 어떤 장면/편집을 원하세요? 글로 보내주세요.\n(예: 눈 내리는 파리 거리에서)"); return
-        tg_send("👆 위 버튼 중 하나를 눌러주세요. (취소: /취소)"); return
+            tg_send("🎨 어떤 장면/편집을 원하세요? 글로 보내주세요."); return
+        if ("영상" in text) or ("video" in low):
+            cap = STATE["pending_cap"]; fid = STATE["pending_photo"]
+            if cap:
+                reset_state(); do_video_from_photo(fid, cap); send_menu("✦･ﾟ: 완성! :ﾟ･✦  ヽ(•‿•)ノ  다음은?"); return
+            STATE["flow"] = "await_photo_video_scene"
+            tg_send("🎬 이 사진을 어떤 영상으로 만들까요? 움직임/분위기를 글로 보내주세요.\n(취소: /cancel)")
+            return
+        tg_send("버튼 중 하나를 골라주세요. (취소: /cancel)"); return
 
-    # 인물합성 장면 입력 대기
     if f == "await_klein_scene":
         if not text:
             tg_send("✏️ 원하는 장면을 글로 보내주세요. (취소: /취소)"); return
         fid = STATE["pending_photo"]; reset_state()
         do_klein(fid, text); send_menu("✦･ﾟ: 완성! :ﾟ･✦  ヽ(•‿•)ノ  다음은?"); return
+    if f == "await_photo_video_scene":
+        if not text:
+            tg_send("🎬 영상 설명을 글로 보내주세요. 예: 카메라가 천천히 다가가고 배경이 부드럽게 움직임")
+            return
+        fid = STATE["pending_photo"]; reset_state()
+        do_video_from_photo(fid, text); send_menu("✦･ﾟ: 완성! :ﾟ･✦  ヽ(•‿•)ノ  다음은?"); return
 
     # 메뉴 버튼/숫자 선택 (사진 없는 순수 텍스트)
     if not photo:
         picked = menu_pick(text)
         if picked == "help":
-            send_menu("🏓 핑퐁 봇\n" + HELP); return
+            send_menu("🏓 핑퐁 봇\n" + help_text()); return
         if picked:
             start_mode(picked); return
 
@@ -644,6 +963,8 @@ CONSOLE_BANNER = r"""
 # ---------- main ----------
 def main():
     print(CONSOLE_BANNER, flush=True)
+    start_heartbeat()
+    start_dashboard()
     print("  +--------------------[ 사전점검 ]--------------------+", flush=True)
     comfy_ok, lines = preflight()
     for ln in lines:
@@ -651,14 +972,13 @@ def main():
     print("  +---------------------------------------------------+", flush=True)
     print("  >> INSERT COIN... 폰에서 봇에게 메시지를 보내세요 <<\n", flush=True)
     summary = (TG_BANNER + "\n✦ 가동 완료! ✦\n\n[ 점검 결과 ]\n" +
-               "\n".join(lines) + "\n\n" + HELP)
+               "\n".join(lines) + "\n\n" + help_text())
     send_menu(summary)
     init = tg_updates(0)
     offset = (init[-1]["update_id"] + 1) if init else 0
     beat = 0
     while True:
         try:
-            beat_alive()
             process_queue()
             ups = tg_updates(offset)
             if not ups:  # 대기 중 — 살아있다는 표시

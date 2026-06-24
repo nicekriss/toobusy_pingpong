@@ -15,5 +15,68 @@
     "ltx_gguf": "LTX23\\ltx23DEVGGUFUnsloth_q4km.gguf",
     "klein": "FLUX2\\flux-2-klein-9b-kv-fp8.safetensors",
     "ace": "aceStepAudioGen_v15XLTurbo.safetensors"
+  },
+  "custom_workflows": {
+    "스티커": {
+      "file": "workflows/my_sticker.json",
+      "trigger": "/스티커",
+      "type": "image",
+      "llm": "image",
+      "prompt_nodes": [
+        [
+          "6",
+          "text"
+        ]
+      ],
+      "seed_nodes": [
+        [
+          "3",
+          "seed"
+        ]
+      ],
+      "prefix_node": [
+        "9",
+        "filename_prefix"
+      ],
+      "prefix": "pingpong/sticker_",
+      "output_node": "9"
+    },
+    "부구편집": {
+      "file": "workflows/image_boogu_image_0_1_edit_API.json",
+      "trigger": "/부구편집",
+      "type": "image",
+      "llm": "image",
+      "prompt_nodes": [
+        [
+          "45:36",
+          "prompt"
+        ]
+      ],
+      "image_nodes": [
+        [
+          "32",
+          "image"
+        ]
+      ],
+      "seed_nodes": [
+        [
+          "45:21",
+          "noise_seed"
+        ]
+      ],
+      "prefix_node": [
+        "44",
+        "filename_prefix"
+      ],
+      "prefix": "pingpong/boogu_edit_",
+      "output_node": "44",
+      "set_nodes": [
+        [
+          "49",
+          "resize_type.megapixels",
+          1
+        ]
+      ]
+    }
   }
 }

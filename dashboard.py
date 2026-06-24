@@ -6,8 +6,10 @@
 - 숨김(복구 가능)/삭제(.trash 이동) 지원
 실행: python dashboard.py  (또는 대시보드.bat)
 """
-import os, sys, json, time, base64, re, mimetypes, threading, webbrowser
+import os, sys, json, time, base64, re, mimetypes, threading, webbrowser, struct, zlib, subprocess
 import urllib.request
+import html as html_lib
+import xml.etree.ElementTree as ET
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 try:
@@ -16,23 +18,366 @@ except Exception:
     pass
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-CFG = json.load(open(os.path.join(HERE, "config.json"), encoding="utf-8"))
+CFG_PATH = os.path.join(HERE, "config.json")
+CFG = json.load(open(CFG_PATH, encoding="utf-8"))
+CUSTOM = CFG.get("custom_workflows", {}) or {}
 def _auto(k, *parts):
     base = os.path.join(os.environ.get("LOCALAPPDATA", ""), "Comfy-Desktop", "ComfyUI-Shared")
     return CFG.get(k) or os.path.join(base, *parts)
 OUTDIR   = _auto("comfy_output_dir", "output")
 INPUTDIR = _auto("comfy_input_dir", "input")
 COMFY    = CFG.get("comfy_api", "http://127.0.0.1:8188").rstrip("/")
+LMAPI    = CFG.get("lmstudio_api", "http://127.0.0.1:1234").rstrip("/")
 GALLERY  = os.path.join(OUTDIR, "pingpong")
 TRASH    = os.path.join(GALLERY, ".trash")
 ALIVE    = os.path.join(GALLERY, ".alive")
 QUEUE    = os.path.join(HERE, "queue")
 HIDDEN   = os.path.join(HERE, "dashboard_hidden.json")
 PORT     = int(CFG.get("dashboard_port", 8910))
+EVENTS   = []
+CPU_LAST = {"t": 0, "idle": 0, "kernel": 0, "user": 0, "cpu": 0}
+YOUTUBE_CHANNEL_ID = "UC4xLnbcb7AxfJ8wdkiobaKQ"
+YT_CACHE = {"t": 0, "data": None}
+HIDDEN_SUBPROCESS_FLAGS = 0
+if os.name == "nt" and hasattr(subprocess, "CREATE_NO_WINDOW"):
+    HIDDEN_SUBPROCESS_FLAGS = subprocess.CREATE_NO_WINDOW
+
+class ReusableThreadingHTTPServer(ThreadingHTTPServer):
+    allow_reuse_address = True
+
+def run_hidden(args, **kwargs):
+    if HIDDEN_SUBPROCESS_FLAGS and "creationflags" not in kwargs:
+        kwargs["creationflags"] = HIDDEN_SUBPROCESS_FLAGS
+    return subprocess.run(args, **kwargs)
 
 IMG_EXT = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
 VID_EXT = {".mp4", ".webm", ".mov", ".mkv"}
 AUD_EXT = {".mp3", ".flac", ".wav", ".ogg", ".m4a"}
+
+def event(msg):
+    EVENTS.append({"t": time.strftime("%H:%M:%S"), "msg": msg})
+    del EVENTS[:-80]
+
+def read_config():
+    try:
+        return json.load(open(CFG_PATH, encoding="utf-8"))
+    except Exception:
+        return dict(CFG)
+
+def write_config(data):
+    global CFG, CUSTOM, LMAPI
+    tmp = CFG_PATH + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+        f.write("\n")
+    os.replace(tmp, CFG_PATH)
+    CFG = data
+    CUSTOM = CFG.get("custom_workflows", {}) or {}
+    LMAPI = CFG.get("lmstudio_api", "http://127.0.0.1:1234").rstrip("/")
+
+def _add_model(out, seen, model_id, label=None, source=""):
+    model_id = (model_id or "").strip()
+    if not model_id or model_id in seen:
+        return
+    if source != "config" and re.search(r"\b(embed|embedding|rerank)\b", model_id, re.I):
+        return
+    seen.add(model_id)
+    out.append({"id": model_id, "label": label or model_id, "source": source})
+
+def lmstudio_models():
+    cfg = read_config()
+    current = cfg.get("llm_model", "")
+    out, seen, errors = [], set(), []
+    _add_model(out, seen, current, source="config")
+    try:
+        run_hidden(["lms", "server", "start"], capture_output=True, text=True, encoding="utf-8", timeout=10)
+    except Exception as e:
+        errors.append("lms server: " + str(e)[:120])
+    try:
+        r = run_hidden(["lms", "ls", "--json"], capture_output=True, text=True, encoding="utf-8", timeout=20)
+        if r.returncode == 0 and r.stdout.strip():
+            data = json.loads(r.stdout)
+            rows = data if isinstance(data, list) else data.get("models") or data.get("data") or []
+            for m in rows:
+                if isinstance(m, str):
+                    _add_model(out, seen, m, source="lms")
+                elif isinstance(m, dict):
+                    mid = m.get("modelKey") or m.get("id") or m.get("path") or m.get("name")
+                    label = m.get("displayName") or m.get("name") or mid
+                    _add_model(out, seen, mid, label=label, source="lms")
+    except Exception as e:
+        errors.append("lms ls json: " + str(e)[:120])
+    if len(out) <= (1 if current else 0):
+        try:
+            r = run_hidden(["lms", "ls"], capture_output=True, text=True, encoding="utf-8", timeout=20)
+            if r.returncode == 0:
+                for line in r.stdout.splitlines():
+                    line = line.strip()
+                    if not line or line.lower().startswith(("you have", "listing", "identifier", "model")):
+                        continue
+                    line = re.sub(r"^[*>\-\s]+", "", line)
+                    mid = re.split(r"\s{2,}|\t", line)[0].strip()
+                    if "/" in mid or "\\" in mid or re.search(r"\b(qwen|gemma|llama|mistral|deepseek|phi|yi|openchat)\b", mid, re.I):
+                        _add_model(out, seen, mid, source="lms")
+        except Exception as e:
+            errors.append("lms ls: " + str(e)[:120])
+    try:
+        data = json.load(urllib.request.urlopen(LMAPI + "/v1/models", timeout=3))
+        for m in data.get("data", []):
+            _add_model(out, seen, m.get("id"), source="loaded")
+    except Exception as e:
+        errors.append("api: " + str(e)[:120])
+    return {"current": current, "models": out, "errors": errors[-3:]}
+
+def _filetime_to_int(ft):
+    return (ft.dwHighDateTime << 32) + ft.dwLowDateTime
+
+def cpu_percent():
+    if os.name != "nt":
+        return 0
+    try:
+        import ctypes
+        from ctypes import wintypes
+        idle = wintypes.FILETIME(); kernel = wintypes.FILETIME(); user = wintypes.FILETIME()
+        ctypes.windll.kernel32.GetSystemTimes(ctypes.byref(idle), ctypes.byref(kernel), ctypes.byref(user))
+        now = time.time()
+        i, k, u = _filetime_to_int(idle), _filetime_to_int(kernel), _filetime_to_int(user)
+        if CPU_LAST["t"]:
+            idle_delta = i - CPU_LAST["idle"]
+            total_delta = (k - CPU_LAST["kernel"]) + (u - CPU_LAST["user"])
+            if total_delta > 0:
+                CPU_LAST["cpu"] = max(0, min(100, round((1 - idle_delta / total_delta) * 100)))
+        CPU_LAST.update({"t": now, "idle": i, "kernel": k, "user": u})
+    except Exception:
+        pass
+    return CPU_LAST["cpu"]
+
+def memory_info():
+    if os.name != "nt":
+        return {"used": 0, "total": 0, "pct": 0}
+    try:
+        import ctypes
+        class MEMORYSTATUSEX(ctypes.Structure):
+            _fields_ = [
+                ("dwLength", ctypes.c_ulong), ("dwMemoryLoad", ctypes.c_ulong),
+                ("ullTotalPhys", ctypes.c_ulonglong), ("ullAvailPhys", ctypes.c_ulonglong),
+                ("ullTotalPageFile", ctypes.c_ulonglong), ("ullAvailPageFile", ctypes.c_ulonglong),
+                ("ullTotalVirtual", ctypes.c_ulonglong), ("ullAvailVirtual", ctypes.c_ulonglong),
+                ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+            ]
+        stat = MEMORYSTATUSEX(); stat.dwLength = ctypes.sizeof(stat)
+        ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(stat))
+        total = stat.ullTotalPhys / (1024 ** 3)
+        used = (stat.ullTotalPhys - stat.ullAvailPhys) / (1024 ** 3)
+        return {"used": round(used, 1), "total": round(total, 1), "pct": int(stat.dwMemoryLoad)}
+    except Exception:
+        return {"used": 0, "total": 0, "pct": 0}
+
+def gpu_info():
+    try:
+        r = run_hidden(
+            ["nvidia-smi", "--query-gpu=memory.used,memory.total,utilization.gpu", "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=2
+        )
+        if r.returncode == 0 and r.stdout.strip():
+            used, total, util = [int(x.strip()) for x in r.stdout.splitlines()[0].split(",")[:3]]
+            return {"used": used, "total": total, "pct": round(used * 100 / total), "util": util}
+    except Exception:
+        pass
+    return {"used": 0, "total": 0, "pct": 0, "util": 0}
+
+def comfy_snapshot():
+    snap = {"ok": False, "running": 0, "pending": 0, "recent": []}
+    try:
+        q = json.load(urllib.request.urlopen(COMFY + "/queue", timeout=2))
+        snap["ok"] = True
+        snap["running"] = len(q.get("queue_running") or [])
+        snap["pending"] = len(q.get("queue_pending") or [])
+    except Exception as e:
+        snap["recent"].append("Comfy queue error: " + str(e)[:120])
+    try:
+        hist = json.load(urllib.request.urlopen(COMFY + "/history", timeout=2))
+        for pid, item in list(hist.items())[-5:]:
+            status_msg = item.get("status", {}).get("status_str", "done")
+            snap["recent"].append(f"{pid[:8]} {status_msg}")
+    except Exception:
+        pass
+    return snap
+
+def local_queue_count():
+    try:
+        return len([f for f in os.listdir(QUEUE) if f.endswith(".json")])
+    except FileNotFoundError:
+        return 0
+    except Exception:
+        return 0
+
+def system_info():
+    snap = comfy_snapshot()
+    snap["local_queue"] = local_queue_count()
+    return {"cpu": cpu_percent(), "ram": memory_info(), "gpu": gpu_info(), "comfy": snap}
+
+def comfy_log():
+    snap = comfy_snapshot()
+    local_q = local_queue_count()
+    lines = [f"Comfy {'ONLINE' if snap['ok'] else 'OFFLINE'} | running {snap['running']} | pending {snap['pending']} | pingpong queue {local_q}"]
+    lines += snap["recent"]
+    lines += [f"{e['t']} {e['msg']}" for e in EVENTS[-20:]]
+    return lines[-40:]
+
+def youtube_latest():
+    if YT_CACHE["data"] and time.time() - YT_CACHE["t"] < 1800:
+        return YT_CACHE["data"]
+    data = {"ok": False}
+    try:
+        url = "https://www.youtube.com/feeds/videos.xml?channel_id=" + YOUTUBE_CHANNEL_ID
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        xml = urllib.request.urlopen(req, timeout=5).read()
+        root = ET.fromstring(xml)
+        ns = {
+            "atom": "http://www.w3.org/2005/Atom",
+            "media": "http://search.yahoo.com/mrss/",
+            "yt": "http://www.youtube.com/xml/schemas/2015",
+        }
+        entry = root.find("atom:entry", ns)
+        if entry is not None:
+            vid = (entry.findtext("yt:videoId", default="", namespaces=ns) or "").strip()
+            title = (entry.findtext("atom:title", default="", namespaces=ns) or "").strip()
+            link = entry.find("atom:link", ns)
+            href = link.get("href") if link is not None else ("https://www.youtube.com/watch?v=" + vid)
+            group = entry.find("media:group", ns)
+            thumb = ""
+            if group is not None:
+                th = group.find("media:thumbnail", ns)
+                if th is not None:
+                    thumb = th.get("url", "")
+            data = {"ok": True, "title": title, "url": href, "thumb": thumb, "videoId": vid}
+    except Exception as e:
+        data = {"ok": False, "err": str(e)[:120]}
+    if not data.get("ok"):
+        try:
+            url = "https://www.youtube.com/channel/" + YOUTUBE_CHANNEL_ID + "/videos"
+            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0", "Accept-Language": "ko,en;q=0.9"})
+            html = urllib.request.urlopen(req, timeout=8).read().decode("utf-8", "replace")
+            m = re.search(r'"videoId":"([^"]+)".{0,3000}?"title":\{"content":"(.*?)"\}', html, flags=re.S)
+            if m:
+                vid = m.group(1)
+                title = html_lib.unescape(m.group(2))
+                if "\\u" in title:
+                    title = title.encode("utf-8").decode("unicode_escape")
+                data = {
+                    "ok": True,
+                    "title": title,
+                    "url": "https://www.youtube.com/watch?v=" + vid,
+                    "thumb": "https://i.ytimg.com/vi/" + vid + "/hqdefault.jpg",
+                    "videoId": vid,
+                }
+        except Exception as e:
+            data = {"ok": False, "err": str(e)[:120]}
+    YT_CACHE.update({"t": time.time(), "data": data})
+    return data
+
+def _png_text_chunks(path):
+    out = {}
+    try:
+        with open(path, "rb") as f:
+            if f.read(8) != b"\x89PNG\r\n\x1a\n":
+                return out
+            while True:
+                raw = f.read(8)
+                if len(raw) < 8:
+                    return out
+                n, ctype = struct.unpack(">I4s", raw)
+                data = f.read(n)
+                f.read(4)
+                if ctype == b"IEND":
+                    return out
+                if ctype == b"tEXt" and b"\0" in data:
+                    key, val = data.split(b"\0", 1)
+                    out[key.decode("latin-1", "replace")] = val.decode("utf-8", "replace")
+                elif ctype == b"zTXt" and b"\0" in data:
+                    key, rest = data.split(b"\0", 1)
+                    if rest:
+                        out[key.decode("latin-1", "replace")] = zlib.decompress(rest[1:]).decode("utf-8", "replace")
+                elif ctype == b"iTXt" and b"\0" in data:
+                    parts = data.split(b"\0", 5)
+                    if len(parts) == 6:
+                        key, flag, _method, _lang, _translated, text = parts
+                        if flag == b"\x01":
+                            text = zlib.decompress(text)
+                        out[key.decode("utf-8", "replace")] = text.decode("utf-8", "replace")
+    except Exception:
+        return out
+
+def _clean_prompt(s):
+    s = (s or "").strip()
+    s = re.sub(r"<think>[\s\S]*?</think>", " ", s, flags=re.I)
+    s = re.sub(r"^\s*(?:under\s+\d+\s+words?\??\s*)?(?:let'?s\s+count|word\s+count)\s*[:\-]\s*", "", s, flags=re.I)
+    s = re.sub(r"\s*\(\s*\d+\s+words?\s*\)\s*\.?\s*$", "", s, flags=re.I)
+    s = re.sub(r'^\s*(?:revised\s+draft|final\s+version|prompt)\s*[:*,-]*\s*', '', s, flags=re.I)
+    bad = re.compile(
+        r"(?:\b(wait|actually|however|therefore|usually|given|instruction|system prompt|the input|the user|"
+        r"i should|i will|i need|let'?s|this means|looking at|since it|if i|we need|missing elements|under \d+ words?|word count)\b"
+        r"|^\s*(style|missing elements)\s*:)",
+        re.I,
+    )
+    parts = re.split(r"(?<=[.!?])\s+", s.replace("\n", " "))
+    good = [p.strip().strip('"').strip("*").strip() for p in parts if p.strip() and not bad.search(p)]
+    if good:
+        s = " ".join(good[:3])
+    return re.sub(r"\s+", " ", s).strip()[:2000]
+
+def image_prompt(path):
+    if os.path.splitext(path)[1].lower() != ".png":
+        return ""
+    raw = _png_text_chunks(path).get("prompt")
+    if not raw:
+        return ""
+    try:
+        wf = json.loads(raw)
+    except Exception:
+        return ""
+    candidates = []
+    for node in wf.values():
+        inputs = node.get("inputs", {})
+        cls = node.get("class_type", "")
+        if isinstance(inputs.get("board_json"), str):
+            try:
+                board = json.loads(inputs["board_json"])
+                for it in board.get("items", []):
+                    if it.get("type") == "text" and it.get("text"):
+                        candidates.append(it["text"])
+            except Exception:
+                pass
+        if isinstance(inputs.get("timeline_data"), str):
+            try:
+                gp = json.loads(inputs["timeline_data"]).get("global_prompt")
+                if gp:
+                    candidates.append(gp)
+            except Exception:
+                pass
+        for key in ("positive", "text", "value"):
+            val = inputs.get(key)
+            if isinstance(val, str) and len(val.strip()) > 8:
+                if "expert prompt engineer" in val.lower():
+                    continue
+                if cls == "PrimitiveStringMultiline" or key in ("positive", "text"):
+                    candidates.append(val)
+    candidates = [_clean_prompt(x) for x in candidates if _clean_prompt(x)]
+    if not candidates:
+        return ""
+    return max(candidates, key=len)
+
+def media_meta(path):
+    try:
+        meta = json.load(open(path + ".pingpong.json", encoding="utf-8"))
+        return {
+            "request": _clean_prompt(meta.get("request", "")),
+            "generated": _clean_prompt(meta.get("generated", "")),
+            "mode": meta.get("mode", ""),
+        }
+    except Exception:
+        return {"request": "", "generated": "", "mode": ""}
 
 def load_hidden():
     try:
@@ -68,8 +413,14 @@ def scan():
                 mt = os.path.getmtime(full)
             except OSError:
                 continue
-            out[kind].append({"name": fn, "rel": rel,
-                              "url": "/media/" + urllib.parse.quote(rel), "mtime": mt})
+            item = {"name": fn, "rel": rel,
+                    "url": "/media/" + urllib.parse.quote(rel), "mtime": mt}
+            if kind == "images":
+                meta = media_meta(full)
+                item["request"] = meta["request"]
+                item["prompt"] = meta["generated"] or image_prompt(full)
+                item["mode"] = meta["mode"]
+            out[kind].append(item)
     for k in ("images", "videos", "audios"):
         out[k].sort(key=lambda x: x["mtime"], reverse=True)
     return out
@@ -90,7 +441,33 @@ def status():
         queued = len([f for f in os.listdir(QUEUE) if f.endswith(".json")])
     except FileNotFoundError:
         queued = 0
-    return {"alive": alive, "generating": gen, "queued": queued}
+    return {"alive": alive or gen, "heartbeat": alive, "generating": gen, "queued": queued}
+
+def custom_modes():
+    out = []
+    for name, spec in CUSTOM.items():
+        trigger = spec.get("trigger") or ("/" + name)
+        out.append({
+            "name": name,
+            "mode": "custom:" + name,
+            "label": name,
+            "trigger": trigger,
+            "type": spec.get("type", "image"),
+            "llm": spec.get("llm", "none"),
+            "image_inputs": len(spec.get("image_nodes", [])),
+        })
+    return out
+
+def requested_image_count(text):
+    text = text or ""
+    m = re.search(r"(?<!\d)(10|[2-9])\s*(?:장|개|컷|枚|images?|pics?|pictures?)", text, flags=re.I)
+    if m:
+        return max(1, min(10, int(m.group(1))))
+    kor = {"두": 2, "세": 3, "네": 4, "다섯": 5, "여섯": 6, "일곱": 7, "여덟": 8, "아홉": 9, "열": 10}
+    for word, n in kor.items():
+        if re.search(word + r"\s*(?:장|개|컷)", text):
+            return n
+    return 1
 
 def enqueue(job):
     os.makedirs(QUEUE, exist_ok=True)
@@ -110,11 +487,54 @@ def save_dataurl(durl, idx):
         f.write(base64.b64decode(m.group(1)))
     return rel
 
+def save_director_asset(item, idx):
+    durl = item.get("data") if isinstance(item, dict) else item
+    name = item.get("name", "") if isinstance(item, dict) else ""
+    m = re.match(r"data:([^;]+);base64,(.+)", durl or "", re.S)
+    if not m:
+        return None
+    mime, payload = m.group(1).lower(), m.group(2)
+    if mime.startswith("image/"):
+        kind = "image"; ext = mimetypes.guess_extension(mime) or ".png"
+    elif mime.startswith("video/"):
+        kind = "video"; ext = mimetypes.guess_extension(mime) or ".mp4"
+    elif mime.startswith("audio/"):
+        kind = "audio"; ext = mimetypes.guess_extension(mime) or ".wav"
+    else:
+        return None
+    ts = time.strftime("%m%d_%H%M%S") + "_%d" % idx
+    safe_name = re.sub(r"[^A-Za-z0-9_.-]+", "_", os.path.splitext(name)[0])[:40] or "asset"
+    rel = "whatdreamscost/dash_%s_%s%s" % (ts, safe_name, ext)
+    dest = os.path.join(INPUTDIR, "whatdreamscost", "dash_%s_%s%s" % (ts, safe_name, ext))
+    os.makedirs(os.path.dirname(dest), exist_ok=True)
+    with open(dest, "wb") as f:
+        f.write(base64.b64decode(payload))
+    out = {"kind": kind, "rel": rel, "name": name or os.path.basename(rel)}
+    for key in ("start", "length", "trimStart", "videoStrength", "videoAttentionStrength", "resampleMode"):
+        if isinstance(item, dict) and key in item:
+            out[key] = item[key]
+    return out
+
 def safe_path(rel):
     full = os.path.normpath(os.path.join(GALLERY, rel))
     if not full.startswith(os.path.normpath(GALLERY)):
         return None
     return full
+
+def restart_self():
+    code = (
+        "import subprocess,sys,time;"
+        "time.sleep(1.2);"
+        "flags=getattr(subprocess,'CREATE_NO_WINDOW',0)|getattr(subprocess,'CREATE_NEW_PROCESS_GROUP',0)|getattr(subprocess,'DETACHED_PROCESS',0);"
+        "subprocess.Popen([sys.argv[1], sys.argv[2]], cwd=sys.argv[3], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=flags)"
+    )
+    flags = 0
+    if os.name == "nt":
+        flags = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS | HIDDEN_SUBPROCESS_FLAGS
+    subprocess.Popen([sys.executable, "-c", code, sys.executable, __file__, HERE],
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                     creationflags=flags)
+    threading.Timer(0.8, lambda: os._exit(0)).start()
 
 
 class H(BaseHTTPRequestHandler):
@@ -146,6 +566,16 @@ class H(BaseHTTPRequestHandler):
             self._json(scan())
         elif p == "/api/status":
             self._json(status())
+        elif p == "/api/modes":
+            self._json({"custom": custom_modes()})
+        elif p == "/api/llm_models":
+            self._json(lmstudio_models())
+        elif p == "/api/system":
+            self._json(system_info())
+        elif p == "/api/comfy_log":
+            self._json({"lines": comfy_log()})
+        elif p == "/api/youtube_latest":
+            self._json(youtube_latest())
         elif p.startswith("/media/"):
             self.serve_media(urllib.parse.unquote(p[len("/media/"):]))
         else:
@@ -161,6 +591,7 @@ class H(BaseHTTPRequestHandler):
             mode = body.get("mode", "image")
             text = body.get("text", "")
             imgs = body.get("images", [])
+            assets = body.get("assets", [])
             if mode in ("klein", "faceswap"):
                 rels = [save_dataurl(d, i) for i, d in enumerate(imgs)]
                 rels = [r for r in rels if r]
@@ -173,7 +604,43 @@ class H(BaseHTTPRequestHandler):
                         return self._json({"ok": False, "err": "사진 2장 필요"}, 400)
                     enqueue({"mode": "faceswap", "char_rel": rels[0], "face_rel": rels[1], "text": text})
             else:
-                enqueue({"mode": mode, "text": text})
+                job = {"mode": mode, "text": text}
+                if mode == "image":
+                    count = requested_image_count(text)
+                    if count > 1:
+                        job = {"mode": "image_fanout", "text": text, "count": count}
+                if mode == "video" and assets:
+                    saved_assets = [save_director_asset(a, i) for i, a in enumerate(assets)]
+                    job["director_assets"] = [a for a in saved_assets if a]
+                if isinstance(mode, str) and mode.startswith("custom:") and imgs:
+                    rels = [save_dataurl(d, i) for i, d in enumerate(imgs)]
+                    job["image_refs"] = [r for r in rels if r]
+                enqueue(job)
+            event(f"queued {mode}: {text[:80]}")
+            return self._json({"ok": True})
+        if p == "/api/open_gallery":
+            try:
+                os.makedirs(GALLERY, exist_ok=True)
+                os.startfile(GALLERY)
+                event("opened gallery folder")
+                return self._json({"ok": True})
+            except Exception as e:
+                return self._json({"ok": False, "err": str(e)}, 500)
+        if p == "/api/llm_model":
+            model = (body.get("model") or "").strip()
+            if not model:
+                return self._json({"ok": False, "err": "모델 이름이 비어 있어요"}, 400)
+            try:
+                cfg = read_config()
+                cfg["llm_model"] = model
+                write_config(cfg)
+                event("llm model selected: " + model)
+                return self._json({"ok": True, "model": model})
+            except Exception as e:
+                return self._json({"ok": False, "err": str(e)}, 500)
+        if p == "/api/restart_dashboard":
+            event("dashboard restart requested")
+            restart_self()
             return self._json({"ok": True})
         if p == "/api/hide":
             h = load_hidden(); h.add(body.get("rel", "")); save_hidden(h)
@@ -188,7 +655,9 @@ class H(BaseHTTPRequestHandler):
                 dest = os.path.join(TRASH, os.path.basename(full))
                 if os.path.exists(dest):
                     dest += "_" + str(int(time.time()))
-                try: os.replace(full, dest)
+                try:
+                    os.replace(full, dest)
+                    event("deleted " + os.path.basename(full))
                 except Exception as e: return self._json({"ok": False, "err": str(e)}, 500)
             return self._json({"ok": True})
         self.send_error(404)
@@ -225,7 +694,7 @@ class H(BaseHTTPRequestHandler):
                     break
                 try:
                     self.wfile.write(chunk)
-                except (BrokenPipeError, ConnectionResetError):
+                except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
                     break
                 remain -= len(chunk)
 
@@ -237,9 +706,10 @@ PAGE = r'''<!doctype html><html lang="ko"><head><meta charset="utf-8">
 <style>
 :root{--ink:#ece9ff;--mut:#a79fd6;--pink:#ff5d8f;--cyan:#56e1ff;--pur:#9d7bff;--grn:#8dffb0;--amb:#ffd166;--b1:#171228;--b2:#241b3e;--ln:rgba(255,255,255,.12)}
 *{box-sizing:border-box}
-body{margin:0;background:#0a0814;color:var(--ink);font-family:'VT323',monospace;font-size:18px;padding:18px}
+body{margin:0;background:#0a0814;color:var(--ink);font-family:'VT323',monospace;font-size:18px;padding:18px}body.modalopen{overflow:hidden}
 .pix{font-family:'Press Start 2P',monospace}
-.wrap{max-width:1100px;margin:0 auto}
+.wrap{max-width:1480px;margin:0 auto}
+.topstick{position:sticky;top:0;z-index:20;background:#0a0814;padding-top:12px;padding-bottom:10px;border-bottom:1px solid rgba(255,255,255,.08)}
 .bar{display:flex;align-items:center;justify-content:space-between;margin-bottom:14px}
 .brand{font-size:15px;line-height:1.9;color:var(--cyan)}.brand b{color:var(--pink)}.brand small{display:block;font-size:9px;color:var(--mut)}
 .stat{display:flex;align-items:center;gap:8px;font-size:10px;color:var(--mut)}
@@ -252,16 +722,29 @@ body{margin:0;background:#0a0814;color:var(--ink);font-family:'VT323',monospace;
 .gi{flex:1}.gi::placeholder{color:var(--mut)}
 .up{background:#0a0814;border:1px solid var(--ln);color:var(--mut);height:38px;padding:0 10px;border-radius:7px;cursor:pointer;font-family:'VT323';font-size:17px}.up:hover{color:var(--cyan);border-color:var(--cyan)}
 .genb{background:var(--pink);border:none;color:#220812;font-family:'Press Start 2P';font-size:10px;border-radius:7px;padding:0 14px;height:38px;cursor:pointer}.genb:hover{background:#ff85a8}
+.folderb{background:var(--b2);border:1px solid var(--ln);color:var(--ink);font-family:'VT323';font-size:17px;border-radius:7px;padding:0 10px;height:38px;cursor:pointer}.folderb:hover{color:var(--cyan);border-color:var(--cyan)}
+.llmbar{display:flex;align-items:center;gap:8px;margin:-8px 0 14px;color:var(--mut);font-size:16px}.llmbar .lk{font-size:9px;color:var(--cyan);min-width:42px}.llmbar select{flex:1;min-width:0;background:#0a0814;border:1px solid var(--ln);color:var(--ink);border-radius:7px;height:30px;font-family:'VT323';font-size:16px;padding:0 8px}.llmbar select:focus{outline:none;border-color:var(--cyan)}.llmbar button{background:var(--b2);border:1px solid var(--ln);color:var(--ink);border-radius:6px;height:30px;padding:0 9px;font-family:'VT323';font-size:15px;cursor:pointer}.llmbar button:hover{border-color:var(--cyan);color:var(--cyan)}.llmstat{max-width:280px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.assets{display:none;gap:6px;align-items:center;margin:-8px 0 12px;flex-wrap:wrap}.assets.on{display:flex}.asset{display:flex;align-items:center;gap:6px;background:var(--b1);border:1px solid var(--ln);border-radius:7px;padding:4px 7px;font-size:15px}.asset b{color:var(--cyan);font-size:12px}.asset button{border:none;background:rgba(13,11,22,.85);color:var(--ink);border-radius:5px;cursor:pointer}.asset button:hover{background:var(--amb);color:#0a0814}
+.director{display:none;margin:-4px 0 14px;border:1px solid var(--pur);border-radius:10px;background:rgba(17,13,32,.72);overflow:hidden}.director.on{display:block}.dhead{display:flex;justify-content:space-between;align-items:center;padding:9px 12px;border-bottom:1px solid var(--ln);font-size:10px;color:var(--cyan)}.dhead button{background:transparent;border:1px solid var(--ln);color:var(--mut);border-radius:6px;height:26px;padding:0 8px;font-family:'VT323';cursor:pointer}.dhead button:hover{color:var(--pink);border-color:var(--pink)}
+.dgrid{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;padding:10px}.dslot{min-width:0;border:1px solid var(--ln);border-radius:8px;background:#0a0814;padding:9px}.dtop{display:flex;justify-content:space-between;align-items:center;gap:8px;margin-bottom:8px}.dtop b{font-size:9px;color:var(--amb)}.dtop button{background:var(--b2);border:1px solid var(--ln);color:var(--ink);border-radius:6px;height:28px;padding:0 8px;font-family:'VT323';font-size:15px;cursor:pointer}.dtop button:hover{color:var(--cyan);border-color:var(--cyan)}
+.dlane{display:flex;flex-direction:column;gap:6px;min-height:44px}.ditem{display:flex;align-items:center;gap:7px;border:1px solid #241d42;border-radius:6px;padding:5px 6px;font-size:15px;background:rgba(255,255,255,.02)}.ditem .thumb{width:38px;height:30px;border-radius:5px;background:#161228;object-fit:cover;display:flex;align-items:center;justify-content:center;color:var(--pink);font-size:15px;flex:none}.ditem span{min-width:0;flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.ditem button{width:24px;height:24px;border:none;border-radius:5px;background:rgba(13,11,22,.85);color:var(--ink);cursor:pointer}.ditem button:hover{background:var(--amb);color:#0a0814}.dhint{color:var(--mut);font-size:14px;line-height:1.25;padding:3px 1px}
+.tl{padding:0 10px 10px}.tlbar{height:20px;border:1px solid var(--ln);border-radius:7px;background:#0a0814;position:relative;overflow:hidden}.tlseg{position:absolute;top:3px;height:14px;border-radius:4px;background:var(--cyan);opacity:.8}.tlseg.video{background:var(--pink)}.tlseg.audio{background:var(--amb)}.tlcap{display:flex;justify-content:space-between;color:var(--mut);font-size:13px;margin-top:4px}.ditem{flex-wrap:wrap}.ditem .dmain{display:flex;align-items:center;gap:7px;width:100%}.dtime{display:grid;grid-template-columns:repeat(3,1fr);gap:5px;width:100%;padding-left:45px}.dtime label{font-size:9px;color:var(--mut);display:flex;flex-direction:column;gap:2px}.dtime input{min-width:0;background:#0a0814;border:1px solid var(--ln);border-radius:5px;color:var(--ink);font-family:'VT323';font-size:15px;height:24px;padding:0 5px}.dtime input:focus{outline:none;border-color:var(--cyan)}
+.refboard{display:none;margin:-4px 0 14px;border:1px solid var(--pink);border-radius:10px;background:rgba(17,13,32,.72);overflow:hidden}.refboard.on{display:block}.rbody{display:grid;grid-template-columns:220px minmax(0,1fr);gap:10px;padding:10px}.refboard.swap .rbody{grid-template-columns:220px 220px minmax(0,1fr)}.rphoto{border:1px dashed var(--ln);border-radius:8px;min-height:168px;background:#0a0814;display:flex;align-items:center;justify-content:center;overflow:hidden;color:var(--mut);font-size:16px;text-align:center;padding:8px}.rphoto img{width:100%;height:100%;object-fit:cover}.rphoto.off{display:none}.rmeta{border:1px solid var(--ln);border-radius:8px;background:#0a0814;padding:10px;display:flex;flex-direction:column;gap:8px}.rmeta .rk{font-size:9px;color:var(--amb)}.rmeta .rv{font-size:18px;color:var(--ink);line-height:1.2}.racts{display:flex;gap:8px;flex-wrap:wrap}.racts button{background:var(--b2);border:1px solid var(--ln);color:var(--ink);border-radius:6px;height:30px;padding:0 9px;font-family:'VT323';font-size:15px;cursor:pointer}.racts button:hover{border-color:var(--cyan);color:var(--cyan)}
+.sysbar{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin:-6px 0 14px}.meter{background:var(--b1);border:1px solid var(--ln);border-radius:7px;padding:6px 8px}.meter .mt{display:flex;justify-content:space-between;font-size:9px;color:var(--mut);margin-bottom:5px}.meter .mb{height:5px;background:#0a0814;border-radius:9px;overflow:hidden}.meter .mf{height:100%;background:linear-gradient(90deg,var(--cyan),var(--pink));width:0%}
 .shake{animation:sh .3s}@keyframes sh{0%,100%{transform:translateX(0)}25%{transform:translateX(-5px)}75%{transform:translateX(5px)}}
+.videoFoldbar{display:flex;justify-content:space-between;align-items:center;margin:-2px 0 8px;color:var(--mut);font-size:10px}
 .mon{display:flex;gap:14px;margin-bottom:18px}
+.mon.collapsed{display:none}
 .crt{flex:1.7;background:#070611;border:7px solid #2c2350;border-radius:16px;padding:10px}
 .crt video{width:100%;aspect-ratio:16/10;border-radius:8px;background:#000;display:block}
 .now{font-size:16px;color:var(--amb);margin-top:8px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .vlist{flex:1;display:flex;flex-direction:column;gap:6px}
 .vhead{display:flex;justify-content:space-between;align-items:center;font-size:10px;color:var(--mut)}
+.vtog{background:var(--b2);border:1px solid var(--ln);color:var(--ink);border-radius:5px;height:24px;cursor:pointer;font-family:'VT323';font-size:15px}.vtog:hover{color:var(--cyan);border-color:var(--cyan)}
 .vrow{display:flex;align-items:center;gap:6px;background:var(--b1);border:1px solid var(--ln);border-radius:8px;padding:7px 9px;font-size:16px}
 .vrow .nm{flex:1;cursor:pointer;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.vrow:hover .nm{color:var(--cyan)}.vrow .tg{font-size:9px;color:var(--pink)}
 .lab{font-size:11px;color:var(--mut);letter-spacing:1px;display:flex;justify-content:space-between;align-items:center;margin:8px 0 10px}
+.content{display:grid;grid-template-columns:minmax(0,1fr) 330px;gap:18px;align-items:start}.maincol{min-width:0}
 .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:12px}
 .card{position:relative;border-radius:10px;overflow:hidden;border:2px solid #2a2150;cursor:pointer;transition:transform .15s,border-color .15s;aspect-ratio:3/4}
 .card:hover{transform:scale(1.06);border-color:var(--pink);z-index:2}
@@ -271,15 +754,27 @@ body{margin:0;background:#0a0814;color:var(--ink);font-family:'VT323',monospace;
 .tbtn{width:26px;height:26px;border:none;border-radius:6px;background:rgba(13,11,22,.85);color:#fff;cursor:pointer;font-family:'VT323';font-size:14px}.tbtn:hover{background:var(--cyan);color:#0a0814}.tbtn.del:hover{background:var(--amb);color:#0a0814}
 .chip{font-size:15px;color:var(--pur);background:var(--b2);border:1px solid var(--pur);border-radius:5px;padding:2px 8px;cursor:pointer}.chip:hover{background:var(--pur);color:#0a0814}.chip.off{display:none}
 .empty{color:var(--mut);font-size:18px;padding:30px;text-align:center;border:1px dashed var(--ln);border-radius:10px}
-.player{display:flex;align-items:center;gap:10px;margin-top:18px;background:var(--b1);border:1px solid var(--ln);border-radius:10px;padding:10px 14px;position:sticky;bottom:10px}
+.audioDock{background:var(--b1);border:1px solid var(--ln);border-radius:10px;position:sticky;top:156px;overflow:hidden}
+.plistHead{display:flex;align-items:center;justify-content:space-between;padding:8px 12px;border-bottom:1px solid var(--ln);font-size:10px;color:var(--mut)}
+.plist{max-height:calc(100vh - 310px);overflow:auto;padding:6px;display:flex;flex-direction:column;gap:5px}
+.arow{display:flex;align-items:center;gap:8px;border:1px solid transparent;border-radius:7px;padding:5px 7px;font-size:16px}.arow:hover{border-color:var(--cyan);color:var(--cyan)}.arow.on{background:rgba(255,93,143,.12);border-color:var(--pink);color:var(--amb)}
+.arow .anm{flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;cursor:pointer}.arow .adel{width:24px;height:24px;border:none;border-radius:5px;background:rgba(13,11,22,.85);color:var(--ink);cursor:pointer}.arow .adel:hover{background:var(--amb);color:#0a0814}
+.player{display:flex;align-items:center;gap:10px;padding:10px 14px;flex-wrap:wrap}
+.logbox{margin-top:12px;background:var(--b1);border:1px solid var(--ln);border-radius:10px;overflow:hidden}.loghead{width:100%;display:flex;justify-content:space-between;align-items:center;background:transparent;border:none;color:var(--mut);padding:9px 12px;cursor:pointer;font-size:10px;text-align:left}.loghead:hover{color:var(--cyan)}.logbody{display:none;max-height:260px;overflow:auto;border-top:1px solid var(--ln);padding:8px 10px;color:var(--grn);font-size:14px;white-space:pre-wrap}.logbox.open .logbody{display:block}
+.ytban{display:block;margin-top:12px;border:1px solid var(--pink);border-radius:10px;background:linear-gradient(135deg,rgba(255,93,143,.18),rgba(86,225,255,.08));padding:13px 14px;text-decoration:none;color:var(--ink);box-shadow:0 0 18px rgba(255,93,143,.12)}
+.ytban:hover{border-color:var(--cyan);box-shadow:0 0 20px rgba(86,225,255,.2)}.ytban .k{font-size:9px;color:var(--pink);margin-bottom:7px}.ytban .t{font-size:12px;color:var(--cyan);line-height:1.5}.ytban .s{font-size:16px;color:var(--amb);margin-top:6px}
+.ytlatest{display:none;margin-top:10px;border:1px solid var(--ln);border-radius:10px;overflow:hidden;background:var(--b1);text-decoration:none;color:var(--ink)}.ytlatest.on{display:block}.ytlatest img{width:100%;display:block;aspect-ratio:16/9;object-fit:cover}.ytlatest .ytxt{padding:9px 10px}.ytlatest .yk{font-size:9px;color:var(--pink);margin-bottom:6px}.ytlatest .yn{font-size:16px;color:var(--amb);line-height:1.15}.ytlatest:hover{border-color:var(--cyan)}
 .pbtn{background:var(--b2);border:1px solid var(--ln);color:var(--ink);border-radius:6px;width:34px;height:34px;cursor:pointer;font-size:16px}.pbtn:hover{color:var(--cyan);border-color:var(--cyan)}
 .ptrack{flex:1;font-size:17px;color:var(--amb);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.lb{display:none;position:fixed;inset:0;background:rgba(6,5,14,.94);align-items:center;justify-content:center;z-index:50}.lb.open{display:flex}
-.lb img{max-height:84vh;max-width:74vw;border-radius:8px;border:2px solid var(--pink);image-rendering:pixelated}
-.nav{background:var(--b2);border:1px solid var(--ln);color:var(--ink);width:46px;height:70px;border-radius:8px;font-size:26px;cursor:pointer;margin:0 12px}.nav:hover{color:var(--pink);border-color:var(--pink)}
+.vol{width:120px;accent-color:var(--pink)}
+@media (max-width:1000px){.wrap{max-width:1100px}.sysbar{grid-template-columns:repeat(2,1fr)}.dgrid,.rbody{grid-template-columns:1fr}.content{display:block}.audioDock{margin-top:18px;position:sticky;top:auto;bottom:10px}.plist{max-height:150px}}
+.lb{display:none;position:fixed;inset:0;background:rgba(6,5,14,.94);z-index:50;overflow:auto;padding:24px 84px;grid-template-rows:minmax(0,1fr) auto;place-items:center}.lb.open{display:grid}.lb.zoomed{display:block}
+.lb img{max-height:calc(100vh - 220px);max-width:min(82vw,1200px);border-radius:8px;border:2px solid var(--pink);image-rendering:auto;cursor:zoom-in;object-fit:contain}.lb.zoomed img{max-height:none;max-width:none;cursor:zoom-out;display:block;margin:24px auto}
+.nav{position:fixed;top:50%;transform:translateY(-50%);z-index:55;background:var(--b2);border:1px solid var(--ln);color:var(--ink);width:46px;height:70px;border-radius:8px;font-size:26px;cursor:pointer}.nav.prev{left:28px}.nav.next{right:28px}.nav:hover{color:var(--pink);border-color:var(--pink)}
 .lbtools{position:fixed;top:20px;right:24px;display:flex;gap:8px}.lbtools button{background:rgba(13,11,22,.7);border:1px solid var(--ln);color:var(--ink);border-radius:6px;width:36px;height:36px;cursor:pointer;font-size:15px}.lbtools button:hover{border-color:var(--pink);color:var(--pink)}
-.lbcap{position:fixed;bottom:22px;left:0;right:0;text-align:center;font-size:18px;color:var(--amb)}
-</style></head><body><div class="wrap">
+.lbcap{width:min(900px,82vw);max-height:22vh;overflow:auto;text-align:left;font-size:18px;color:var(--amb);background:rgba(10,8,20,.86);border:1px solid var(--ln);border-radius:8px;padding:10px 12px;margin-top:14px}
+.lbcap b{display:block;color:var(--cyan);font-family:'Press Start 2P',monospace;font-size:10px;margin-bottom:7px}.lbcap .k{font-family:'Press Start 2P',monospace;font-size:8px;color:var(--pink);margin:8px 0 4px}.lbcap .pr{color:var(--ink);line-height:1.25;white-space:pre-wrap}.lbcap .rq{color:var(--amb);line-height:1.25;white-space:pre-wrap}
+</style></head><body><div class="wrap"><div class="topstick">
 <div class="bar">
   <div class="brand pix">너무바쁜베짱이 <b>STUDIO</b><small>PING·PONG GALLERY v1.0</small></div>
   <div class="stat pix"><span id="hbox"></span><span><span class="dot" id="dot"></span> <span id="hstate">…</span></span></div>
@@ -290,27 +785,126 @@ body{margin:0;background:#0a0814;color:var(--ink);font-family:'VT323',monospace;
   <button class="up" id="up" style="display:none" onclick="document.getElementById('files').click()">📷 사진</button>
   <input type="file" id="files" accept="image/*" multiple style="display:none" onchange="filePick()">
   <button class="genb pix" onclick="gen()">생성 ▸</button>
+  <button class="folderb" onclick="openGallery()">📁 폴더</button>
+  <button class="folderb" onclick="restartDash()">↻ 재시작</button>
 </div>
+<div class="llmbar">
+  <span class="lk pix">LLM</span>
+  <select id="llm" onchange="saveLlmModel()"><option value="">모델 목록 불러오는 중...</option></select>
+  <button onclick="loadLlmModels()">새로고침</button>
+  <span class="llmstat" id="llmstat"></span>
+</div>
+<div class="assets" id="assets"></div>
+<div class="director" id="director">
+  <div class="dhead pix"><span>DIRECTOR BOARD</span><button onclick="clearDirector()">비우기</button></div>
+  <div class="tl"><div class="tlbar" id="tlbar"></div><div class="tlcap"><span>0f</span><span>120f</span></div></div>
+  <div class="dgrid">
+    <div class="dslot"><div class="dtop"><b class="pix">IMAGE GUIDE</b><button onclick="openPicker('image')">이미지 추가</button></div><div class="dlane" id="lane-image"></div></div>
+    <div class="dslot"><div class="dtop"><b class="pix">MOTION VIDEO</b><button onclick="openPicker('video')">영상 추가</button></div><div class="dlane" id="lane-video"></div></div>
+    <div class="dslot"><div class="dtop"><b class="pix">AUDIO GUIDE</b><button onclick="openPicker('audio')">오디오 추가</button></div><div class="dlane" id="lane-audio"></div></div>
+  </div>
+</div>
+<div class="refboard" id="refboard">
+  <div class="dhead pix"><span>TOOBUSY REFERENCE BOARD</span><button onclick="clearReference()">비우기</button></div>
+  <div class="rbody">
+    <div class="rphoto" id="rphoto">CHARACTER A</div>
+    <div class="rphoto off" id="rface">FACE A</div>
+    <div class="rmeta">
+      <div><div class="rk pix">REFERENCE</div><div class="rv" id="rname">인물 사진을 넣어주세요</div></div>
+      <div><div class="rk pix">GOAL</div><div class="rv" id="rgoal">위 프롬프트 입력창의 장면 설명이 목표 장면으로 들어가요.</div></div>
+      <div class="racts" id="racts"><button onclick="openPicker('image')">참조 이미지 선택</button><button onclick="clearReference()">이미지 제거</button></div>
+    </div>
+  </div>
+</div>
+<div class="sysbar">
+  <div class="meter"><div class="mt pix"><span>GPU VRAM</span><span id="sgpu">--</span></div><div class="mb"><div class="mf" id="bgpu"></div></div></div>
+  <div class="meter"><div class="mt pix"><span>GPU LOAD</span><span id="sgpuload">--</span></div><div class="mb"><div class="mf" id="bgpuload"></div></div></div>
+  <div class="meter"><div class="mt pix"><span>RAM</span><span id="sram">--</span></div><div class="mb"><div class="mf" id="bram"></div></div></div>
+  <div class="meter"><div class="mt pix"><span>COMFY</span><span id="scomfy">--</span></div><div class="mb"><div class="mf" id="bcomfy"></div></div></div>
+</div>
+<div class="videoFoldbar pix"><span>▶ VIDEOS</span><button class="vtog" id="vtog" onclick="toggleVideo()">펼치기</button></div>
 <div class="mon">
   <div class="crt"><video id="mon" controls playsinline></video><div class="now pix" id="now">NOW PLAYING — 없음</div></div>
-  <div class="vlist"><div class="vhead pix"><span>▶ VIDEOS</span></div><div id="vrows" style="display:flex;flex-direction:column;gap:6px"></div></div>
+  <div class="vlist"><div class="vhead pix"><span>VIDEO LIST</span></div><div id="vrows" style="display:flex;flex-direction:column;gap:6px"></div></div>
 </div>
+</div>
+<div class="content"><main class="maincol">
 <div class="lab pix"><span>■ GENERATED IMAGES <span class="chip off" id="hid" onclick="unhideAll()"></span></span><span id="upinfo" style="color:var(--mut)"></span></div>
 <div class="grid" id="grid"></div>
-<div class="player">
-  <button class="pbtn" onclick="atrk(-1)">⏮</button><button class="pbtn" id="pp" onclick="aplay()">▶</button><button class="pbtn" onclick="atrk(1)">⏭</button>
-  <div class="ptrack pix" id="ptrack">BGM — 음악 없음</div>
-  <audio id="aud"></audio>
-</div></div>
-<div class="lb" id="lb"><div class="lbtools"><button onclick="lbHide()">👁</button><button onclick="lbDel()">🗑</button><button onclick="closeLb()">✕</button></div><button class="nav" onclick="step(-1)">‹</button><img id="lbimg"><button class="nav" onclick="step(1)">›</button><div class="lbcap pix" id="lbcap"></div></div>
+</main><aside class="audioDock">
+  <div class="plistHead pix"><span>♪ PLAYLIST</span><span id="acount">0</span></div>
+  <div class="plist" id="plist"></div>
+  <div class="player">
+    <button class="pbtn" onclick="atrk(-1)">⏮</button><button class="pbtn" id="pp" onclick="aplay()">▶</button><button class="pbtn" onclick="atrk(1)">⏭</button>
+    <div class="ptrack pix" id="ptrack">BGM — 음악 없음</div>
+    <input class="vol" id="vol" type="range" min="0" max="1" step="0.01" value="0.8" title="볼륨">
+    <audio id="aud"></audio>
+  </div>
+  <div class="logbox" id="logbox"><button class="loghead pix" onclick="toggleLog()"><span>▸ COMFY LOG</span><span id="logstate">접힘</span></button><div class="logbody" id="logbody"></div></div>
+  <a class="ytban" href="https://youtube.com/channel/UC4xLnbcb7AxfJ8wdkiobaKQ?si=favM__m0syIADuZ2" target="_blank" rel="noopener">
+    <div class="k pix">TOOBUSY STUDIO</div>
+    <div class="t pix">YOUTUBE CHANNEL</div>
+    <div class="s">바로가기 ▶</div>
+  </a>
+  <a class="ytlatest" id="ytlatest" target="_blank" rel="noopener"><img id="ytthumb"><div class="ytxt"><div class="yk pix">LATEST UPLOAD</div><div class="yn" id="yttitle"></div></div></a>
+</aside></div></div>
+<div class="lb" id="lb"><div class="lbtools"><button onclick="lbHide()">👁</button><button onclick="lbDel()">🗑</button><button onclick="closeLb()">✕</button></div><button class="nav prev" onclick="step(-1)">‹</button><img id="lbimg" onclick="toggleZoom()"><button class="nav next" onclick="step(1)">›</button><div class="lbcap" id="lbcap"></div></div>
 <script>
-var IMGS=[],VIDS=[],AUDS=[],ai=0,cur=0;
+var IMGS=[],VIDS=[],AUDS=[],CUSTOMS=[],ai=0,cur=0,curAudioRel='',IMGKEY='',VIDKEY='',AUDKEY='';
 function api(p,b){return fetch(p,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b)})}
 function el(t,c){var e=document.createElement(t);if(c)e.className=c;return e}
+function esc(s){return String(s||'').replace(/[&<>"']/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]})}
+function openGallery(){api('/api/open_gallery',{}).then(function(r){return r.json()}).then(function(j){if(!j.ok)alert(j.err||'폴더를 열 수 없어요')})}
+function restartDash(){if(!confirm('대시보드를 다시 시작할까요?'))return;api('/api/restart_dashboard',{}).then(function(){setTimeout(function(){location.reload()},1800)})}
+function setLlmStatus(t){document.getElementById('llmstat').textContent=t||''}
+function loadLlmModels(){var sel=document.getElementById('llm');setLlmStatus('LM Studio 확인 중...');
+  fetch('/api/llm_models').then(function(r){return r.json()}).then(function(d){
+    sel.innerHTML='';
+    var list=d.models||[];
+    if(!list.length){var o=document.createElement('option');o.value='';o.textContent='모델을 찾지 못했어요';sel.appendChild(o);setLlmStatus('LM Studio 확인 필요');return}
+    list.forEach(function(m){var o=document.createElement('option');o.value=m.id;o.textContent=(m.label||m.id)+(m.source?' · '+m.source:'');sel.appendChild(o)});
+    sel.value=d.current||list[0].id;
+    setLlmStatus(d.current?('현재 '+d.current):'선택 필요')
+  }).catch(function(){setLlmStatus('목록 로드 실패')})
+}
+function saveLlmModel(){var sel=document.getElementById('llm'),model=sel.value;if(!model)return;setLlmStatus('저장 중...');
+  api('/api/llm_model',{model:model}).then(function(r){return r.json()}).then(function(j){
+    if(!j.ok){setLlmStatus(j.err||'저장 실패');return}
+    setLlmStatus('저장됨 · 다음 생성부터 적용')
+  }).catch(function(){setLlmStatus('저장 실패')})
+}
+function setVideoFold(fold){var m=document.querySelector('.mon'),b=document.getElementById('vtog');m.classList.toggle('collapsed',fold);b.textContent=fold?'펼치기':'접기';localStorage.setItem('pingpong_video_fold',fold?'1':'0')}
+function toggleVideo(){setVideoFold(!document.querySelector('.mon').classList.contains('collapsed'))}
+function initVideoFold(){setVideoFold(localStorage.getItem('pingpong_video_fold')!=='0')}
+function meter(bar,label,pct,text){document.getElementById(bar).style.width=Math.max(0,Math.min(100,pct||0))+'%';document.getElementById(label).textContent=text}
+function pollSystem(){fetch('/api/system').then(function(r){return r.json()}).then(function(s){
+  meter('bgpu','sgpu',s.gpu.pct,s.gpu.used?((s.gpu.used/1024).toFixed(1)+'/'+(s.gpu.total/1024).toFixed(1)+'G'):'--');
+  meter('bgpuload','sgpuload',s.gpu.util,s.gpu.used?(s.gpu.util+'%'):'--');
+  meter('bram','sram',s.ram.pct,s.ram.used?(s.ram.used+'/'+s.ram.total+'G'):'--');
+  var cq=(s.comfy.pending||0),lq=(s.comfy.local_queue||0),run=(s.comfy.running||0);
+  meter('bcomfy','scomfy',(run||cq||lq)?100:(s.comfy.ok?18:0),s.comfy.ok?('RUN '+run+' / C '+cq+' / Q '+lq):'OFF');
+})}
+function toggleLog(){var box=document.getElementById('logbox');box.classList.toggle('open');document.getElementById('logstate').textContent=box.classList.contains('open')?'열림':'접힘';if(box.classList.contains('open'))pollLog()}
+function pollLog(){if(!document.getElementById('logbox').classList.contains('open'))return;fetch('/api/comfy_log').then(function(r){return r.json()}).then(function(d){document.getElementById('logbody').textContent=(d.lines||[]).join('\n')})}
+function loadYoutube(){fetch('/api/youtube_latest').then(function(r){return r.json()}).then(function(y){
+  if(!y.ok||!y.thumb)return;
+  var a=document.getElementById('ytlatest');a.href=y.url;document.getElementById('ytthumb').src=y.thumb;document.getElementById('yttitle').textContent=y.title;a.classList.add('on')
+})}
 
+function listKey(xs){return (xs||[]).map(function(x){return x.rel+':'+Math.floor(x.mtime||0)}).join('|')}
 function load(){fetch('/api/list').then(function(r){return r.json()}).then(function(d){
-  IMGS=d.images;VIDS=d.videos;AUDS=d.audios;renderImgs();renderVids();renderAuds();
+  var ik=listKey(d.images),vk=listKey(d.videos),ak=listKey(d.audios);
+  if(ik!==IMGKEY){IMGKEY=ik;IMGS=d.images;renderImgs()}
+  if(vk!==VIDKEY){VIDKEY=vk;VIDS=d.videos;renderVids()}
+  if(ak!==AUDKEY){AUDKEY=ak;AUDS=d.audios;renderAuds()}
   var h=document.getElementById('hid');h.textContent='↺ 숨김 복구 '+d.hiddenCount;h.className='chip'+(d.hiddenCount?'':' off');
+})}
+function loadModes(){fetch('/api/modes').then(function(r){return r.json()}).then(function(d){
+  CUSTOMS=d.custom||[];var sel=document.getElementById('mode');
+  CUSTOMS.forEach(function(c){if(sel.querySelector('option[value="'+c.mode+'"]'))return;
+    var o=document.createElement('option');o.value=c.mode;o.textContent=c.label+' '+c.trigger;sel.appendChild(o)
+  });
+  modeChg();
 })}
 function renderImgs(){var g=document.getElementById('grid');g.innerHTML='';
   if(!IMGS.length){g.innerHTML='<div class="empty">아직 생성된 이미지가 없어요. 위에서 생성해보세요!</div>';return}
@@ -328,39 +922,141 @@ function renderVids(){var v=document.getElementById('vrows');v.innerHTML='';
     r.querySelector('.tbtn').onclick=function(){if(confirm('삭제할까요?'))api('/api/delete',{rel:it.rel}).then(load)};
     v.appendChild(r)});
   if(VIDS.length){var m=document.getElementById('mon');if(!m.src){m.src=VIDS[0].url;document.getElementById('now').textContent='NOW PLAYING — '+VIDS[0].name}}}
-function renderAuds(){if(AUDS.length){setTrack(Math.min(ai,AUDS.length-1))}else{document.getElementById('ptrack').textContent='BGM — 음악 없음'}}
+function renderAuds(){var a=document.getElementById('aud');
+  renderPlaylist();
+  if(!AUDS.length){curAudioRel='';a.removeAttribute('src');document.getElementById('ptrack').textContent='BGM — 음악 없음';document.getElementById('pp').textContent='▶';return}
+  var keep=curAudioRel&&AUDS.some(function(x){return x.rel===curAudioRel});
+  if(!keep)setTrack(Math.min(ai,AUDS.length-1),false);
+}
 
-function setTrack(i){if(!AUDS.length)return;ai=(i+AUDS.length)%AUDS.length;var a=document.getElementById('aud');a.src=AUDS[ai].url;document.getElementById('ptrack').textContent='BGM ♪ '+AUDS[ai].name}
-function aplay(){var a=document.getElementById('aud');if(!AUDS.length)return;if(a.paused){if(!a.src)setTrack(0);a.play();document.getElementById('pp').textContent='⏸'}else{a.pause();document.getElementById('pp').textContent='▶'}}
-function atrk(d){setTrack(ai+d);var a=document.getElementById('aud');a.play();document.getElementById('pp').textContent='⏸'}
+function renderPlaylist(){var p=document.getElementById('plist'),c=document.getElementById('acount');p.innerHTML='';c.textContent=AUDS.length;
+  if(!AUDS.length){p.innerHTML='<div class="empty">아직 음악이 없어요.</div>';return}
+  AUDS.forEach(function(it,i){var r=el('div','arow'+(it.rel===curAudioRel?' on':''));r.innerHTML='<span class="anm">'+esc(it.name)+'</span><button class="adel">×</button>';
+    r.querySelector('.anm').onclick=function(){setTrack(i,true)};
+    r.querySelector('.adel').onclick=function(e){e.stopPropagation();if(confirm('삭제할까요?'))api('/api/delete',{rel:it.rel}).then(load)};
+    p.appendChild(r)
+  })
+}
+function setTrack(i,autoplay){if(!AUDS.length)return;ai=(i+AUDS.length)%AUDS.length;var a=document.getElementById('aud');curAudioRel=AUDS[ai].rel;
+  if(!a.src||!a.src.endsWith(AUDS[ai].url)){a.src=AUDS[ai].url}
+  document.getElementById('ptrack').textContent='BGM ♪ '+AUDS[ai].name;
+  renderPlaylist();
+  if(autoplay){a.play().then(function(){document.getElementById('pp').textContent='⏸'}).catch(function(){document.getElementById('pp').textContent='▶'})}
+}
+function aplay(){var a=document.getElementById('aud');if(!AUDS.length)return;if(!a.src)setTrack(0,false);if(a.paused){a.play().then(function(){document.getElementById('pp').textContent='⏸'}).catch(function(){document.getElementById('pp').textContent='▶'})}else{a.pause();document.getElementById('pp').textContent='▶'}}
+function atrk(d){setTrack(ai+d,true)}
 document.getElementById('aud').addEventListener('ended',function(){atrk(1)});
+document.getElementById('aud').addEventListener('pause',function(){document.getElementById('pp').textContent='▶'});
+document.getElementById('aud').addEventListener('play',function(){document.getElementById('pp').textContent='⏸'});
+var vol=document.getElementById('vol'),savedVol=localStorage.getItem('pingpong_volume'),aud=document.getElementById('aud');
+if(savedVol!==null)vol.value=savedVol;aud.volume=parseFloat(vol.value);
+vol.oninput=function(){aud.volume=parseFloat(vol.value);localStorage.setItem('pingpong_volume',vol.value)};
+function typingTarget(e){var t=e.target,tag=(t&&t.tagName||'').toLowerCase();return tag==='input'||tag==='textarea'||tag==='select'||(t&&t.isContentEditable)}
 
-function openLb(i){cur=i;showLb();document.getElementById('lb').classList.add('open')}
-function showLb(){if(!IMGS.length){closeLb();return}cur=(cur+IMGS.length)%IMGS.length;document.getElementById('lbimg').src=IMGS[cur].url;document.getElementById('lbcap').textContent=IMGS[cur].name}
+function openLb(i){cur=i;showLb();document.getElementById('lb').classList.add('open');document.body.classList.add('modalopen')}
+function showLb(){if(!IMGS.length){closeLb();return}document.getElementById('lb').classList.remove('zoomed');cur=(cur+IMGS.length)%IMGS.length;var it=IMGS[cur];document.getElementById('lbimg').src=it.url;
+  var html='<b>'+esc(it.name)+'</b>';
+  html+='<div class="k">REQUEST</div><div class="rq">'+esc(it.request||'요청 원문 기록 없음 - 새 생성부터 저장돼요')+'</div>';
+  html+='<div class="k">GENERATED PROMPT</div><div class="pr">'+esc(it.prompt||'프롬프트 메타데이터 없음')+'</div>';
+  document.getElementById('lbcap').innerHTML=html
+}
+function toggleZoom(){document.getElementById('lb').classList.toggle('zoomed')}
 function step(d){cur+=d;showLb()}
-function closeLb(){document.getElementById('lb').classList.remove('open')}
+function closeLb(){document.getElementById('lb').classList.remove('open','zoomed');document.body.classList.remove('modalopen')}
 function lbHide(){var it=IMGS[cur];if(it)api('/api/hide',{rel:it.rel}).then(function(){IMGS.splice(cur,1);renderImgs();IMGS.length?showLb():closeLb();updHidQuick()})}
 function lbDel(){var it=IMGS[cur];if(it&&confirm('삭제할까요?'))api('/api/delete',{rel:it.rel}).then(function(){IMGS.splice(cur,1);renderImgs();IMGS.length?showLb():closeLb()})}
 function updHidQuick(){load()}
 function unhideAll(){api('/api/unhide_all',{}).then(load)}
-document.addEventListener('keydown',function(e){if(!document.getElementById('lb').classList.contains('open'))return;if(e.key==='ArrowRight')step(1);if(e.key==='ArrowLeft')step(-1);if(e.key==='Escape')closeLb()});
+document.addEventListener('keydown',function(e){
+  if(e.code==='Space'&&!typingTarget(e)){e.preventDefault();aplay();return}
+  if(!document.getElementById('lb').classList.contains('open'))return;
+  if(e.key==='ArrowRight')step(1);if(e.key==='ArrowLeft')step(-1);if(e.key==='Escape')closeLb()
+});
 
-function modeChg(){var m=document.getElementById('mode').value,p=document.getElementById('prompt'),u=document.getElementById('up');
+function modeChg(){var m=document.getElementById('mode').value,p=document.getElementById('prompt'),u=document.getElementById('up'),d=document.getElementById('director'),rb=document.getElementById('refboard');
   var ph={image:'무엇을 그릴까요? 예: 노을 지는 바닷가',video:'어떤 영상? 대사는 "따옴표"',song:'어떤 음악? 예: 신나는 EDM',klein:'바꿀 장면 설명 (+ 사진 1장)',faceswap:'장면(선택) + 사진 2장(몸→얼굴)'};
-  p.placeholder=ph[m];u.style.display=(m==='klein'||m==='faceswap')?'block':'none';document.getElementById('upinfo').textContent=''}
+  var c=CUSTOMS.find(function(x){return x.mode===m});
+  p.placeholder=c?('무엇을 만들까요? '+c.trigger+' 프롬프트'):ph[m];
+  d.classList.toggle('on',m==='video');
+  rb.classList.toggle('on',m==='klein'||m==='faceswap');
+  rb.classList.toggle('swap',m==='faceswap');
+  pickRole='';
+  u.style.display=(c&&c.image_inputs)?'block':'none';u.textContent='📷 이미지';
+  document.getElementById('files').accept=m==='video'?'image/*,video/*,audio/*':'image/*';
+  renderAssets();document.getElementById('upinfo').textContent=''}
 var picked=[];
-function filePick(){var fs=document.getElementById('files').files;picked=[];var done=0;
-  if(!fs.length){document.getElementById('upinfo').textContent='';return}
-  for(var i=0;i<fs.length;i++){(function(){var fr=new FileReader();fr.onload=function(){picked.push(fr.result);done++;if(done===fs.length)document.getElementById('upinfo').textContent='사진 '+picked.length+'장 첨부됨'};fr.readAsDataURL(fs[i])})()}}
+function kindOf(f){return f.type.indexOf('image/')===0?'image':(f.type.indexOf('video/')===0?'video':(f.type.indexOf('audio/')===0?'audio':'file'))}
+var pickRole='';
+function openPicker(role){pickRole=role||'';var f=document.getElementById('files');
+  f.accept=role==='image'?'image/*':(role==='video'?'video/*':(role==='audio'?'audio/*':'image/*,video/*,audio/*'));
+  f.value='';
+  f.click()
+}
+function clearDirector(){picked=picked.filter(function(x){return x&&x.kind!=='image'&&x.kind!=='video'&&x.kind!=='audio'});document.getElementById('files').value='';renderAssets()}
+function clearReference(){picked=[];document.getElementById('files').value='';renderAssets()}
+function mediaThumb(a){if(a.kind==='image')return '<img class="thumb" src="'+a.data+'">';return '<div class="thumb">'+(a.kind==='video'?'MP4':'♪')+'</div>'}
+function imageAt(n){return picked.filter(function(x){return x&&x.kind==='image'})[n]}
+function clampFrame(v,min,max){v=parseInt(v,10);if(isNaN(v))v=min;return Math.max(min,Math.min(max,v))}
+function updateAssetTime(idx,key,val){var a=picked[idx];if(!a)return;a[key]=clampFrame(val,key==='length'?1:0,120);if(key==='start'&&a.start+a.length>120)a.length=Math.max(1,120-a.start);if(key==='length'&&a.start+a.length>120)a.length=Math.max(1,120-a.start);renderAssets()}
+function renderTimeline(){var bar=document.getElementById('tlbar');if(!bar)return;bar.innerHTML='';
+  picked.filter(function(a){return a&&(a.kind==='image'||a.kind==='video'||a.kind==='audio')}).forEach(function(a){
+    var st=clampFrame(a.start||0,0,119),ln=clampFrame(a.length||120,1,120-st),seg=el('div','tlseg '+a.kind);
+    seg.style.left=(st/120*100)+'%';seg.style.width=(ln/120*100)+'%';seg.title=a.kind+' '+st+'-'+(st+ln)+'f';bar.appendChild(seg)
+  })
+}
+function renderReferenceBoard(){var photo=document.getElementById('rphoto'),face=document.getElementById('rface'),name=document.getElementById('rname'),goal=document.getElementById('rgoal'),acts=document.getElementById('racts'),m=document.getElementById('mode').value,img=imageAt(0),faceImg=imageAt(1),text=document.getElementById('prompt').value.trim();
+  if(!photo)return;
+  if(m==='faceswap'){
+    face.classList.remove('off');
+    photo.innerHTML=img?'<img src="'+img.data+'">':'BODY / SCENE';
+    face.innerHTML=faceImg?'<img src="'+faceImg.data+'">':'FACE IDENTITY';
+    name.textContent=(img?img.name:'몸/장면 사진 필요')+'  →  '+(faceImg?faceImg.name:'얼굴 사진 필요');
+    goal.textContent=text||'프롬프트는 선택 사항이에요. 비우면 원본 장면을 최대한 유지해요.';
+    acts.innerHTML="<button onclick=\"openPicker('swap-body')\">몸/장면 선택</button><button onclick=\"openPicker('swap-face')\">얼굴 선택</button><button onclick=\"clearReference()\">비우기</button>";
+  }else{
+    face.classList.add('off');
+    if(img){photo.innerHTML='<img src="'+img.data+'">';name.textContent=img.name}else{photo.textContent='CHARACTER A';name.textContent='인물 사진을 넣어주세요'}
+    goal.textContent=text||'위 프롬프트 입력창의 장면 설명이 목표 장면으로 들어가요.';
+    acts.innerHTML="<button onclick=\"openPicker('image')\">참조 이미지 선택</button><button onclick=\"clearReference()\">이미지 제거</button>";
+  }
+}
+function renderDirectorLane(kind,label){var lane=document.getElementById('lane-'+kind),items=picked.filter(function(x){return x&&x.kind===kind});lane.innerHTML='';
+  if(!items.length){lane.innerHTML='<div class="dhint">'+label+'를 넣으면 Director 노드에 같이 전달돼요.</div>';return}
+  items.forEach(function(a){var idx=picked.indexOf(a),row=el('div','ditem');a.start=clampFrame(a.start||0,0,119);a.length=clampFrame(a.length||120,1,120-a.start);a.trimStart=clampFrame(a.trimStart||0,0,9999);
+    row.innerHTML='<div class="dmain">'+mediaThumb(a)+'<span>'+esc(a.name)+'</span><button>×</button></div><div class="dtime"><label>START<input type="number" min="0" max="119" value="'+a.start+'" data-k="start"></label><label>LEN<input type="number" min="1" max="120" value="'+a.length+'" data-k="length"></label><label>TRIM<input type="number" min="0" value="'+a.trimStart+'" data-k="trimStart"></label></div>';
+    row.querySelector('button').onclick=function(){picked.splice(idx,1);renderAssets()};
+    row.querySelectorAll('input').forEach(function(inp){inp.onchange=function(){updateAssetTime(idx,inp.getAttribute('data-k'),inp.value)}});
+    lane.appendChild(row)
+  })
+}
+function renderAssets(){var box=document.getElementById('assets'),m=document.getElementById('mode').value;box.innerHTML='';box.className='assets'+(picked.length&&m!=='video'&&m!=='klein'&&m!=='faceswap'?' on':'');
+  picked.forEach(function(a,i){if(!a)return;var row=el('div','asset');row.innerHTML='<b>'+esc(a.kind.toUpperCase())+'</b><span>'+esc(a.name)+'</span><button>×</button>';row.querySelector('button').onclick=function(){picked.splice(i,1);renderAssets()};box.appendChild(row)});
+  renderDirectorLane('image','참조 이미지');
+  renderDirectorLane('video','모션 영상');
+  renderDirectorLane('audio','오디오');
+  renderTimeline();
+  renderReferenceBoard();
+  document.getElementById('upinfo').textContent=picked.length?(m==='video'?'Director 자료 '+picked.length+'개':'사진 '+picked.length+'장 첨부됨'):''
+}
+function filePick(){var fs=document.getElementById('files').files,done=0;
+  if(!fs.length){renderAssets();return}
+  var m=document.getElementById('mode').value,append=(m==='video'||m==='faceswap'),role=pickRole;if(append)picked=picked.slice();else picked=[];
+  for(var i=0;i<fs.length;i++){(function(f){var k=kindOf(f);if((role==='image'||role==='swap-body'||role==='swap-face')&&k!=='image'){done++;if(done===fs.length)renderAssets();return}if(role&&role!=='image'&&role!=='swap-body'&&role!=='swap-face'&&k!==role){done++;if(done===fs.length)renderAssets();return}var fr=new FileReader();fr.onload=function(){var item={data:fr.result,name:f.name,type:f.type,kind:k,start:0,length:120,trimStart:0};if(m==='faceswap'&&role==='swap-face'){picked[1]=item}else if(m==='faceswap'&&role==='swap-body'){picked[0]=item}else{picked.push(item)}done++;if(done===fs.length)renderAssets()};fr.readAsDataURL(f)})(fs[i])}
+  pickRole='';
+}
 function gen(){var m=document.getElementById('mode').value,p=document.getElementById('prompt'),t=p.value.trim();
-  if((m==='image'||m==='video'||m==='song')&&!t){p.classList.add('shake');setTimeout(function(){p.classList.remove('shake')},300);return}
-  if(m==='klein'&&picked.length<1){alert('사진 1장을 첨부하세요');return}
-  if(m==='faceswap'&&picked.length<2){alert('사진 2장(몸→얼굴)을 첨부하세요');return}
-  api('/api/generate',{mode:m,text:t,images:picked}).then(function(r){return r.json()}).then(function(j){
+  if((m==='image'||m==='video'||m==='song'||m.indexOf('custom:')===0)&&!t){p.classList.add('shake');setTimeout(function(){p.classList.remove('shake')},300);return}
+  var imageData=picked.filter(function(x){return x&&x.kind==='image'}).map(function(x){return x.data});
+  if(m==='klein'&&imageData.length<1){alert('사진 1장을 첨부하세요');return}
+  if(m==='faceswap'&&imageData.length<2){alert('사진 2장(몸→얼굴)을 첨부하세요');return}
+  var custom=CUSTOMS.find(function(x){return x.mode===m});
+  if(custom&&custom.image_inputs&&imageData.length<custom.image_inputs){alert('이미지 '+custom.image_inputs+'장을 첨부하세요');return}
+  api('/api/generate',{mode:m,text:t,images:imageData,assets:picked}).then(function(r){return r.json()}).then(function(j){
     if(!j.ok){alert(j.err||'실패');return}
-    p.value='';picked=[];document.getElementById('files').value='';document.getElementById('upinfo').textContent='큐에 추가됨 ✓ 봇이 곧 처리해요';
+    p.value='';picked=[];document.getElementById('files').value='';renderAssets();document.getElementById('upinfo').textContent='큐에 추가됨 ✓ 봇이 곧 처리해요';
   })}
 document.getElementById('prompt').addEventListener('keydown',function(e){if(e.key==='Enter')gen()});
+document.getElementById('prompt').addEventListener('input',renderReferenceBoard);
 
 function poll(){fetch('/api/status').then(function(r){return r.json()}).then(function(s){
   var hb=document.getElementById('hbox'),dot=document.getElementById('dot'),st=document.getElementById('hstate');
@@ -371,13 +1067,13 @@ function poll(){fetch('/api/status').then(function(r){return r.json()}).then(fun
 var rows=["0110110","1111111","1111111","0111110","0011100","0001000"],hs='';
 for(var y=0;y<6;y++)for(var x=0;x<7;x++)if(rows[y][x]==='1')hs+='<rect x='+(x*6.5)+' y='+(y*6.5)+' width=6.5 height=6.5 fill="#ff5d8f"/>';
 document.getElementById('hbox').innerHTML='<svg class="heart on" viewBox="0 0 46 40">'+hs+'</svg>';
-load();poll();setInterval(load,5000);setInterval(poll,2000);
+initVideoFold();loadModes();loadLlmModels();load();loadYoutube();poll();pollSystem();setInterval(load,5000);setInterval(poll,2000);setInterval(pollSystem,3000);setInterval(pollLog,3000);setInterval(loadYoutube,1800000);
 </script></body></html>'''
 
 
 def main():
     os.makedirs(QUEUE, exist_ok=True)
-    srv = ThreadingHTTPServer(("127.0.0.1", PORT), H)
+    srv = ReusableThreadingHTTPServer(("127.0.0.1", PORT), H)
     url = "http://127.0.0.1:%d" % PORT
     print("=" * 52)
     print("  너무바쁜베짱이 핑퐁 갤러리 대시보드")

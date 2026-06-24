@@ -185,7 +185,7 @@ def main():
         json.dump(cfg, f, ensure_ascii=False, indent=2)
     print("\n" + "=" * 54)
     print("  ✅ 설정 완료! config.json 저장됨")
-    print("  이제 '핑퐁시작.bat' 으로 봇을 켜세요.")
+    print("  이제 'run_bot.bat' 으로 봇을 켜세요.")
     print("=" * 54)
 
 if __name__ == "__main__":
