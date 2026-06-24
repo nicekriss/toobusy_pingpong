@@ -12,7 +12,7 @@ VRAM 핑퐁 오케스트레이터 (멀티모드)
 핵심: 24GB 단일 GPU에서 LLM과 ComfyUI가 번갈아 VRAM 점유.
  LLM 올리기 전 ComfyUI /free 필수(동시 상주 시 OOM). LLM은 '생각하는 순간'만 VRAM.
 """
-import os, sys, json, copy, time, random, subprocess, traceback, re, threading
+import os, sys, json, copy, time, random, subprocess, traceback, re, threading, unicodedata
 import requests
 
 try:  # 윈도우 cp949 콘솔에서 이모지/한글 출력 시 크래시 방지
@@ -61,6 +61,31 @@ MODELS = CFG.get("models", {}) or {}
 CUSTOM = CFG.get("custom_workflows", {}) or {}
 def model_of(key):
     return MODELS.get(key) or DEFAULT_MODELS[key]
+
+def reload_custom_workflows():
+    global CFG, CUSTOM
+    try:
+        latest = json.load(open(CFG_PATH, encoding="utf-8"))
+        CFG = latest
+        CUSTOM = latest.get("custom_workflows", {}) or {}
+    except Exception as e:
+        log("custom workflow reload failed:", e)
+    return CUSTOM
+
+def _custom_key(s):
+    return unicodedata.normalize("NFC", str(s or "").strip()).lower()
+
+def resolve_custom_workflow(name):
+    wanted = _custom_key(name)
+    for workflows in (CUSTOM, reload_custom_workflows()):
+        if not workflows:
+            continue
+        for key, spec in workflows.items():
+            aliases = [key, spec.get("trigger", ""), spec.get("trigger", "").lstrip("/")]
+            if wanted in {_custom_key(a) for a in aliases}:
+                return key, spec
+    available = ", ".join((s.get("trigger") or k) for k, s in CUSTOM.items()) or "none"
+    raise KeyError(f"{name} (available: {available})")
 
 def current_llm_model():
     global MODEL
@@ -688,7 +713,7 @@ def detect_mode(text):
     for kw, mode in table:
         if low.startswith(kw):
             return mode, text[len(kw):].strip()
-    for name, spec in CUSTOM.items():
+    for name, spec in reload_custom_workflows().items():
         trigger = (spec.get("trigger") or "").strip()
         if trigger and low.startswith(trigger.lower()):
             return "custom:" + name, text[len(trigger):].strip()
@@ -698,7 +723,7 @@ def detect_mode(text):
 def do_custom_text(mode, body, image_refs=None, settings=None):
     name = mode.split(":", 1)[1]
     try:
-        spec = CUSTOM[name]
+        name, spec = resolve_custom_workflow(name)
         kind = {"image": "photo", "video": "video", "audio": "audio"}[spec["type"]]
         image_refs = image_refs or []
         required_images = len(spec.get("image_nodes", []))
