@@ -15,7 +15,7 @@ if not exist "config.json" (
 echo Starting dashboard. Browser opens at http://127.0.0.1:8910
 echo Close this window to stop the dashboard.
 echo.
-python dashboard.py
+python .\dashboard_safe.py
 echo.
 echo Dashboard stopped.
 pause
