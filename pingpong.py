@@ -92,14 +92,15 @@ QUEUE_DIR = os.path.join(HERE, "queue")
 def run_job(job):
     m = job.get("mode")
     txt = (job.get("text") or "").strip()
+    settings = job.get("settings") or {}
     if isinstance(m, str) and m.startswith("custom:"):
-        do_custom_text(m, txt, job.get("image_refs") or [])
+        do_custom_text(m, txt, job.get("image_refs") or [], settings)
     elif m == "image_fanout":
-        fanout_image_jobs(txt, int(job.get("count") or requested_image_count(txt)))
+        fanout_image_jobs(txt, int(job.get("count") or requested_image_count(txt)), settings)
     elif m == "image_direct":
-        do_image_direct(txt, job.get("request") or txt)
+        do_image_direct(txt, job.get("request") or txt, settings)
     elif m in ("image", "video", "song"):
-        do_text(m, txt or "a creative, beautiful scene", job.get("director_assets") or [])
+        do_text(m, txt or "a creative, beautiful scene", job.get("director_assets") or [], settings)
     elif m == "klein":
         _klein_core(job["char_rel"], txt)
     elif m == "faceswap":
@@ -369,7 +370,7 @@ def llm_image_variations(model_id, user, count):
             prompts.append(base + f", variation {len(prompts) + 1}, unique composition and details")
     return prompts[:count]
 
-def fanout_image_jobs(body, count):
+def fanout_image_jobs(body, count, settings=None):
     count = max(2, min(10, int(count or 2)))
     tg_send(f"🧠▸ 이미지 {count}장용 프롬프트 분해 중... 한 장당 한 큐로 보낼게요.")
     comfy_free()
@@ -379,7 +380,7 @@ def fanout_image_jobs(body, count):
     finally:
         llm_down()
     for i, prompt in enumerate(prompts, 1):
-        enqueue_job({"mode": "image_direct", "text": prompt, "request": body, "source": "fanout", "idx": i, "total": count})
+        enqueue_job({"mode": "image_direct", "text": prompt, "request": body, "settings": settings or {}, "source": "fanout", "idx": i, "total": count})
     tg_send("📦▸ 독립 이미지 큐 " + str(len(prompts)) + "개 추가 완료\n" + "\n".join(f"{i}. {p[:80]}" for i, p in enumerate(prompts, 1)))
 
 def write_generation_meta(files, mode, request_text="", generated_prompt=""):
@@ -396,11 +397,11 @@ def write_generation_meta(files, mode, request_text="", generated_prompt=""):
         except Exception as e:
             log("meta write fail:", e)
 
-def do_image_direct(prompt, request_text=None):
+def do_image_direct(prompt, request_text=None, settings=None):
     prompt = (prompt or "a creative, beautiful scene").strip()
     tg_send(f"🎨▸ 큐 이미지 생성 중 ░▒▓█▓▒░ ✧\n{prompt}")
     comfy_free()
-    wf, save = inject_zit(prompt)
+    wf, save = inject_zit(prompt, settings)
     files = comfy_run(wf, save)
     write_generation_meta(files, "image", request_text or prompt, prompt)
     tg_send_file("photo", files[0], caption=prompt[:1000])
@@ -467,7 +468,35 @@ def _files_from(node_out):
 def load_wf(name):
     return json.load(open(os.path.join(HERE, "workflows", name), encoding="utf-8"))
 
-def inject_custom(spec, prompt, image_refs=None):
+def _float_setting(settings, key, default, lo, hi):
+    try:
+        val = float((settings or {}).get(key, default))
+    except Exception:
+        val = default
+    return max(lo, min(hi, val))
+
+def _int_setting(settings, key, default, lo, hi):
+    try:
+        val = int(float((settings or {}).get(key, default)))
+    except Exception:
+        val = default
+    return max(lo, min(hi, val))
+
+def _ratio_setting(settings, default="3:4"):
+    val = str((settings or {}).get("image_ratio") or default).strip()
+    allowed = {"1:1", "3:4", "4:3", "2:3", "3:2", "9:16", "16:9", "21:9"}
+    return val if val in allowed else default
+
+def _set_any_megapixels(wf, megapixels):
+    for node in wf.values():
+        inputs = node.get("inputs") if isinstance(node, dict) else None
+        if not isinstance(inputs, dict):
+            continue
+        for key in list(inputs.keys()):
+            if key == "megapixels" or key.endswith(".megapixels"):
+                inputs[key] = megapixels
+
+def inject_custom(spec, prompt, image_refs=None, settings=None):
     wf_path = os.path.join(HERE, spec["file"])
     wf = json.load(open(wf_path, encoding="utf-8"))
     tag = tag_now()
@@ -483,16 +512,24 @@ def inject_custom(spec, prompt, image_refs=None):
         wf[str(node)]["inputs"][field] = rseed()
     for node, field, value in spec.get("set_nodes", []):
         wf[str(node)]["inputs"][field] = value
+    if settings and spec.get("type") == "image":
+        _set_any_megapixels(wf, _float_setting(settings, "image_megapixels", 1.0, 0.25, 4.0))
     if spec.get("prefix_node"):
         node, field = spec["prefix_node"]
         wf[str(node)]["inputs"][field] = spec.get("prefix", "pingpong/custom_") + tag
     return wf, str(spec["output_node"])
 
-def inject_zit(prompt):
+def inject_zit(prompt, settings=None):
     wf = load_wf("toobusy_zimgt.json"); tag = tag_now()
+    ratio = _ratio_setting(settings)
+    megapixels = _float_setting(settings, "image_megapixels", 1.0, 0.25, 4.0)
     for n in ("1", "4"):
         wf[n]["inputs"]["positive"] = prompt
         wf[n]["inputs"]["seed"] = rseed()
+        wf[n]["inputs"]["ratio_preset"] = ratio
+        wf[n]["inputs"]["megapixels"] = megapixels
+        wf[n]["inputs"]["width"] = 0
+        wf[n]["inputs"]["height"] = 0
     if not CFG.get("zit_lora", False):
         wf["1"]["inputs"]["lora_slots"] = 0
         wf["1"]["inputs"]["lora_1_enable"] = False
@@ -562,13 +599,20 @@ def _apply_ltx_director_assets(td, assets, duration_frames):
             })
     return td
 
-def inject_ltx(prompt, director_assets=None):
+def inject_ltx(prompt, director_assets=None, settings=None):
     wf = load_wf("LTX_Director_2_Workflow_ggufdis_API.json"); tag = tag_now()
+    seconds = _int_setting(settings, "video_seconds", 5, 1, 20)
+    frame_rate = _int_setting(settings, "video_fps", int(wf["131"]["inputs"].get("frame_rate", 24)), 8, 30)
+    duration_frames = max(1, seconds * frame_rate)
+    wf["131"]["inputs"]["duration_seconds"] = seconds
+    wf["131"]["inputs"]["frame_rate"] = frame_rate
+    wf["131"]["inputs"]["duration_frames"] = duration_frames
+    wf["131"]["inputs"]["end_frame"] = duration_frames
     td = json.loads(wf["131"]["inputs"]["timeline_data"])
     td["global_prompt"] = prompt
-    _apply_ltx_director_assets(td, director_assets, int(wf["131"]["inputs"].get("duration_frames", 120)))
+    _apply_ltx_director_assets(td, director_assets, duration_frames)
     wf["131"]["inputs"]["timeline_data"] = json.dumps(td, ensure_ascii=False)
-    w = CFG.get("video_width", 0)
+    w = _int_setting(settings, "video_width", CFG.get("video_width", 0), 0, 1920)
     if w:
         wf["131"]["inputs"]["custom_width"] = w
         wf["131"]["inputs"]["custom_height"] = 0
@@ -651,7 +695,7 @@ def detect_mode(text):
     return "image", text
 
 # ---------- 핸들러 ----------
-def do_custom_text(mode, body, image_refs=None):
+def do_custom_text(mode, body, image_refs=None, settings=None):
     name = mode.split(":", 1)[1]
     try:
         spec = CUSTOM[name]
@@ -673,7 +717,7 @@ def do_custom_text(mode, body, image_refs=None):
             finally:
                 llm_down()
         tg_send("▸ 생성 중 ░▒▓ : " + prompt[:120])
-        wf, out = inject_custom(spec, prompt, image_refs)
+        wf, out = inject_custom(spec, prompt, image_refs, settings)
         files = comfy_run(wf, out)
         write_generation_meta(files, "custom:" + name, body, prompt)
         tg_send_file(kind, files[0], caption=prompt[:1000])
@@ -682,7 +726,7 @@ def do_custom_text(mode, body, image_refs=None):
         tg_send(f"⚠️ 커스텀 워크플로 설정 오류: {e}")
         log("custom workflow config error:", traceback.format_exc())
 
-def do_text(mode, body, director_assets=None):
+def do_text(mode, body, director_assets=None, settings=None):
     if mode == "help" or not body:
         tg_send(help_text()); return
     if mode.startswith("custom:"):
@@ -694,7 +738,7 @@ def do_text(mode, body, director_assets=None):
     if mode == "image":
         count = requested_image_count(body)
         if count > 1:
-            fanout_image_jobs(body, count)
+            fanout_image_jobs(body, count, settings)
             return
     tg_send(f"🧠▸ 두뇌 가동... ░▒▓ ({mode})\n> {body}")
     comfy_free()
@@ -714,10 +758,10 @@ def do_text(mode, body, director_assets=None):
         wf, save = inject_ace(tags, lyrics); kind = "audio"
         tg_send(f"🎼▸ 작곡 중 ░▒▓█▓▒░ ♪♬\n{payload_desc}")
     elif mode == "video":
-        wf, save = inject_ltx(prompt, director_assets); kind = "video"
+        wf, save = inject_ltx(prompt, director_assets, settings); kind = "video"
         tg_send(f"🎬▸ 필름 감는 중 📼 (수 분 소요) ░▒▓\n{prompt}")
     else:
-        wf, save = inject_zit(prompt); kind = "photo"
+        wf, save = inject_zit(prompt, settings); kind = "photo"
         tg_send(f"🎨▸ 그리는 중 ░▒▓█▓▒░ ✧\n{prompt}")
     files = comfy_run(wf, save)
     if mode == "song":

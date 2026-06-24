@@ -592,6 +592,7 @@ class H(BaseHTTPRequestHandler):
             text = body.get("text", "")
             imgs = body.get("images", [])
             assets = body.get("assets", [])
+            settings = body.get("settings", {}) if isinstance(body.get("settings", {}), dict) else {}
             if mode in ("klein", "faceswap"):
                 rels = [save_dataurl(d, i) for i, d in enumerate(imgs)]
                 rels = [r for r in rels if r]
@@ -604,11 +605,11 @@ class H(BaseHTTPRequestHandler):
                         return self._json({"ok": False, "err": "사진 2장 필요"}, 400)
                     enqueue({"mode": "faceswap", "char_rel": rels[0], "face_rel": rels[1], "text": text})
             else:
-                job = {"mode": mode, "text": text}
+                job = {"mode": mode, "text": text, "settings": settings}
                 if mode == "image":
                     count = requested_image_count(text)
                     if count > 1:
-                        job = {"mode": "image_fanout", "text": text, "count": count}
+                        job = {"mode": "image_fanout", "text": text, "count": count, "settings": settings}
                 if mode == "video" and assets:
                     saved_assets = [save_director_asset(a, i) for i, a in enumerate(assets)]
                     job["director_assets"] = [a for a in saved_assets if a]
@@ -724,6 +725,7 @@ body{margin:0;background:#0a0814;color:var(--ink);font-family:'VT323',monospace;
 .genb{background:var(--pink);border:none;color:#220812;font-family:'Press Start 2P';font-size:10px;border-radius:7px;padding:0 14px;height:38px;cursor:pointer}.genb:hover{background:#ff85a8}
 .folderb{background:var(--b2);border:1px solid var(--ln);color:var(--ink);font-family:'VT323';font-size:17px;border-radius:7px;padding:0 10px;height:38px;cursor:pointer}.folderb:hover{color:var(--cyan);border-color:var(--cyan)}
 .llmbar{display:flex;align-items:center;gap:8px;margin:-8px 0 14px;color:var(--mut);font-size:16px}.llmbar .lk{font-size:9px;color:var(--cyan);min-width:42px}.llmbar select{flex:1;min-width:0;background:#0a0814;border:1px solid var(--ln);color:var(--ink);border-radius:7px;height:30px;font-family:'VT323';font-size:16px;padding:0 8px}.llmbar select:focus{outline:none;border-color:var(--cyan)}.llmbar button{background:var(--b2);border:1px solid var(--ln);color:var(--ink);border-radius:6px;height:30px;padding:0 9px;font-family:'VT323';font-size:15px;cursor:pointer}.llmbar button:hover{border-color:var(--cyan);color:var(--cyan)}.llmstat{max-width:280px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.optbar{display:none;align-items:center;gap:8px;margin:-8px 0 14px;padding:8px 10px;background:rgba(17,13,32,.72);border:1px solid var(--ln);border-radius:9px;color:var(--mut);flex-wrap:wrap}.optbar.on{display:flex}.optbar label{display:flex;align-items:center;gap:6px;font-size:15px}.optbar .ok{font-size:9px;color:var(--amb);margin-right:2px}.optbar select,.optbar input{background:#0a0814;border:1px solid var(--ln);color:var(--ink);border-radius:6px;height:28px;font-family:'VT323';font-size:16px;padding:0 7px}.optbar select:focus,.optbar input:focus{outline:none;border-color:var(--cyan)}.optbar input{width:66px}.optgrp{display:none;gap:8px;align-items:center;flex-wrap:wrap}.optgrp.on{display:flex}
 .assets{display:none;gap:6px;align-items:center;margin:-8px 0 12px;flex-wrap:wrap}.assets.on{display:flex}.asset{display:flex;align-items:center;gap:6px;background:var(--b1);border:1px solid var(--ln);border-radius:7px;padding:4px 7px;font-size:15px}.asset b{color:var(--cyan);font-size:12px}.asset button{border:none;background:rgba(13,11,22,.85);color:var(--ink);border-radius:5px;cursor:pointer}.asset button:hover{background:var(--amb);color:#0a0814}
 .director{display:none;margin:-4px 0 14px;border:1px solid var(--pur);border-radius:10px;background:rgba(17,13,32,.72);overflow:hidden}.director.on{display:block}.dhead{display:flex;justify-content:space-between;align-items:center;padding:9px 12px;border-bottom:1px solid var(--ln);font-size:10px;color:var(--cyan)}.dhead button{background:transparent;border:1px solid var(--ln);color:var(--mut);border-radius:6px;height:26px;padding:0 8px;font-family:'VT323';cursor:pointer}.dhead button:hover{color:var(--pink);border-color:var(--pink)}
 .dgrid{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;padding:10px}.dslot{min-width:0;border:1px solid var(--ln);border-radius:8px;background:#0a0814;padding:9px}.dtop{display:flex;justify-content:space-between;align-items:center;gap:8px;margin-bottom:8px}.dtop b{font-size:9px;color:var(--amb)}.dtop button{background:var(--b2);border:1px solid var(--ln);color:var(--ink);border-radius:6px;height:28px;padding:0 8px;font-family:'VT323';font-size:15px;cursor:pointer}.dtop button:hover{color:var(--cyan);border-color:var(--cyan)}
@@ -794,6 +796,21 @@ body{margin:0;background:#0a0814;color:var(--ink);font-family:'VT323',monospace;
   <button onclick="loadLlmModels()">새로고침</button>
   <span class="llmstat" id="llmstat"></span>
 </div>
+<div class="optbar" id="optbar">
+  <span class="ok pix">OPTIONS</span>
+  <div class="optgrp" id="imgopts">
+    <label>RATIO <select id="iratio"><option>1:1</option><option selected>3:4</option><option>4:3</option><option>2:3</option><option>3:2</option><option>9:16</option><option>16:9</option><option>21:9</option></select></label>
+    <label>SIZE <select id="imp"><option value="0.5">0.5MP</option><option value="1" selected>1MP</option><option value="1.5">1.5MP</option><option value="2">2MP</option><option value="3">3MP</option><option value="4">4MP</option></select></label>
+  </div>
+  <div class="optgrp" id="editopts">
+    <label>SIZE <select id="emp"><option value="0.5">0.5MP</option><option value="1" selected>1MP</option><option value="1.5">1.5MP</option><option value="2">2MP</option><option value="3">3MP</option></select></label>
+  </div>
+  <div class="optgrp" id="vidopts">
+    <label>SECONDS <input id="vsec" type="number" min="1" max="20" value="5"></label>
+    <label>WIDTH <select id="vwidth"><option value="0" selected>AUTO</option><option value="512">512</option><option value="640">640</option><option value="768">768</option><option value="960">960</option><option value="1024">1024</option></select></label>
+    <label>FPS <select id="vfps"><option value="16">16</option><option value="24" selected>24</option><option value="30">30</option></select></label>
+  </div>
+</div>
 <div class="assets" id="assets"></div>
 <div class="director" id="director">
   <div class="dhead pix"><span>DIRECTOR BOARD</span><button onclick="clearDirector()">비우기</button></div>
@@ -850,7 +867,7 @@ body{margin:0;background:#0a0814;color:var(--ink);font-family:'VT323',monospace;
 </aside></div></div>
 <div class="lb" id="lb"><div class="lbtools"><button onclick="lbHide()">👁</button><button onclick="lbDel()">🗑</button><button onclick="closeLb()">✕</button></div><button class="nav prev" onclick="step(-1)">‹</button><img id="lbimg" onclick="toggleZoom()"><button class="nav next" onclick="step(1)">›</button><div class="lbcap" id="lbcap"></div></div>
 <script>
-var IMGS=[],VIDS=[],AUDS=[],CUSTOMS=[],ai=0,cur=0,curAudioRel='',IMGKEY='',VIDKEY='',AUDKEY='';
+var IMGS=[],VIDS=[],AUDS=[],CUSTOMS=[],ai=0,cur=0,curAudioRel='',IMGKEY='',VIDKEY='',AUDKEY='',DURATION_FRAMES=120;
 function api(p,b){return fetch(p,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b)})}
 function el(t,c){var e=document.createElement(t);if(c)e.className=c;return e}
 function esc(s){return String(s||'').replace(/[&<>"']/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]})}
@@ -873,6 +890,32 @@ function saveLlmModel(){var sel=document.getElementById('llm'),model=sel.value;i
     setLlmStatus('저장됨 · 다음 생성부터 적용')
   }).catch(function(){setLlmStatus('저장 실패')})
 }
+function optVal(id){var e=document.getElementById(id);return e?e.value:''}
+function optNum(id,def){var v=parseFloat(optVal(id));return isNaN(v)?def:v}
+function loadGenOptions(){
+  ['iratio','imp','emp','vsec','vwidth','vfps'].forEach(function(id){var v=localStorage.getItem('pingpong_'+id),e=document.getElementById(id);if(e&&v!==null)e.value=v});
+  updateDurationFrames()
+}
+function saveGenOptions(){
+  ['iratio','imp','emp','vsec','vwidth','vfps'].forEach(function(id){var e=document.getElementById(id);if(e)localStorage.setItem('pingpong_'+id,e.value)})
+}
+function updateDurationFrames(){
+  var sec=Math.max(1,Math.min(20,parseInt(optVal('vsec')||'5',10)||5));
+  var fps=Math.max(8,Math.min(30,parseInt(optVal('vfps')||'24',10)||24));
+  DURATION_FRAMES=sec*fps;
+  var caps=document.querySelectorAll('.tlcap span');if(caps[1])caps[1].textContent=DURATION_FRAMES+'f';
+  picked.forEach(function(a){if(a&&a.start!==undefined){a.start=clampFrame(a.start,0,DURATION_FRAMES-1);a.length=clampFrame(a.length||DURATION_FRAMES,1,DURATION_FRAMES-a.start)}});
+  renderTimeline()
+}
+function gatherSettings(){
+  var m=document.getElementById('mode').value,custom=CUSTOMS.find(function(x){return x.mode===m});
+  var s={};
+  if(m==='image'){s.image_ratio=optVal('iratio');s.image_megapixels=optNum('imp',1)}
+  else if(m==='video'){s.video_seconds=optNum('vsec',5);s.video_width=optNum('vwidth',0);s.video_fps=optNum('vfps',24)}
+  else if(custom&&custom.type==='image'){s.image_megapixels=optNum('emp',1)}
+  return s
+}
+['iratio','imp','emp','vsec','vwidth','vfps'].forEach(function(id){setTimeout(function(){var e=document.getElementById(id);if(e)e.onchange=function(){saveGenOptions();updateDurationFrames();renderAssets()}},0)});
 function setVideoFold(fold){var m=document.querySelector('.mon'),b=document.getElementById('vtog');m.classList.toggle('collapsed',fold);b.textContent=fold?'펼치기':'접기';localStorage.setItem('pingpong_video_fold',fold?'1':'0')}
 function toggleVideo(){setVideoFold(!document.querySelector('.mon').classList.contains('collapsed'))}
 function initVideoFold(){setVideoFold(localStorage.getItem('pingpong_video_fold')!=='0')}
@@ -973,13 +1016,17 @@ document.addEventListener('keydown',function(e){
   if(e.key==='ArrowRight')step(1);if(e.key==='ArrowLeft')step(-1);if(e.key==='Escape')closeLb()
 });
 
-function modeChg(){var m=document.getElementById('mode').value,p=document.getElementById('prompt'),u=document.getElementById('up'),d=document.getElementById('director'),rb=document.getElementById('refboard');
+function modeChg(){var m=document.getElementById('mode').value,p=document.getElementById('prompt'),u=document.getElementById('up'),d=document.getElementById('director'),rb=document.getElementById('refboard'),ob=document.getElementById('optbar'),io=document.getElementById('imgopts'),eo=document.getElementById('editopts'),vo=document.getElementById('vidopts');
   var ph={image:'무엇을 그릴까요? 예: 노을 지는 바닷가',video:'어떤 영상? 대사는 "따옴표"',song:'어떤 음악? 예: 신나는 EDM',klein:'바꿀 장면 설명 (+ 사진 1장)',faceswap:'장면(선택) + 사진 2장(몸→얼굴)'};
   var c=CUSTOMS.find(function(x){return x.mode===m});
   p.placeholder=c?('무엇을 만들까요? '+c.trigger+' 프롬프트'):ph[m];
   d.classList.toggle('on',m==='video');
   rb.classList.toggle('on',m==='klein'||m==='faceswap');
   rb.classList.toggle('swap',m==='faceswap');
+  ob.classList.toggle('on',m==='image'||m==='video'||(c&&c.type==='image'));
+  io.classList.toggle('on',m==='image');
+  eo.classList.toggle('on',!!(c&&c.type==='image'));
+  vo.classList.toggle('on',m==='video');
   pickRole='';
   u.style.display=(c&&c.image_inputs)?'block':'none';u.textContent='📷 이미지';
   document.getElementById('files').accept=m==='video'?'image/*,video/*,audio/*':'image/*';
@@ -997,11 +1044,11 @@ function clearReference(){picked=[];document.getElementById('files').value='';re
 function mediaThumb(a){if(a.kind==='image')return '<img class="thumb" src="'+a.data+'">';return '<div class="thumb">'+(a.kind==='video'?'MP4':'♪')+'</div>'}
 function imageAt(n){return picked.filter(function(x){return x&&x.kind==='image'})[n]}
 function clampFrame(v,min,max){v=parseInt(v,10);if(isNaN(v))v=min;return Math.max(min,Math.min(max,v))}
-function updateAssetTime(idx,key,val){var a=picked[idx];if(!a)return;a[key]=clampFrame(val,key==='length'?1:0,120);if(key==='start'&&a.start+a.length>120)a.length=Math.max(1,120-a.start);if(key==='length'&&a.start+a.length>120)a.length=Math.max(1,120-a.start);renderAssets()}
+function updateAssetTime(idx,key,val){var a=picked[idx];if(!a)return;a[key]=clampFrame(val,key==='length'?1:0,DURATION_FRAMES);if(key==='start'&&a.start+a.length>DURATION_FRAMES)a.length=Math.max(1,DURATION_FRAMES-a.start);if(key==='length'&&a.start+a.length>DURATION_FRAMES)a.length=Math.max(1,DURATION_FRAMES-a.start);renderAssets()}
 function renderTimeline(){var bar=document.getElementById('tlbar');if(!bar)return;bar.innerHTML='';
   picked.filter(function(a){return a&&(a.kind==='image'||a.kind==='video'||a.kind==='audio')}).forEach(function(a){
-    var st=clampFrame(a.start||0,0,119),ln=clampFrame(a.length||120,1,120-st),seg=el('div','tlseg '+a.kind);
-    seg.style.left=(st/120*100)+'%';seg.style.width=(ln/120*100)+'%';seg.title=a.kind+' '+st+'-'+(st+ln)+'f';bar.appendChild(seg)
+    var st=clampFrame(a.start||0,0,DURATION_FRAMES-1),ln=clampFrame(a.length||DURATION_FRAMES,1,DURATION_FRAMES-st),seg=el('div','tlseg '+a.kind);
+    seg.style.left=(st/DURATION_FRAMES*100)+'%';seg.style.width=(ln/DURATION_FRAMES*100)+'%';seg.title=a.kind+' '+st+'-'+(st+ln)+'f';bar.appendChild(seg)
   })
 }
 function renderReferenceBoard(){var photo=document.getElementById('rphoto'),face=document.getElementById('rface'),name=document.getElementById('rname'),goal=document.getElementById('rgoal'),acts=document.getElementById('racts'),m=document.getElementById('mode').value,img=imageAt(0),faceImg=imageAt(1),text=document.getElementById('prompt').value.trim();
@@ -1022,8 +1069,8 @@ function renderReferenceBoard(){var photo=document.getElementById('rphoto'),face
 }
 function renderDirectorLane(kind,label){var lane=document.getElementById('lane-'+kind),items=picked.filter(function(x){return x&&x.kind===kind});lane.innerHTML='';
   if(!items.length){lane.innerHTML='<div class="dhint">'+label+'를 넣으면 Director 노드에 같이 전달돼요.</div>';return}
-  items.forEach(function(a){var idx=picked.indexOf(a),row=el('div','ditem');a.start=clampFrame(a.start||0,0,119);a.length=clampFrame(a.length||120,1,120-a.start);a.trimStart=clampFrame(a.trimStart||0,0,9999);
-    row.innerHTML='<div class="dmain">'+mediaThumb(a)+'<span>'+esc(a.name)+'</span><button>×</button></div><div class="dtime"><label>START<input type="number" min="0" max="119" value="'+a.start+'" data-k="start"></label><label>LEN<input type="number" min="1" max="120" value="'+a.length+'" data-k="length"></label><label>TRIM<input type="number" min="0" value="'+a.trimStart+'" data-k="trimStart"></label></div>';
+  items.forEach(function(a){var idx=picked.indexOf(a),row=el('div','ditem');a.start=clampFrame(a.start||0,0,DURATION_FRAMES-1);a.length=clampFrame(a.length||DURATION_FRAMES,1,DURATION_FRAMES-a.start);a.trimStart=clampFrame(a.trimStart||0,0,9999);
+    row.innerHTML='<div class="dmain">'+mediaThumb(a)+'<span>'+esc(a.name)+'</span><button>×</button></div><div class="dtime"><label>START<input type="number" min="0" max="'+(DURATION_FRAMES-1)+'" value="'+a.start+'" data-k="start"></label><label>LEN<input type="number" min="1" max="'+DURATION_FRAMES+'" value="'+a.length+'" data-k="length"></label><label>TRIM<input type="number" min="0" value="'+a.trimStart+'" data-k="trimStart"></label></div>';
     row.querySelector('button').onclick=function(){picked.splice(idx,1);renderAssets()};
     row.querySelectorAll('input').forEach(function(inp){inp.onchange=function(){updateAssetTime(idx,inp.getAttribute('data-k'),inp.value)}});
     lane.appendChild(row)
@@ -1041,7 +1088,7 @@ function renderAssets(){var box=document.getElementById('assets'),m=document.get
 function filePick(){var fs=document.getElementById('files').files,done=0;
   if(!fs.length){renderAssets();return}
   var m=document.getElementById('mode').value,append=(m==='video'||m==='faceswap'),role=pickRole;if(append)picked=picked.slice();else picked=[];
-  for(var i=0;i<fs.length;i++){(function(f){var k=kindOf(f);if((role==='image'||role==='swap-body'||role==='swap-face')&&k!=='image'){done++;if(done===fs.length)renderAssets();return}if(role&&role!=='image'&&role!=='swap-body'&&role!=='swap-face'&&k!==role){done++;if(done===fs.length)renderAssets();return}var fr=new FileReader();fr.onload=function(){var item={data:fr.result,name:f.name,type:f.type,kind:k,start:0,length:120,trimStart:0};if(m==='faceswap'&&role==='swap-face'){picked[1]=item}else if(m==='faceswap'&&role==='swap-body'){picked[0]=item}else{picked.push(item)}done++;if(done===fs.length)renderAssets()};fr.readAsDataURL(f)})(fs[i])}
+  for(var i=0;i<fs.length;i++){(function(f){var k=kindOf(f);if((role==='image'||role==='swap-body'||role==='swap-face')&&k!=='image'){done++;if(done===fs.length)renderAssets();return}if(role&&role!=='image'&&role!=='swap-body'&&role!=='swap-face'&&k!==role){done++;if(done===fs.length)renderAssets();return}var fr=new FileReader();fr.onload=function(){var item={data:fr.result,name:f.name,type:f.type,kind:k,start:0,length:DURATION_FRAMES,trimStart:0};if(m==='faceswap'&&role==='swap-face'){picked[1]=item}else if(m==='faceswap'&&role==='swap-body'){picked[0]=item}else{picked.push(item)}done++;if(done===fs.length)renderAssets()};fr.readAsDataURL(f)})(fs[i])}
   pickRole='';
 }
 function gen(){var m=document.getElementById('mode').value,p=document.getElementById('prompt'),t=p.value.trim();
@@ -1051,7 +1098,8 @@ function gen(){var m=document.getElementById('mode').value,p=document.getElement
   if(m==='faceswap'&&imageData.length<2){alert('사진 2장(몸→얼굴)을 첨부하세요');return}
   var custom=CUSTOMS.find(function(x){return x.mode===m});
   if(custom&&custom.image_inputs&&imageData.length<custom.image_inputs){alert('이미지 '+custom.image_inputs+'장을 첨부하세요');return}
-  api('/api/generate',{mode:m,text:t,images:imageData,assets:picked}).then(function(r){return r.json()}).then(function(j){
+  saveGenOptions();
+  api('/api/generate',{mode:m,text:t,images:imageData,assets:picked,settings:gatherSettings()}).then(function(r){return r.json()}).then(function(j){
     if(!j.ok){alert(j.err||'실패');return}
     p.value='';picked=[];document.getElementById('files').value='';renderAssets();document.getElementById('upinfo').textContent='큐에 추가됨 ✓ 봇이 곧 처리해요';
   })}
@@ -1067,7 +1115,7 @@ function poll(){fetch('/api/status').then(function(r){return r.json()}).then(fun
 var rows=["0110110","1111111","1111111","0111110","0011100","0001000"],hs='';
 for(var y=0;y<6;y++)for(var x=0;x<7;x++)if(rows[y][x]==='1')hs+='<rect x='+(x*6.5)+' y='+(y*6.5)+' width=6.5 height=6.5 fill="#ff5d8f"/>';
 document.getElementById('hbox').innerHTML='<svg class="heart on" viewBox="0 0 46 40">'+hs+'</svg>';
-initVideoFold();loadModes();loadLlmModels();load();loadYoutube();poll();pollSystem();setInterval(load,5000);setInterval(poll,2000);setInterval(pollSystem,3000);setInterval(pollLog,3000);setInterval(loadYoutube,1800000);
+loadGenOptions();initVideoFold();loadModes();loadLlmModels();load();loadYoutube();poll();pollSystem();setInterval(load,5000);setInterval(poll,2000);setInterval(pollSystem,3000);setInterval(pollLog,3000);setInterval(loadYoutube,1800000);
 </script></body></html>'''
 
 
