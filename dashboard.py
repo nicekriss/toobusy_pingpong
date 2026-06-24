@@ -390,11 +390,15 @@ def save_hidden(s):
     except Exception:
         pass
 
-def scan():
+def scan(page=1, per=48):
     hidden = load_hidden()
-    out = {"images": [], "videos": [], "audios": [], "hiddenCount": 0}
+    page = max(1, int(page or 1))
+    per = max(12, min(96, int(per or 48)))
+    out = {"images": [], "videos": [], "audios": [], "hiddenCount": 0,
+           "imagePage": page, "imagePer": per, "imageTotal": 0, "imagePages": 1}
     if not os.path.isdir(GALLERY):
         return out
+    images = []
     for root, dirs, files in os.walk(GALLERY):
         dirs[:] = [d for d in dirs if not d.startswith(".")]
         for fn in files:
@@ -416,12 +420,24 @@ def scan():
             item = {"name": fn, "rel": rel,
                     "url": "/media/" + urllib.parse.quote(rel), "mtime": mt}
             if kind == "images":
-                meta = media_meta(full)
-                item["request"] = meta["request"]
-                item["prompt"] = meta["generated"] or image_prompt(full)
-                item["mode"] = meta["mode"]
-            out[kind].append(item)
-    for k in ("images", "videos", "audios"):
+                item["full"] = full
+                images.append(item)
+            else:
+                out[kind].append(item)
+    images.sort(key=lambda x: x["mtime"], reverse=True)
+    out["imageTotal"] = len(images)
+    out["imagePages"] = max(1, (len(images) + per - 1) // per)
+    page = min(page, out["imagePages"])
+    out["imagePage"] = page
+    start = (page - 1) * per
+    for item in images[start:start + per]:
+        full = item.pop("full")
+        meta = media_meta(full)
+        item["request"] = meta["request"]
+        item["prompt"] = meta["generated"] or image_prompt(full)
+        item["mode"] = meta["mode"]
+        out["images"].append(item)
+    for k in ("videos", "audios"):
         out[k].sort(key=lambda x: x["mtime"], reverse=True)
     return out
 
@@ -554,7 +570,8 @@ class H(BaseHTTPRequestHandler):
         return json.loads(self.rfile.read(n) or b"{}")
 
     def do_GET(self):
-        p = urllib.parse.urlparse(self.path).path
+        parsed = urllib.parse.urlparse(self.path)
+        p = parsed.path
         if p == "/" or p == "/index.html":
             b = PAGE.encode("utf-8")
             self.send_response(200)
@@ -563,7 +580,8 @@ class H(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(b)
         elif p == "/api/list":
-            self._json(scan())
+            qs = urllib.parse.parse_qs(parsed.query)
+            self._json(scan(qs.get("page", ["1"])[0], qs.get("per", ["48"])[0]))
         elif p == "/api/status":
             self._json(status())
         elif p == "/api/modes":
@@ -746,6 +764,7 @@ body{margin:0;background:#0a0814;color:var(--ink);font-family:'VT323',monospace;
 .vrow{display:flex;align-items:center;gap:6px;background:var(--b1);border:1px solid var(--ln);border-radius:8px;padding:7px 9px;font-size:16px}
 .vrow .nm{flex:1;cursor:pointer;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.vrow:hover .nm{color:var(--cyan)}.vrow .tg{font-size:9px;color:var(--pink)}
 .lab{font-size:11px;color:var(--mut);letter-spacing:1px;display:flex;justify-content:space-between;align-items:center;margin:8px 0 10px}
+.pager{display:none;align-items:center;justify-content:center;gap:8px;margin:14px 0 4px}.pager.on{display:flex}.pager button{background:var(--b2);border:1px solid var(--ln);color:var(--ink);border-radius:6px;min-width:34px;height:30px;font-family:'VT323';font-size:16px;cursor:pointer}.pager button:hover:not(:disabled){border-color:var(--cyan);color:var(--cyan)}.pager button:disabled{opacity:.35;cursor:default}.pager .pinfo{color:var(--amb);font-size:17px;min-width:160px;text-align:center}
 .content{display:grid;grid-template-columns:minmax(0,1fr) 330px;gap:18px;align-items:start}.maincol{min-width:0}
 .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:12px}
 .card{position:relative;border-radius:10px;overflow:hidden;border:2px solid #2a2150;cursor:pointer;transition:transform .15s,border-color .15s;aspect-ratio:3/4}
@@ -848,6 +867,7 @@ body{margin:0;background:#0a0814;color:var(--ink);font-family:'VT323',monospace;
 <div class="content"><main class="maincol">
 <div class="lab pix"><span>■ GENERATED IMAGES <span class="chip off" id="hid" onclick="unhideAll()"></span></span><span id="upinfo" style="color:var(--mut)"></span></div>
 <div class="grid" id="grid"></div>
+<div class="pager pix" id="pager"><button onclick="goPage(1)">≪</button><button onclick="goPage(IMGPAGE-1)">‹</button><span class="pinfo" id="pinfo"></span><button onclick="goPage(IMGPAGE+1)">›</button><button onclick="goPage(IMGPAGES)">≫</button></div>
 </main><aside class="audioDock">
   <div class="plistHead pix"><span>♪ PLAYLIST</span><span id="acount">0</span></div>
   <div class="plist" id="plist"></div>
@@ -867,7 +887,7 @@ body{margin:0;background:#0a0814;color:var(--ink);font-family:'VT323',monospace;
 </aside></div></div>
 <div class="lb" id="lb"><div class="lbtools"><button onclick="lbHide()">👁</button><button onclick="lbDel()">🗑</button><button onclick="closeLb()">✕</button></div><button class="nav prev" onclick="step(-1)">‹</button><img id="lbimg" onclick="toggleZoom()"><button class="nav next" onclick="step(1)">›</button><div class="lbcap" id="lbcap"></div></div>
 <script>
-var IMGS=[],VIDS=[],AUDS=[],CUSTOMS=[],ai=0,cur=0,curAudioRel='',IMGKEY='',VIDKEY='',AUDKEY='',DURATION_FRAMES=120;
+var IMGS=[],VIDS=[],AUDS=[],CUSTOMS=[],ai=0,cur=0,curAudioRel='',IMGKEY='',VIDKEY='',AUDKEY='',DURATION_FRAMES=120,IMGPAGE=1,IMGPAGES=1,IMGTOTAL=0,IMGPER=48;
 function api(p,b){return fetch(p,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b)})}
 function el(t,c){var e=document.createElement(t);if(c)e.className=c;return e}
 function esc(s){return String(s||'').replace(/[&<>"']/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]})}
@@ -935,13 +955,17 @@ function loadYoutube(){fetch('/api/youtube_latest').then(function(r){return r.js
 })}
 
 function listKey(xs){return (xs||[]).map(function(x){return x.rel+':'+Math.floor(x.mtime||0)}).join('|')}
-function load(){fetch('/api/list').then(function(r){return r.json()}).then(function(d){
+function load(){fetch('/api/list?page='+IMGPAGE+'&per='+IMGPER).then(function(r){return r.json()}).then(function(d){
   var ik=listKey(d.images),vk=listKey(d.videos),ak=listKey(d.audios);
+  IMGPAGE=d.imagePage||1;IMGPAGES=d.imagePages||1;IMGTOTAL=d.imageTotal||0;
   if(ik!==IMGKEY){IMGKEY=ik;IMGS=d.images;renderImgs()}
   if(vk!==VIDKEY){VIDKEY=vk;VIDS=d.videos;renderVids()}
   if(ak!==AUDKEY){AUDKEY=ak;AUDS=d.audios;renderAuds()}
+  renderPager();
   var h=document.getElementById('hid');h.textContent='↺ 숨김 복구 '+d.hiddenCount;h.className='chip'+(d.hiddenCount?'':' off');
 })}
+function goPage(p){p=Math.max(1,Math.min(IMGPAGES,p||1));if(p===IMGPAGE)return;IMGPAGE=p;IMGKEY='';load();window.scrollTo({top:document.getElementById('grid').offsetTop-180,behavior:'smooth'})}
+function renderPager(){var p=document.getElementById('pager'),info=document.getElementById('pinfo');if(!p)return;p.classList.toggle('on',IMGPAGES>1);info.textContent=IMGPAGE+' / '+IMGPAGES+'  ·  '+IMGTOTAL+' imgs';var b=p.querySelectorAll('button');b[0].disabled=b[1].disabled=IMGPAGE<=1;b[2].disabled=b[3].disabled=IMGPAGE>=IMGPAGES}
 function loadModes(){fetch('/api/modes').then(function(r){return r.json()}).then(function(d){
   CUSTOMS=d.custom||[];var sel=document.getElementById('mode');
   CUSTOMS.forEach(function(c){if(sel.querySelector('option[value="'+c.mode+'"]'))return;
