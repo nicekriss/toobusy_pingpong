@@ -12,7 +12,7 @@ VRAM 핑퐁 오케스트레이터 (멀티모드)
 핵심: 24GB 단일 GPU에서 LLM과 ComfyUI가 번갈아 VRAM 점유.
  LLM 올리기 전 ComfyUI /free 필수(동시 상주 시 OOM). LLM은 '생각하는 순간'만 VRAM.
 """
-import os, sys, json, copy, time, random, subprocess, traceback, re, threading, unicodedata, base64, mimetypes, uuid, urllib.parse
+import os, sys, json, copy, time, random, subprocess, traceback, re, threading, unicodedata, base64, mimetypes, uuid, urllib.parse, webbrowser
 import requests
 try:
     import websocket
@@ -249,10 +249,12 @@ def enqueue_job(job):
     json.dump(job, open(os.path.join(QUEUE_DIR, fn), "w", encoding="utf-8"), ensure_ascii=False)
 
 def start_dashboard():
-    url = f"http://127.0.0.1:{DASHBOARD_PORT}/api/status"
+    page_url = f"http://127.0.0.1:{DASHBOARD_PORT}"
+    status_url = page_url + "/api/status"
     try:
-        requests.get(url, timeout=1)
+        requests.get(status_url, timeout=1)
         log("dashboard already running")
+        threading.Timer(0.5, lambda: webbrowser.open(page_url)).start()
         return
     except Exception:
         pass
@@ -263,7 +265,8 @@ def start_dashboard():
         subprocess.Popen([sys.executable, os.path.join(HERE, "dashboard.py")],
                          cwd=HERE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                          creationflags=flags)
-        log("dashboard started", f"http://127.0.0.1:{DASHBOARD_PORT}")
+        threading.Timer(1.5, lambda: webbrowser.open(page_url)).start()
+        log("dashboard started", page_url)
     except Exception as e:
         log("dashboard start fail:", e)
 
