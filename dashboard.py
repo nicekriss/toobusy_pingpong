@@ -38,6 +38,7 @@ EVENTS   = []
 CPU_LAST = {"t": 0, "idle": 0, "kernel": 0, "user": 0, "cpu": 0}
 YOUTUBE_CHANNEL_ID = "UC4xLnbcb7AxfJ8wdkiobaKQ"
 YT_CACHE = {"t": 0, "data": None}
+LORA_CACHE = {"t": 0, "data": []}
 HIDDEN_SUBPROCESS_FLAGS = 0
 if os.name == "nt" and hasattr(subprocess, "CREATE_NO_WINDOW"):
     HIDDEN_SUBPROCESS_FLAGS = subprocess.CREATE_NO_WINDOW
@@ -474,6 +475,33 @@ def custom_modes():
         })
     return out
 
+def comfy_loras():
+    if time.time() - LORA_CACHE["t"] < 30:
+        return LORA_CACHE["data"]
+    names = []
+    try:
+        data = json.load(urllib.request.urlopen(COMFY + "/object_info/LoraLoader", timeout=5))
+        info = data.get("LoraLoader", data) if isinstance(data, dict) else {}
+        required = (((info.get("input") or {}).get("required") or {}) if isinstance(info, dict) else {})
+        raw = required.get("lora_name") or []
+        if isinstance(raw, list) and raw and isinstance(raw[0], list):
+            names = [str(x) for x in raw[0] if str(x).strip()]
+    except Exception:
+        names = []
+    if not names:
+        try:
+            data = json.load(urllib.request.urlopen(COMFY + "/object_info", timeout=8))
+            for info in (data or {}).values():
+                required = (((info.get("input") or {}).get("required") or {}) if isinstance(info, dict) else {})
+                raw = required.get("lora_name") or []
+                if isinstance(raw, list) and raw and isinstance(raw[0], list):
+                    names.extend(str(x) for x in raw[0] if str(x).strip())
+        except Exception:
+            pass
+    names = sorted(set(names), key=str.lower)
+    LORA_CACHE.update({"t": time.time(), "data": names})
+    return names
+
 def requested_image_count(text):
     text = text or ""
     m = re.search(r"(?<!\d)(10|[2-9])\s*(?:장|개|컷|枚|images?|pics?|pictures?)", text, flags=re.I)
@@ -632,6 +660,8 @@ class H(BaseHTTPRequestHandler):
             self._json({"custom": custom_modes()})
         elif p == "/api/llm_models":
             self._json(lmstudio_models())
+        elif p == "/api/loras":
+            self._json({"loras": comfy_loras()})
         elif p == "/api/system":
             self._json(system_info())
         elif p == "/api/comfy_log":
@@ -932,7 +962,7 @@ body{margin:0;background:#0a0814;color:var(--ink);font-family:'VT323',monospace;
 </aside></div></div>
 <div class="lb" id="lb"><div class="lbtools"><button onclick="lbHide()">👁</button><button onclick="lbDel()">🗑</button><button onclick="closeLb()">✕</button></div><button class="nav prev" onclick="step(-1)">‹</button><img id="lbimg" onclick="toggleZoom()"><button class="nav next" onclick="step(1)">›</button><div class="lbcap" id="lbcap"></div></div>
 <script>
-var IMGS=[],VIDS=[],AUDS=[],CUSTOMS=[],AUDDUR={},ai=0,cur=0,curAudioRel='',IMGKEY='',VIDKEY='',AUDKEY='',DURATION_FRAMES=120,IMGPAGE=1,IMGPAGES=1,IMGTOTAL=0,IMGPER=48;
+var IMGS=[],VIDS=[],AUDS=[],CUSTOMS=[],LORAS=[],AUDDUR={},ai=0,cur=0,curAudioRel='',IMGKEY='',VIDKEY='',AUDKEY='',DURATION_FRAMES=120,IMGPAGE=1,IMGPAGES=1,IMGTOTAL=0,IMGPER=48;
 function api(p,b){return fetch(p,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b)})}
 function el(t,c){var e=document.createElement(t);if(c)e.className=c;return e}
 function esc(s){return String(s||'').replace(/[&<>"']/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]})}
@@ -955,6 +985,7 @@ function saveLlmModel(){var sel=document.getElementById('llm'),model=sel.value;i
     setLlmStatus('저장됨 · 다음 생성부터 적용')
   }).catch(function(){setLlmStatus('저장 실패')})
 }
+function loadLoras(){fetch('/api/loras').then(function(r){return r.json()}).then(function(d){LORAS=d.loras||[];renderAssets()}).catch(function(){LORAS=[]})}
 function optVal(id){var e=document.getElementById(id);return e?e.value:''}
 function optNum(id,def){var v=parseFloat(optVal(id));return isNaN(v)?def:v}
 function loadGenOptions(){
@@ -1151,15 +1182,17 @@ function roleSelect(a,i){var roles=['character_a','character_b','character_c','c
 function setPickedBool(i,k,v){picked[i][k]=v;renderReferenceBoard()}
 function setPickedVal(i,k,v){picked[i][k]=v;renderReferenceBoard()}
 function setFaceTool(i,mode){picked[i].face_erase_enabled=mode==='erase';picked[i].face_keep_enabled=mode==='keep';renderAssets()}
+function loraOptions(selected){var vals=LORAS.slice();if(selected&&vals.indexOf(selected)<0)vals.unshift(selected);var h='<option value="">LoRA 선택</option>';vals.forEach(function(n){h+='<option value="'+esc(n)+'"'+(n===selected?' selected':'')+'>'+esc(n)+'</option>'});return h}
+function loraSelect(id,selected,onchange){return '<select class="lora-name" id="'+id+'" onchange="'+onchange+'">'+loraOptions(selected)+'</select>'}
 function boardTools(a,i){var role=a.role||'',face=role.indexOf('face_')===0||role.indexOf('character_')===0,mode=a.face_keep_enabled?'keep':(a.face_erase_enabled?'erase':'');var h='<label class="use"><input type="checkbox" '+(a.bg_remove_enabled?'checked':'')+' onchange="setPickedBool('+i+',&quot;bg_remove_enabled&quot;,this.checked)">BG</label>';
-  if(face){h+='<select title="face mask" onchange="setFaceTool('+i+',this.value)"><option value="">FACE</option><option value="erase"'+(mode==='erase'?' selected':'')+'>ERASE</option><option value="keep"'+(mode==='keep'?' selected':'')+'>KEEP</option></select><input class="lora-name" title="face LoRA" placeholder="face lora" value="'+esc(a.face_lora_name||'')+'" onchange="setPickedVal('+i+',&quot;face_lora_name&quot;,this.value);setPickedBool('+i+',&quot;face_lora_enabled&quot;,!!this.value)"><input class="short" title="face LoRA strength" type="number" step="0.05" value="'+(a.face_lora_strength||1)+'" onchange="setPickedVal('+i+',&quot;face_lora_strength&quot;,parseFloat(this.value||1))">'}
+  if(face){h+='<select title="face mask" onchange="setFaceTool('+i+',this.value)"><option value="">FACE</option><option value="erase"'+(mode==='erase'?' selected':'')+'>ERASE</option><option value="keep"'+(mode==='keep'?' selected':'')+'>KEEP</option></select>'+loraSelect('',a.face_lora_name||'','setPickedVal('+i+',&quot;face_lora_name&quot;,this.value);setPickedBool('+i+',&quot;face_lora_enabled&quot;,!!this.value)')+'<input class="short" title="face LoRA strength" type="number" step="0.05" value="'+(a.face_lora_strength||1)+'" onchange="setPickedVal('+i+',&quot;face_lora_strength&quot;,parseFloat(this.value||1))">'}
   return h
 }
-function addLoraCard(){var n=prompt('LoRA filename');if(!n)return;picked.push({kind:'lora',type:'lora',role:'lora_a',name:n,lora_name:n,lora_strength:1,lora_enabled:true,enabled:true});renderAssets()}
+function addLoraCard(){var sel=document.getElementById('loraAddSel'),n=sel?sel.value:'';if(!n){alert(LORAS.length?'LoRA를 먼저 선택해 주세요':'ComfyUI LoRA 목록을 못 불러왔어요. ComfyUI를 켜고 새로고침해 주세요.');return}picked.push({kind:'lora',type:'lora',role:'lora_a',name:n,lora_name:n,lora_strength:1,lora_enabled:true,enabled:true});renderAssets()}
 function renderAssets(){var box=document.getElementById('assets'),m=document.getElementById('mode').value;box.innerHTML='';box.className='assets'+(picked.length&&m!=='video'?' on':'');
   var boardMode=(m==='klein'||m==='faceswap');
-  picked.forEach(function(a,i){if(!a)return;if(a.enabled===undefined)a.enabled=true;var row=el('div','asset'+(a.enabled===false?' off':''));var board=(a.kind==='image'&&boardMode),lora=((a.kind==='lora'||a.type==='lora')&&boardMode);var role=board?roleSelect(a,i):'';var use=(board||lora)?'<label class="use"><input type="checkbox" '+(a.enabled!==false?'checked':'')+' onchange="picked['+i+'].enabled=this.checked;picked['+i+'].lora_enabled=this.checked;renderAssets()">USE</label>':'';var tools=board?boardTools(a,i):'';if(lora){tools='<input class="lora-name" placeholder="lora file" value="'+esc(a.lora_name||a.name||'')+'" onchange="picked['+i+'].lora_name=this.value;picked['+i+'].name=this.value;renderReferenceBoard()"><input class="short" type="number" step="0.05" value="'+(a.lora_strength||1)+'" onchange="picked['+i+'].lora_strength=parseFloat(this.value||1);renderReferenceBoard()">'}row.innerHTML='<b>'+esc((lora?'LORA':a.kind).toUpperCase())+'</b>'+use+role+tools+'<span>'+esc(a.name||a.lora_name||'')+'</span><button>×</button>';row.querySelector('button').onclick=function(){picked.splice(i,1);renderAssets()};box.appendChild(row)});
-  if(boardMode){var add=el('div','asset');add.innerHTML='<b>LORA</b><button onclick="addLoraCard()">+ ADD</button>';box.appendChild(add);box.classList.add('on')}
+  picked.forEach(function(a,i){if(!a)return;if(a.enabled===undefined)a.enabled=true;var row=el('div','asset'+(a.enabled===false?' off':''));var board=(a.kind==='image'&&boardMode),lora=((a.kind==='lora'||a.type==='lora')&&boardMode);var role=board?roleSelect(a,i):'';var use=(board||lora)?'<label class="use"><input type="checkbox" '+(a.enabled!==false?'checked':'')+' onchange="picked['+i+'].enabled=this.checked;picked['+i+'].lora_enabled=this.checked;renderAssets()">USE</label>':'';var tools=board?boardTools(a,i):'';if(lora){tools=loraSelect('',a.lora_name||a.name||'','picked['+i+'].lora_name=this.value;picked['+i+'].name=this.value;renderAssets()')+'<input class="short" type="number" step="0.05" value="'+(a.lora_strength||1)+'" onchange="picked['+i+'].lora_strength=parseFloat(this.value||1);renderReferenceBoard()">'}row.innerHTML='<b>'+esc((lora?'LORA':a.kind).toUpperCase())+'</b>'+use+role+tools+'<span>'+esc(a.name||a.lora_name||'')+'</span><button>×</button>';row.querySelector('button').onclick=function(){picked.splice(i,1);renderAssets()};box.appendChild(row)});
+  if(boardMode){var add=el('div','asset');add.innerHTML='<b>LORA</b>'+loraSelect('loraAddSel','','')+'<button onclick="addLoraCard()">+ ADD</button>';box.appendChild(add);box.classList.add('on')}
   renderDirectorLane('image','참조 이미지');
   renderDirectorLane('video','모션 영상');
   renderDirectorLane('audio','오디오');
@@ -1197,7 +1230,7 @@ function poll(){fetch('/api/status').then(function(r){return r.json()}).then(fun
 var rows=["0110110","1111111","1111111","0111110","0011100","0001000"],hs='';
 for(var y=0;y<6;y++)for(var x=0;x<7;x++)if(rows[y][x]==='1')hs+='<rect x='+(x*6.5)+' y='+(y*6.5)+' width=6.5 height=6.5 fill="#ff5d8f"/>';
 document.getElementById('hbox').innerHTML='<svg class="heart on" viewBox="0 0 46 40">'+hs+'</svg>';
-loadGenOptions();initVideoFold();loadModes();loadLlmModels();load();loadYoutube();poll();pollSystem();setInterval(load,5000);setInterval(poll,2000);setInterval(pollSystem,3000);setInterval(pollLog,3000);setInterval(loadYoutube,1800000);
+loadGenOptions();initVideoFold();loadModes();loadLlmModels();loadLoras();load();loadYoutube();poll();pollSystem();setInterval(load,5000);setInterval(poll,2000);setInterval(pollSystem,3000);setInterval(pollLog,3000);setInterval(loadYoutube,1800000);
 </script></body></html>'''
 
 
