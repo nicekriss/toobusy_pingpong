@@ -91,6 +91,43 @@
           1
         ]
       ]
+    },
+    "LTX레퍼시트": {
+      "file": "workflows/LTX-2.3_ICLoRA_Ingredients_Single_Stage_Distilled_API.json",
+      "trigger": "/레퍼영상",
+      "type": "video",
+      "llm": "none",
+      "prompt_nodes": [
+        [
+          "2483",
+          "text"
+        ]
+      ],
+      "image_nodes": [
+        [
+          "2004",
+          "image"
+        ]
+      ],
+      "seed_nodes": [
+        [
+          "4832",
+          "noise_seed"
+        ]
+      ],
+      "prefix_node": [
+        "4852",
+        "filename_prefix"
+      ],
+      "prefix": "pingpong/ltx_refsheet_",
+      "output_node": "4852",
+      "video_length_node": [
+        "5072",
+        "value"
+      ],
+      "fps": 24,
+      "length_extra_frames": 1,
+      "default_seconds": 10
     }
   }
 }

@@ -570,6 +570,12 @@ def inject_custom(spec, prompt, image_refs=None, settings=None):
         wf[str(node)]["inputs"][field] = rseed()
     for node, field, value in spec.get("set_nodes", []):
         wf[str(node)]["inputs"][field] = value
+    if settings and spec.get("type") == "video" and spec.get("video_length_node"):
+        node, field = spec["video_length_node"]
+        fps = int(spec.get("fps", 24) or 24)
+        extra = int(spec.get("length_extra_frames", 1) or 0)
+        seconds = _int_setting(settings, "video_seconds", int(spec.get("default_seconds", 5) or 5), 1, 60)
+        wf[str(node)]["inputs"][field] = seconds * fps + extra
     if settings and spec.get("type") == "image":
         _set_any_megapixels(wf, _float_setting(settings, "image_megapixels", 1.0, 0.25, 4.0))
         if spec.get("ratio_node"):
