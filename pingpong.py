@@ -520,6 +520,12 @@ def _ratio_setting(settings, default="3:4"):
     allowed = {"1:1", "3:4", "4:3", "2:3", "3:2", "9:16", "16:9", "21:9"}
     return val if val in allowed else default
 
+def _custom_ratio_value(spec, ratio):
+    mapping = spec.get("ratio_map") or {}
+    if ratio in mapping:
+        return mapping[ratio]
+    return ratio
+
 def _bool_setting(settings, key, default=False):
     val = (settings or {}).get(key, default)
     if isinstance(val, bool):
@@ -566,6 +572,9 @@ def inject_custom(spec, prompt, image_refs=None, settings=None):
         wf[str(node)]["inputs"][field] = value
     if settings and spec.get("type") == "image":
         _set_any_megapixels(wf, _float_setting(settings, "image_megapixels", 1.0, 0.25, 4.0))
+        if spec.get("ratio_node"):
+            node, field = spec["ratio_node"]
+            wf[str(node)]["inputs"][field] = _custom_ratio_value(spec, _ratio_setting(settings))
     if spec.get("prefix_node"):
         node, field = spec["prefix_node"]
         wf[str(node)]["inputs"][field] = spec.get("prefix", "pingpong/custom_") + tag

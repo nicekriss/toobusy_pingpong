@@ -472,6 +472,7 @@ def custom_modes():
             "type": spec.get("type", "image"),
             "llm": spec.get("llm", "none"),
             "image_inputs": len(spec.get("image_nodes", [])),
+            "ratio": bool(spec.get("ratio_node")),
         })
     return out
 
@@ -1008,7 +1009,7 @@ function gatherSettings(){
   var s={};
   if(m==='image'){s.image_ratio=optVal('iratio');s.zit_upscale=optVal('zup')==='1';s.zit_scale_by=optNum('zscale',0.5)}
   else if(m==='video'){s.video_seconds=optNum('vsec',5);s.video_width=optNum('vwidth',0);s.video_fps=optNum('vfps',24)}
-  else if(custom&&custom.type==='image'){s.image_megapixels=optNum('emp',1)}
+  else if(custom&&custom.type==='image'){s.image_megapixels=optNum('emp',1);if(custom.ratio)s.image_ratio=optVal('iratio')}
   return s
 }
 ['iratio','zup','zscale','emp','vsec','vwidth','vfps'].forEach(function(id){setTimeout(function(){var e=document.getElementById(id);if(e)e.onchange=function(){saveGenOptions();updateDurationFrames();renderAssets()}},0)});
@@ -1126,7 +1127,8 @@ function modeChg(){var m=document.getElementById('mode').value,p=document.getEle
   rb.classList.toggle('on',m==='klein');
   rb.classList.remove('swap');
   ob.classList.toggle('on',m==='image'||m==='video'||(c&&c.type==='image'));
-  io.classList.toggle('on',m==='image');
+  io.classList.toggle('on',m==='image'||!!(c&&c.type==='image'&&c.ratio));
+  ['zup','zscale'].forEach(function(id){var e=document.getElementById(id),l=e&&e.closest('label');if(l)l.style.display=(m==='image')?'flex':'none'});
   eo.classList.toggle('on',!!(c&&c.type==='image'));
   vo.classList.toggle('on',m==='video');
   pickRole='';

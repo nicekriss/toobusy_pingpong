@@ -39,7 +39,21 @@
         "filename_prefix"
       ],
       "prefix": "pingpong/sticker_",
-      "output_node": "9"
+      "output_node": "9",
+      "ratio_node": [
+        "49",
+        "aspect_ratio"
+      ],
+      "ratio_map": {
+        "1:1": "1:1 (Square)",
+        "3:4": "3:4 (Portrait)",
+        "4:3": "4:3 (Landscape)",
+        "2:3": "2:3 (Portrait)",
+        "3:2": "3:2 (Landscape)",
+        "9:16": "9:16 (Portrait)",
+        "16:9": "16:9 (Landscape)",
+        "21:9": "21:9 (Cinematic)"
+      }
     },
     "부구편집": {
       "file": "workflows/image_boogu_image_0_1_edit_API.json",
