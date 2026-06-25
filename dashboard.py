@@ -43,6 +43,7 @@ YOUTUBE_CHANNEL_ID = "UC4xLnbcb7AxfJ8wdkiobaKQ"
 YT_CACHE = {"t": 0, "data": None}
 LORA_CACHE = {"t": 0, "data": []}
 MODE_STATUS_CACHE = {"t": 0, "data": {}}
+AUDIO_LYRICS_CACHE = {}
 HIDDEN_SUBPROCESS_FLAGS = 0
 if os.name == "nt" and hasattr(subprocess, "CREATE_NO_WINDOW"):
     HIDDEN_SUBPROCESS_FLAGS = subprocess.CREATE_NO_WINDOW
@@ -403,6 +404,118 @@ def media_meta(path):
     except Exception:
         return {"request": "", "generated": "", "mode": ""}
 
+def _decode_audio_text(enc, data):
+    if not data:
+        return ""
+    codec = {0: "latin-1", 1: "utf-16", 2: "utf-16-be", 3: "utf-8"}.get(enc, "utf-8")
+    return data.decode(codec, "replace").replace("\x00", "").strip()
+
+def _split_encoded_text(enc, data):
+    if enc in (1, 2):
+        for sep in (b"\x00\x00",):
+            i = data.find(sep)
+            if i >= 0:
+                return data[:i], data[i + len(sep):]
+    for sep in (b"\x00",):
+        i = data.find(sep)
+        if i >= 0:
+            return data[:i], data[i + len(sep):]
+    return b"", data
+
+def _id3_size(raw):
+    return ((raw[0] & 0x7f) << 21) | ((raw[1] & 0x7f) << 14) | ((raw[2] & 0x7f) << 7) | (raw[3] & 0x7f)
+
+def _audio_lyrics_id3(path):
+    try:
+        with open(path, "rb") as f:
+            head = f.read(10)
+            if len(head) < 10 or head[:3] != b"ID3":
+                return ""
+            major = head[3]
+            tag = f.read(_id3_size(head[6:10]))
+    except Exception:
+        return ""
+    pos = 0
+    while pos + 10 <= len(tag):
+        fid = tag[pos:pos + 4].decode("latin-1", "ignore")
+        if not fid.strip("\x00"):
+            break
+        size = _id3_size(tag[pos + 4:pos + 8]) if major == 4 else int.from_bytes(tag[pos + 4:pos + 8], "big")
+        data = tag[pos + 10:pos + 10 + size]
+        pos += 10 + max(0, size)
+        if not data:
+            continue
+        if fid in ("USLT", "SYLT") and len(data) > 4:
+            enc = data[0]
+            _, text = _split_encoded_text(enc, data[4:])
+            out = _decode_audio_text(enc, text)
+            if out:
+                return out
+        if fid == "TXXX" and len(data) > 1:
+            enc = data[0]
+            desc, text = _split_encoded_text(enc, data[1:])
+            if "lyric" in _decode_audio_text(enc, desc).lower():
+                out = _decode_audio_text(enc, text)
+                if out:
+                    return out
+    return ""
+
+def _audio_lyrics_flac(path):
+    try:
+        with open(path, "rb") as f:
+            if f.read(4) != b"fLaC":
+                return ""
+            last = False
+            while not last:
+                h = f.read(4)
+                if len(h) < 4:
+                    break
+                last = bool(h[0] & 0x80)
+                typ = h[0] & 0x7f
+                size = int.from_bytes(h[1:4], "big")
+                block = f.read(size)
+                if typ != 4 or len(block) < 8:
+                    continue
+                p = 0
+                vendor_len = int.from_bytes(block[p:p + 4], "little"); p += 4 + vendor_len
+                n = int.from_bytes(block[p:p + 4], "little"); p += 4
+                for _ in range(n):
+                    ln = int.from_bytes(block[p:p + 4], "little"); p += 4
+                    text = block[p:p + ln].decode("utf-8", "replace"); p += ln
+                    key, _, val = text.partition("=")
+                    if key.lower() in ("lyrics", "unsyncedlyrics", "description") and val.strip():
+                        return val.strip()
+    except Exception:
+        pass
+    return ""
+
+def _audio_lyrics_sidecar(path):
+    try:
+        raw = json.load(open(path + ".pingpong.json", encoding="utf-8")).get("generated", "")
+    except Exception:
+        return ""
+    m = re.search(r"LYRICS:\s*(.+)", raw or "", flags=re.I | re.S)
+    return m.group(1).strip() if m else ""
+
+def audio_lyrics(path):
+    try:
+        mt = os.path.getmtime(path)
+    except OSError:
+        mt = 0
+    cached = AUDIO_LYRICS_CACHE.get(path)
+    if cached and cached.get("mtime") == mt:
+        return cached.get("lyrics", "")
+    ext = os.path.splitext(path)[1].lower()
+    text = _audio_lyrics_id3(path) if ext in (".mp3", ".m4a") else ""
+    if not text and ext == ".flac":
+        text = _audio_lyrics_flac(path)
+    if not text:
+        text = _audio_lyrics_sidecar(path)
+    text = re.sub(r"\r\n?", "\n", text or "").strip()
+    text = text[:12000]
+    AUDIO_LYRICS_CACHE[path] = {"mtime": mt, "lyrics": text}
+    return text
+
 def load_hidden():
     try:
         return set(json.load(open(HIDDEN, encoding="utf-8")))
@@ -497,6 +610,8 @@ def scan(page=1, per=48):
                 item["full"] = full
                 images.append(item)
             else:
+                if kind == "audios":
+                    item["lyrics"] = audio_lyrics(full)
                 out[kind].append(item)
     images.sort(key=lambda x: x["mtime"], reverse=True)
     out["imageTotal"] = len(images)
@@ -1133,6 +1248,8 @@ body{margin:0;background:#0a0814;color:var(--ink);font-family:'VT323',monospace;
 .arow{display:flex;align-items:center;gap:8px;border:1px solid transparent;border-radius:7px;padding:5px 7px;font-size:16px}.arow:hover{border-color:var(--cyan);color:var(--cyan)}.arow.on{background:rgba(255,93,143,.12);border-color:var(--pink);color:var(--amb)}
 .arow .anm{flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;cursor:pointer}.arow .adur{color:var(--mut);font-size:14px;min-width:42px;text-align:right}.arow .adel{width:24px;height:24px;border:none;border-radius:5px;background:rgba(13,11,22,.85);color:var(--ink);cursor:pointer}.arow .adel:hover{background:var(--amb);color:#0a0814}
 .player{display:flex;align-items:center;gap:10px;padding:10px 14px;flex-wrap:wrap}
+.pbtn.on{border-color:var(--pink);color:var(--pink);box-shadow:0 0 12px rgba(255,93,143,.2)}
+.lyrics{display:none;border-top:1px solid var(--ln);background:rgba(10,8,20,.55)}.lyrics.on{display:block}.lyhead{width:100%;display:flex;justify-content:space-between;align-items:center;background:transparent;border:none;color:var(--mut);padding:8px 12px;cursor:pointer;font-size:10px;text-align:left}.lyhead:hover{color:var(--cyan)}.lybody{display:none;max-height:240px;overflow:auto;margin:0;padding:0 12px 12px;color:var(--ink);font-family:'VT323';font-size:16px;line-height:1.22;white-space:pre-wrap}.lyrics.open .lybody{display:block}.lyrics .has{color:var(--amb)}
 .logbox{margin-top:12px;background:var(--b1);border:1px solid var(--ln);border-radius:10px;overflow:hidden}.loghead{width:100%;display:flex;justify-content:space-between;align-items:center;background:transparent;border:none;color:var(--mut);padding:9px 12px;cursor:pointer;font-size:10px;text-align:left}.loghead:hover{color:var(--cyan)}.logbody{display:none;max-height:260px;overflow:auto;border-top:1px solid var(--ln);padding:8px 10px;color:var(--grn);font-size:14px;white-space:pre-wrap}.logbox.open .logbody{display:block}
 .ytban{display:block;margin-top:12px;border:1px solid var(--pink);border-radius:10px;background:linear-gradient(135deg,rgba(255,93,143,.18),rgba(86,225,255,.08));padding:13px 14px;text-decoration:none;color:var(--ink);box-shadow:0 0 18px rgba(255,93,143,.12)}
 .ytban:hover{border-color:var(--cyan);box-shadow:0 0 20px rgba(86,225,255,.2)}.ytban .k{font-size:9px;color:var(--pink);margin-bottom:7px}.ytban .t{font-size:12px;color:var(--cyan);line-height:1.5}.ytban .s{font-size:16px;color:var(--amb);margin-top:6px}
@@ -1229,11 +1346,12 @@ body{margin:0;background:#0a0814;color:var(--ink);font-family:'VT323',monospace;
   <div class="plistHead pix"><span>♪ PLAYLIST</span><span id="acount">0</span></div>
   <div class="plist" id="plist"></div>
   <div class="player">
-    <button class="pbtn" onclick="atrk(-1)">⏮</button><button class="pbtn" id="pp" onclick="aplay()">▶</button><button class="pbtn" onclick="atrk(1)">⏭</button>
+    <button class="pbtn" id="shuf" onclick="toggleShuffle()" title="셔플">🔀</button><button class="pbtn" onclick="atrk(-1)">⏮</button><button class="pbtn" id="pp" onclick="aplay()">▶</button><button class="pbtn" onclick="atrk(1)">⏭</button>
     <div class="ptrack pix" id="ptrack">BGM — 음악 없음</div>
     <input class="vol" id="vol" type="range" min="0" max="1" step="0.01" value="0.8" title="볼륨">
     <audio id="aud"></audio>
   </div>
+  <div class="lyrics" id="lyrics"><button class="lyhead pix" onclick="toggleLyrics()"><span>LYRICS</span><span class="has" id="lyrstate">없음</span></button><pre class="lybody" id="lyrbody"></pre></div>
   <div class="logbox" id="logbox"><button class="loghead pix" onclick="toggleLog()"><span>▸ COMFY LOG</span><span id="logstate">접힘</span></button><div class="logbody" id="logbody"></div></div>
   <a class="ytban" href="https://youtube.com/channel/UC4xLnbcb7AxfJ8wdkiobaKQ?si=favM__m0syIADuZ2" target="_blank" rel="noopener">
     <div class="k pix">TOOBUSY STUDIO</div>
@@ -1244,7 +1362,7 @@ body{margin:0;background:#0a0814;color:var(--ink);font-family:'VT323',monospace;
 </aside></div></div>
 <div class="lb" id="lb"><div class="lbtools"><button onclick="lbHide()">👁</button><button onclick="lbDel()">🗑</button><button onclick="closeLb()">✕</button></div><button class="nav prev" onclick="step(-1)">‹</button><img id="lbimg" onclick="toggleZoom()"><button class="nav next" onclick="step(1)">›</button><div class="lbcap" id="lbcap"></div></div>
 <script>
-var IMGS=[],VIDS=[],AUDS=[],CUSTOMS=[],LORAS=[],BOARD_PRESETS=[],AUDDUR={},MODE_STATUS={},ai=0,cur=0,curAudioRel='',IMGKEY='',VIDKEY='',AUDKEY='',DURATION_FRAMES=120,IMGPAGE=1,IMGPAGES=1,IMGTOTAL=0,IMGPER=48;
+var IMGS=[],VIDS=[],AUDS=[],CUSTOMS=[],LORAS=[],BOARD_PRESETS=[],AUDDUR={},MODE_STATUS={},SHUFFLE=false,ai=0,cur=0,curAudioRel='',IMGKEY='',VIDKEY='',AUDKEY='',DURATION_FRAMES=120,IMGPAGE=1,IMGPAGES=1,IMGTOTAL=0,IMGPER=48;
 function api(p,b){return fetch(p,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b)})}
 function el(t,c){var e=document.createElement(t);if(c)e.className=c;return e}
 function esc(s){return String(s||'').replace(/[&<>"']/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]})}
@@ -1370,7 +1488,7 @@ function renderVids(){var v=document.getElementById('vrows');v.innerHTML='';
   if(VIDS.length){var m=document.getElementById('mon');if(!m.src){m.src=VIDS[0].url;document.getElementById('now').textContent='NOW PLAYING — '+VIDS[0].name}}}
 function renderAuds(){var a=document.getElementById('aud');
   renderPlaylist();
-  if(!AUDS.length){curAudioRel='';a.removeAttribute('src');document.getElementById('ptrack').textContent='BGM — 음악 없음';document.getElementById('pp').textContent='▶';return}
+  if(!AUDS.length){curAudioRel='';a.removeAttribute('src');document.getElementById('ptrack').textContent='BGM — 음악 없음';document.getElementById('pp').textContent='▶';updateLyrics(null);return}
   var keep=curAudioRel&&AUDS.some(function(x){return x.rel===curAudioRel});
   if(!keep)setTrack(Math.min(ai,AUDS.length-1),false);
 }
@@ -1385,20 +1503,27 @@ function renderPlaylist(){var p=document.getElementById('plist'),c=document.getE
 }
 function fmtDur(v){if(!v||!isFinite(v))return '--:--';v=Math.round(v);return Math.floor(v/60)+':'+String(v%60).padStart(2,'0')}
 function loadAudDur(it){if(AUDDUR[it.rel])return;var a=new Audio();a.preload='metadata';a.src=it.url;a.onloadedmetadata=function(){AUDDUR[it.rel]=a.duration;renderPlaylist()}}
+function updateShuffleButton(){var b=document.getElementById('shuf');if(b)b.classList.toggle('on',SHUFFLE)}
+function toggleShuffle(){SHUFFLE=!SHUFFLE;localStorage.setItem('pingpong_shuffle',SHUFFLE?'1':'0');updateShuffleButton()}
+function nextAudioIndex(d){if(!AUDS.length)return 0;if(SHUFFLE&&d>0&&AUDS.length>1){var n=ai;while(n===ai)n=Math.floor(Math.random()*AUDS.length);return n}return (ai+d+AUDS.length)%AUDS.length}
+function toggleLyrics(){var box=document.getElementById('lyrics');if(box&&box.classList.contains('on'))box.classList.toggle('open')}
+function updateLyrics(it){var box=document.getElementById('lyrics'),state=document.getElementById('lyrstate'),body=document.getElementById('lyrbody');if(!box||!state||!body)return;var txt=(it&&it.lyrics||'').trim();box.classList.toggle('on',!!txt);if(txt){state.textContent='있음';body.textContent=txt}else{state.textContent='없음';body.textContent=''}}
 function setTrack(i,autoplay){if(!AUDS.length)return;ai=(i+AUDS.length)%AUDS.length;var a=document.getElementById('aud');curAudioRel=AUDS[ai].rel;
   if(!a.src||!a.src.endsWith(AUDS[ai].url)){a.src=AUDS[ai].url}
   document.getElementById('ptrack').textContent='BGM ♪ '+AUDS[ai].name;
+  updateLyrics(AUDS[ai]);
   renderPlaylist();
   if(autoplay){a.play().then(function(){document.getElementById('pp').textContent='⏸'}).catch(function(){document.getElementById('pp').textContent='▶'})}
 }
 function aplay(){var a=document.getElementById('aud');if(!AUDS.length)return;if(!a.src)setTrack(0,false);if(a.paused){a.play().then(function(){document.getElementById('pp').textContent='⏸'}).catch(function(){document.getElementById('pp').textContent='▶'})}else{a.pause();document.getElementById('pp').textContent='▶'}}
-function atrk(d){setTrack(ai+d,true)}
+function atrk(d){setTrack(nextAudioIndex(d),true)}
 document.getElementById('aud').addEventListener('ended',function(){atrk(1)});
 document.getElementById('aud').addEventListener('pause',function(){document.getElementById('pp').textContent='▶'});
 document.getElementById('aud').addEventListener('play',function(){document.getElementById('pp').textContent='⏸'});
 var vol=document.getElementById('vol'),savedVol=localStorage.getItem('pingpong_volume'),aud=document.getElementById('aud');
 if(savedVol!==null)vol.value=savedVol;aud.volume=parseFloat(vol.value);
 vol.oninput=function(){aud.volume=parseFloat(vol.value);localStorage.setItem('pingpong_volume',vol.value)};
+SHUFFLE=localStorage.getItem('pingpong_shuffle')==='1';updateShuffleButton();
 function typingTarget(e){var t=e.target,tag=(t&&t.tagName||'').toLowerCase();return tag==='input'||tag==='textarea'||tag==='select'||(t&&t.isContentEditable)}
 
 function openLb(i){cur=i;showLb();document.getElementById('lb').classList.add('open');document.body.classList.add('modalopen')}

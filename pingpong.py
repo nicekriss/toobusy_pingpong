@@ -1057,7 +1057,7 @@ def do_text(mode, body, director_assets=None, settings=None):
         tg_send(f"🎨▸ 그리는 중 ░▒▓█▓▒░ ✧\n{prompt}")
     files = comfy_run(wf, save)
     if mode == "song":
-        write_generation_meta(files, mode, body, payload_desc)
+        write_generation_meta(files, mode, body, f"TAGS:\n{tags}\n\nLYRICS:\n{lyrics}")
     else:
         write_generation_meta(files, mode, body, prompt)
     tg_send_file(kind, files[0], caption=payload_desc)
