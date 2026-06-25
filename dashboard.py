@@ -1204,7 +1204,7 @@ body{margin:0;background:#0a0814;color:var(--ink);font-family:'VT323',monospace;
 .gi{flex:1}.gi::placeholder{color:var(--mut)}
 .up{background:#0a0814;border:1px solid var(--ln);color:var(--mut);height:38px;padding:0 10px;border-radius:7px;cursor:pointer;font-family:'VT323';font-size:17px}.up:hover{color:var(--cyan);border-color:var(--cyan)}
 .genb{background:var(--pink);border:none;color:#220812;font-family:'Press Start 2P';font-size:10px;border-radius:7px;padding:0 14px;height:38px;cursor:pointer}.genb:hover{background:#ff85a8}
-.folderb{background:var(--b2);border:1px solid var(--ln);color:var(--ink);font-family:'VT323';font-size:17px;border-radius:7px;padding:0 10px;height:38px;cursor:pointer}.folderb:hover{color:var(--cyan);border-color:var(--cyan)}
+.folderb{background:var(--b2);border:1px solid var(--ln);color:var(--ink);font-family:'VT323';font-size:17px;border-radius:7px;padding:0 10px;height:38px;cursor:pointer}.folderb:hover:not(:disabled){color:var(--cyan);border-color:var(--cyan)}.folderb:disabled{opacity:.38;cursor:default;color:var(--mut);border-color:var(--ln)}
 .modehint{display:none;margin:-8px 0 14px;padding:8px 10px;border:1px solid var(--ln);border-radius:8px;background:rgba(17,13,32,.72);color:var(--mut);font-size:16px;line-height:1.25}.modehint.on{display:block}.modehint.ok{border-color:rgba(141,255,176,.32);color:var(--grn)}.modehint.bad{border-color:rgba(255,93,143,.48);color:var(--amb)}.modehint b{font-family:'Press Start 2P';font-size:9px;color:var(--cyan);margin-right:8px}.modehint .miss{color:var(--pink)}
 .llmbar{display:flex;align-items:center;gap:8px;margin:-8px 0 14px;color:var(--mut);font-size:16px}.llmbar .lk{font-size:9px;color:var(--cyan);min-width:42px}.llmbar select{flex:1;min-width:0;background:#0a0814;border:1px solid var(--ln);color:var(--ink);border-radius:7px;height:30px;font-family:'VT323';font-size:16px;padding:0 8px}.llmbar select:focus{outline:none;border-color:var(--cyan)}.llmbar button{background:var(--b2);border:1px solid var(--ln);color:var(--ink);border-radius:6px;height:30px;padding:0 9px;font-family:'VT323';font-size:15px;cursor:pointer}.llmbar button:hover{border-color:var(--cyan);color:var(--cyan)}.llmstat{max-width:280px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .optbar{display:none;align-items:center;gap:8px;margin:-8px 0 14px;padding:8px 10px;background:rgba(17,13,32,.72);border:1px solid var(--ln);border-radius:9px;color:var(--mut);flex-wrap:wrap}.optbar.on{display:flex}.optbar label{display:flex;align-items:center;gap:6px;font-size:15px}.optbar .ok{font-size:9px;color:var(--amb);margin-right:2px}.optbar select,.optbar input{background:#0a0814;border:1px solid var(--ln);color:var(--ink);border-radius:6px;height:28px;font-family:'VT323';font-size:16px;padding:0 7px}.optbar select:focus,.optbar input:focus{outline:none;border-color:var(--cyan)}.optbar input{width:66px}.optgrp{display:none;gap:8px;align-items:center;flex-wrap:wrap}.optgrp.on{display:flex}
@@ -1275,7 +1275,7 @@ body{margin:0;background:#0a0814;color:var(--ink);font-family:'VT323',monospace;
   <button class="up" id="up" style="display:none" onclick="document.getElementById('files').click()">📷 사진</button>
   <input type="file" id="files" accept="image/*" multiple style="display:none" onchange="filePick()">
   <button class="genb pix" onclick="gen()">생성 ▸</button>
-  <button class="folderb" onclick="stopComfy()">■ 정지</button>
+  <button class="folderb" id="stopbtn" onclick="stopComfy()" disabled title="큐가 돌 때 활성화돼요">■ 정지</button>
   <button class="folderb" onclick="openGallery()">📁 폴더</button>
   <button class="folderb" onclick="restartDash()">↻ 재시작</button>
 </div>
@@ -1367,7 +1367,8 @@ function api(p,b){return fetch(p,{method:'POST',headers:{'Content-Type':'applica
 function el(t,c){var e=document.createElement(t);if(c)e.className=c;return e}
 function esc(s){return String(s||'').replace(/[&<>"']/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]})}
 function openGallery(){api('/api/open_gallery',{}).then(function(r){return r.json()}).then(function(j){if(!j.ok)alert(j.err||'폴더를 열 수 없어요')})}
-function stopComfy(){if(!confirm('현재 ComfyUI 생성을 정지할까요?'))return;api('/api/interrupt',{}).then(function(r){return r.json()}).then(function(j){if(!j.ok)alert(j.err||'정지 요청 실패');else document.getElementById('upinfo').textContent='ComfyUI 정지 요청 보냄'})}
+function setStopEnabled(on){var b=document.getElementById('stopbtn');if(!b)return;b.disabled=!on;b.title=on?'현재 ComfyUI 생성을 정지합니다':'큐가 돌 때 활성화돼요'}
+function stopComfy(){var b=document.getElementById('stopbtn');if(b&&b.disabled)return;if(!confirm('현재 ComfyUI 생성을 정지할까요?'))return;api('/api/interrupt',{}).then(function(r){return r.json()}).then(function(j){if(!j.ok)alert(j.err||'정지 요청 실패');else{document.getElementById('upinfo').textContent='ComfyUI 정지 요청 보냄';setStopEnabled(false)}})}
 function restartDash(){if(!confirm('대시보드를 다시 시작할까요?'))return;api('/api/restart_dashboard',{}).then(function(){setTimeout(function(){location.reload()},1800)})}
 function setLlmStatus(t){document.getElementById('llmstat').textContent=t||''}
 function loadLlmModels(){var sel=document.getElementById('llm');setLlmStatus('LM Studio 확인 중...');
@@ -1428,6 +1429,7 @@ function pollSystem(){fetch('/api/system').then(function(r){return r.json()}).th
   meter('bram','sram',s.ram.pct,s.ram.used?(s.ram.used+'/'+s.ram.total+'G'):'--');
   var cq=(s.comfy.pending||0),lq=(s.comfy.local_queue||0),run=(s.comfy.running||0);
   var pr=s.comfy.progress||{};
+  setStopEnabled(!!(run||cq||lq||(pr&&pr.active)));
   if(pr.active){meter('bcomfy','scomfy',pr.pct||0,(pr.pct||0)+'% '+(pr.status||''))}
   else{meter('bcomfy','scomfy',(run||cq||lq)?35:(s.comfy.ok?18:0),s.comfy.ok?('RUN '+run+' / C '+cq+' / Q '+lq):'OFF')}
 })}
