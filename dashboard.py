@@ -687,7 +687,7 @@ class H(BaseHTTPRequestHandler):
             settings = body.get("settings", {}) if isinstance(body.get("settings", {}), dict) else {}
             if mode in ("klein", "faceswap"):
                 refs = save_reference_assets(assets, imgs)
-                rels = [r["rel"] for r in refs]
+                rels = [r.get("rel") for r in refs if r.get("rel")]
                 if mode == "klein":
                     if not rels:
                         return self._json({"ok": False, "err": "사진 필요"}, 400)
@@ -823,7 +823,7 @@ body{margin:0;background:#0a0814;color:var(--ink);font-family:'VT323',monospace;
 .dgrid{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;padding:10px}.dslot{min-width:0;border:1px solid var(--ln);border-radius:8px;background:#0a0814;padding:9px}.dtop{display:flex;justify-content:space-between;align-items:center;gap:8px;margin-bottom:8px}.dtop b{font-size:9px;color:var(--amb)}.dtop button{background:var(--b2);border:1px solid var(--ln);color:var(--ink);border-radius:6px;height:28px;padding:0 8px;font-family:'VT323';font-size:15px;cursor:pointer}.dtop button:hover{color:var(--cyan);border-color:var(--cyan)}
 .dlane{display:flex;flex-direction:column;gap:6px;min-height:44px}.ditem{display:flex;align-items:center;gap:7px;border:1px solid #241d42;border-radius:6px;padding:5px 6px;font-size:15px;background:rgba(255,255,255,.02)}.ditem .thumb{width:38px;height:30px;border-radius:5px;background:#161228;object-fit:cover;display:flex;align-items:center;justify-content:center;color:var(--pink);font-size:15px;flex:none}.ditem span{min-width:0;flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.ditem button{width:24px;height:24px;border:none;border-radius:5px;background:rgba(13,11,22,.85);color:var(--ink);cursor:pointer}.ditem button:hover{background:var(--amb);color:#0a0814}.dhint{color:var(--mut);font-size:14px;line-height:1.25;padding:3px 1px}
 .tl{padding:0 10px 10px}.tlbar{height:20px;border:1px solid var(--ln);border-radius:7px;background:#0a0814;position:relative;overflow:hidden}.tlseg{position:absolute;top:3px;height:14px;border-radius:4px;background:var(--cyan);opacity:.8}.tlseg.video{background:var(--pink)}.tlseg.audio{background:var(--amb)}.tlcap{display:flex;justify-content:space-between;color:var(--mut);font-size:13px;margin-top:4px}.ditem{flex-wrap:wrap}.ditem .dmain{display:flex;align-items:center;gap:7px;width:100%}.dtime{display:grid;grid-template-columns:repeat(3,1fr);gap:5px;width:100%;padding-left:45px}.dtime label{font-size:9px;color:var(--mut);display:flex;flex-direction:column;gap:2px}.dtime input{min-width:0;background:#0a0814;border:1px solid var(--ln);border-radius:5px;color:var(--ink);font-family:'VT323';font-size:15px;height:24px;padding:0 5px}.dtime input:focus{outline:none;border-color:var(--cyan)}
-.refboard{display:none;margin:-4px 0 14px;border:1px solid var(--pink);border-radius:10px;background:rgba(17,13,32,.72);overflow:hidden}.refboard.on{display:block}.rbody{display:grid;grid-template-columns:220px minmax(0,1fr);gap:10px;padding:10px}.refboard.swap .rbody{grid-template-columns:220px 220px minmax(0,1fr)}.rphoto{border:1px dashed var(--ln);border-radius:8px;min-height:168px;background:#0a0814;display:flex;align-items:center;justify-content:center;overflow:hidden;color:var(--mut);font-size:16px;text-align:center;padding:8px}.rphoto img{width:100%;height:100%;object-fit:cover}.rphoto.off{display:none}.rmeta{border:1px solid var(--ln);border-radius:8px;background:#0a0814;padding:10px;display:flex;flex-direction:column;gap:8px}.rmeta .rk{font-size:9px;color:var(--amb)}.rmeta .rv{font-size:18px;color:var(--ink);line-height:1.2}.racts{display:flex;gap:8px;flex-wrap:wrap}.racts button{background:var(--b2);border:1px solid var(--ln);color:var(--ink);border-radius:6px;height:30px;padding:0 9px;font-family:'VT323';font-size:15px;cursor:pointer}.racts button:hover{border-color:var(--cyan);color:var(--cyan)}
+.refboard{display:none;margin:-4px 0 14px;border:1px solid var(--pink);border-radius:10px;background:rgba(17,13,32,.72);overflow:hidden}.refboard.on{display:block}.rbody{display:grid;grid-template-columns:220px minmax(0,1fr);gap:10px;padding:10px}.refboard.swap .rbody{grid-template-columns:220px 220px minmax(0,1fr)}.rphoto{border:1px dashed var(--ln);border-radius:8px;min-height:168px;background:#0a0814;display:flex;align-items:center;justify-content:center;overflow:hidden;color:var(--mut);font-size:16px;text-align:center;padding:8px;gap:6px;flex-wrap:wrap}.rphoto img{width:100%;height:100%;object-fit:cover}.rphoto.multi img{width:calc(50% - 3px);height:76px;border-radius:5px}.rphoto.off{display:none}.rmeta{border:1px solid var(--ln);border-radius:8px;background:#0a0814;padding:10px;display:flex;flex-direction:column;gap:8px}.rmeta .rk{font-size:9px;color:var(--amb)}.rmeta .rv{font-size:18px;color:var(--ink);line-height:1.2}.racts{display:flex;gap:8px;flex-wrap:wrap}.racts button{background:var(--b2);border:1px solid var(--ln);color:var(--ink);border-radius:6px;height:30px;padding:0 9px;font-family:'VT323';font-size:15px;cursor:pointer}.racts button:hover{border-color:var(--cyan);color:var(--cyan)}
 .sysbar{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin:-6px 0 14px}.meter{background:var(--b1);border:1px solid var(--ln);border-radius:7px;padding:6px 8px}.meter .mt{display:flex;justify-content:space-between;font-size:9px;color:var(--mut);margin-bottom:5px}.meter .mb{height:5px;background:#0a0814;border-radius:9px;overflow:hidden}.meter .mf{height:100%;background:linear-gradient(90deg,var(--cyan),var(--pink));width:0%}
 .shake{animation:sh .3s}@keyframes sh{0%,100%{transform:translateX(0)}25%{transform:translateX(-5px)}75%{transform:translateX(5px)}}
 .videoFoldbar{display:flex;justify-content:space-between;align-items:center;margin:-2px 0 8px;color:var(--mut);font-size:10px}
@@ -1123,8 +1123,8 @@ function modeChg(){var m=document.getElementById('mode').value,p=document.getEle
   var c=CUSTOMS.find(function(x){return x.mode===m});
   p.placeholder=c?('무엇을 만들까요? '+c.trigger+' 프롬프트'):ph[m];
   d.classList.toggle('on',m==='video');
-  rb.classList.toggle('on',m==='klein'||m==='faceswap');
-  rb.classList.toggle('swap',m==='faceswap');
+  rb.classList.toggle('on',m==='klein');
+  rb.classList.remove('swap');
   ob.classList.toggle('on',m==='image'||m==='video'||(c&&c.type==='image'));
   io.classList.toggle('on',m==='image');
   eo.classList.toggle('on',!!(c&&c.type==='image'));
@@ -1155,6 +1155,15 @@ function renderTimeline(){var bar=document.getElementById('tlbar');if(!bar)retur
 }
 function renderReferenceBoard(){var photo=document.getElementById('rphoto'),face=document.getElementById('rface'),name=document.getElementById('rname'),goal=document.getElementById('rgoal'),acts=document.getElementById('racts'),m=document.getElementById('mode').value,img=imageAt(0),faceImg=imageAt(1),text=document.getElementById('prompt').value.trim();
   if(!photo)return;
+  if(m==='klein'){
+    var imgs=picked.filter(function(x){return x&&x.kind==='image'}),loras=picked.filter(function(x){return x&&(x.kind==='lora'||x.type==='lora')});
+    face.classList.add('off');photo.classList.toggle('multi',imgs.length>1);
+    if(imgs.length){photo.innerHTML=imgs.slice(0,6).map(function(a){return '<img src="'+a.data+'" title="'+esc(a.name||'')+'">'}).join('')}else{photo.textContent='REFERENCE BOARD'}
+    name.textContent=imgs.length+' images · '+loras.length+' loras';
+    goal.textContent=text||'Flux2 Klein 보드에 참조 이미지와 LoRA를 올리고, 각 카드 역할을 골라 생성해요.';
+    acts.innerHTML='<button onclick="openPicker(\'image\')">참조 이미지 추가</button><button onclick="clearReference()">보드 비우기</button>';
+    return
+  }
   if(m==='faceswap'){
     face.classList.remove('off');
     photo.innerHTML=img?'<img src="'+img.data+'">':'BODY / SCENE';
@@ -1190,7 +1199,7 @@ function boardTools(a,i){var role=a.role||'',face=role.indexOf('face_')===0||rol
 }
 function addLoraCard(){var sel=document.getElementById('loraAddSel'),n=sel?sel.value:'';if(!n){alert(LORAS.length?'LoRA를 먼저 선택해 주세요':'ComfyUI LoRA 목록을 못 불러왔어요. ComfyUI를 켜고 새로고침해 주세요.');return}picked.push({kind:'lora',type:'lora',role:'lora_a',name:n,lora_name:n,lora_strength:1,lora_enabled:true,enabled:true});renderAssets()}
 function renderAssets(){var box=document.getElementById('assets'),m=document.getElementById('mode').value;box.innerHTML='';box.className='assets'+(picked.length&&m!=='video'?' on':'');
-  var boardMode=(m==='klein'||m==='faceswap');
+  var boardMode=(m==='klein');
   picked.forEach(function(a,i){if(!a)return;if(a.enabled===undefined)a.enabled=true;var row=el('div','asset'+(a.enabled===false?' off':''));var board=(a.kind==='image'&&boardMode),lora=((a.kind==='lora'||a.type==='lora')&&boardMode);var role=board?roleSelect(a,i):'';var use=(board||lora)?'<label class="use"><input type="checkbox" '+(a.enabled!==false?'checked':'')+' onchange="picked['+i+'].enabled=this.checked;picked['+i+'].lora_enabled=this.checked;renderAssets()">USE</label>':'';var tools=board?boardTools(a,i):'';if(lora){tools=loraSelect('',a.lora_name||a.name||'','picked['+i+'].lora_name=this.value;picked['+i+'].name=this.value;renderAssets()')+'<input class="short" type="number" step="0.05" value="'+(a.lora_strength||1)+'" onchange="picked['+i+'].lora_strength=parseFloat(this.value||1);renderReferenceBoard()">'}row.innerHTML='<b>'+esc((lora?'LORA':a.kind).toUpperCase())+'</b>'+use+role+tools+'<span>'+esc(a.name||a.lora_name||'')+'</span><button>×</button>';row.querySelector('button').onclick=function(){picked.splice(i,1);renderAssets()};box.appendChild(row)});
   if(boardMode){var add=el('div','asset');add.innerHTML='<b>LORA</b>'+loraSelect('loraAddSel','','')+'<button onclick="addLoraCard()">+ ADD</button>';box.appendChild(add);box.classList.add('on')}
   renderDirectorLane('image','참조 이미지');
@@ -1230,6 +1239,8 @@ function poll(){fetch('/api/status').then(function(r){return r.json()}).then(fun
 var rows=["0110110","1111111","1111111","0111110","0011100","0001000"],hs='';
 for(var y=0;y<6;y++)for(var x=0;x<7;x++)if(rows[y][x]==='1')hs+='<rect x='+(x*6.5)+' y='+(y*6.5)+' width=6.5 height=6.5 fill="#ff5d8f"/>';
 document.getElementById('hbox').innerHTML='<svg class="heart on" viewBox="0 0 46 40">'+hs+'</svg>';
+var faceOpt=document.querySelector('#mode option[value="faceswap"]');if(faceOpt)faceOpt.remove();
+var kleinOpt=document.querySelector('#mode option[value="klein"]');if(kleinOpt)kleinOpt.textContent='Flux2 Klein';
 loadGenOptions();initVideoFold();loadModes();loadLlmModels();loadLoras();load();loadYoutube();poll();pollSystem();setInterval(load,5000);setInterval(poll,2000);setInterval(pollSystem,3000);setInterval(pollLog,3000);setInterval(loadYoutube,1800000);
 </script></body></html>'''
 
