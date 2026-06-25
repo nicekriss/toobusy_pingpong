@@ -753,6 +753,7 @@ def inject_zit(prompt, settings=None):
 def _apply_ltx_director_assets(td, assets, duration_frames):
     assets = assets or []
     images = [a for a in assets if a.get("kind") == "image"]
+    texts = [a for a in assets if a.get("kind") == "text"]
     videos = [a for a in assets if a.get("kind") == "video"]
     audios = [a for a in assets if a.get("kind") == "audio"]
     def frames(a, fallback_start=0, fallback_length=None):
@@ -772,12 +773,13 @@ def _apply_ltx_director_assets(td, assets, duration_frames):
         except Exception:
             trim = 0
         return start, length, trim
+    main_segments = []
     if images:
         td["segments"] = []
         for i, a in enumerate(images):
             fallback_start = min(duration_frames - 1, int(a.get("start", i)))
             start, length, trim = frames(a, fallback_start, int(a.get("length", 1) or 1))
-            td["segments"].append({
+            main_segments.append({
                 "id": a.get("id") or f"img{i}",
                 "type": "image",
                 "start": start,
@@ -786,6 +788,19 @@ def _apply_ltx_director_assets(td, assets, duration_frames):
                 "isEndFrame": bool(a.get("isEndFrame", False)),
                 "trimStart": trim,
             })
+    if texts:
+        for i, a in enumerate(texts):
+            start, length, trim = frames(a, 0, max(1, min(duration_frames, int(a.get("length", duration_frames) or duration_frames))))
+            main_segments.append({
+                "id": a.get("id") or f"text{i}",
+                "type": "text",
+                "start": start,
+                "length": length,
+                "prompt": a.get("prompt") or a.get("text") or "",
+                "trimStart": trim,
+            })
+    if main_segments:
+        td["segments"] = sorted(main_segments, key=lambda s: int(s.get("start", 0)))
     if videos:
         td["motionSegments"] = []
         for a in videos:
@@ -811,6 +826,28 @@ def _apply_ltx_director_assets(td, assets, duration_frames):
             })
     return td
 
+def _ltx_prompt_chunks(td, global_prompt, duration_frames):
+    segments = sorted((td.get("segments") or []), key=lambda s: int(s.get("start", 0)))
+    if not any((s.get("prompt") or "").strip() for s in segments):
+        return "", ""
+    prompts = []
+    lengths = []
+    cursor = 0
+    for seg in segments:
+        start = max(0, min(duration_frames, int(seg.get("start", 0))))
+        end = max(start, min(duration_frames, start + int(seg.get("length", 1))))
+        if start > cursor:
+            prompts.append(global_prompt or "video")
+            lengths.append(start - cursor)
+        if end > start:
+            prompts.append((seg.get("prompt") or global_prompt or "video").strip())
+            lengths.append(end - start)
+        cursor = max(cursor, end)
+    if cursor < duration_frames:
+        prompts.append(global_prompt or "video")
+        lengths.append(duration_frames - cursor)
+    return " | ".join(prompts), ", ".join(str(max(1, int(x))) for x in lengths if x > 0)
+
 def inject_ltx(prompt, director_assets=None, settings=None):
     wf = load_wf("LTX_Director_2_Workflow_ggufdis_API.json"); tag = tag_now()
     seconds = _int_setting(settings, "video_seconds", 5, 1, 20)
@@ -829,6 +866,9 @@ def inject_ltx(prompt, director_assets=None, settings=None):
     td["audioTrackEnabled"] = True
     _apply_ltx_director_assets(td, director_assets, duration_frames)
     wf["131"]["inputs"]["timeline_data"] = json.dumps(td, ensure_ascii=False)
+    local_prompts, segment_lengths = _ltx_prompt_chunks(td, prompt, duration_frames)
+    wf["131"]["inputs"]["local_prompts"] = local_prompts
+    wf["131"]["inputs"]["segment_lengths"] = segment_lengths
     w = _int_setting(settings, "video_width", CFG.get("video_width", 0), 0, 1920)
     if w:
         wf["131"]["inputs"]["custom_width"] = w
