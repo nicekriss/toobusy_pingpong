@@ -747,7 +747,8 @@ def inject_klein_board(assets, goal_text, settings=None, flags=None):
         name = a.get("name") or role.replace("_", " ").title()
         item = {"id": f"ref{i+1}", "role": role, "name": name, "filename": a["rel"], "note": a.get("note", "")}
         items.append(item)
-        blocks.append({"kind": "reference", "role": role, "category": role_category.get(role, "reference"), "label": name})
+        if a.get("enabled", True):
+            blocks.append({"kind": "reference", "role": role, "category": role_category.get(role, "reference"), "label": name})
     if goal_text:
         items.append({"id": "goal1", "type": "text", "text_category": "goal", "text": goal_text})
     for text in (settings or {}).get("klein_modifiers", []) or []:
