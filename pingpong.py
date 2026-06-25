@@ -126,8 +126,12 @@ def run_job(job):
         do_image_direct(txt, job.get("request") or txt, settings)
     elif m in ("image", "video", "song"):
         do_text(m, txt or "a creative, beautiful scene", job.get("director_assets") or [], settings)
+    elif m == "klein_board":
+        do_klein_board(job.get("reference_assets") or [], txt, settings)
     elif m == "klein":
         _klein_core(job["char_rel"], txt)
+    elif m == "faceswap_board":
+        do_klein_board(job.get("reference_assets") or [], txt, settings, flags=["face_swap"])
     elif m == "faceswap":
         do_faceswap(job["char_rel"], job["face_rel"], txt)
 
@@ -154,19 +158,17 @@ def process_queue():
             log("job error:", traceback.format_exc())
 
 IMAGE_SYS = (
-    "You are an expert text-to-image prompt engineer for a photorealistic diffusion model. "
-    "Convert the user's request (any language) into ONE vivid, concrete English image prompt. "
-    "Describe subject, setting, lighting, mood, composition, and style. Keep it under 80 words. "
-    "Write it as ONE plain sentence. Do NOT number the words, do NOT add counters or any (1)(2) markers. "
-    "Output ONLY the prompt text, no quotes, no preamble, no notes."
+    "You convert the user's request into ONE production-ready image prompt. "
+    "Output only the final prompt sentence, with no analysis, no self-talk, no labels, no word counts, no markdown. "
+    "Preserve the requested subject, medium, mood, and language intent. Do not invent unrelated subjects. "
+    "If the user asks for photo, keep it photographic; if illustration/comic/anime, keep that medium. "
+    "Use concrete visual details: subject, setting, composition, lighting, texture, camera/style. Keep under 85 words."
 )
 VIDEO_SYS = (
-    "You are an expert video prompt engineer for a text-to-video model. "
-    "Convert the user's request (any language) into ONE vivid English video prompt describing "
-    "the subject, scene, action/motion, and camera movement. If the user wants spoken dialogue, "
-    "keep that line in its ORIGINAL language inside double quotes. Keep it under 70 words. "
-    "Write it as plain prose. Do NOT number the words or add any (1)(2) counters. "
-    "Output ONLY the prompt text, no preamble, no notes."
+    "You convert the user's request into ONE production-ready video prompt. "
+    "Output only the final prompt sentence, with no analysis, no self-talk, no labels, no word counts, no markdown. "
+    "Describe subject, scene, action, temporal motion, camera motion, lighting, and atmosphere. "
+    "If the user requests spoken dialogue, keep the spoken line in the user's original language inside quotes. Keep under 80 words."
 )
 SONG_SYS = (
     "You are a professional songwriter and music producer. Given a theme (any language), respond "
@@ -175,11 +177,10 @@ SONG_SYS = (
     "LYRICS:\n<full song lyrics with [Verse]/[Chorus]/[Bridge] section tags>"
 )
 MULTI_IMAGE_SYS = (
-    "You create multiple distinct prompts for a photorealistic text-to-image diffusion model. "
-    "Given the user's request, return ONLY a JSON array of strings. "
-    "Each string must be a different vivid English image prompt under 80 words. "
-    "Vary subject details, setting, composition, lighting, camera, and mood while staying on theme. "
-    "Do not include markdown, numbering, commentary, or any text outside the JSON array."
+    "Return ONLY a JSON array of final image prompt strings. "
+    "No markdown, no commentary, no labels, no reasoning. "
+    "Each string must stay faithful to the user's request but vary composition, setting, lighting, camera, and details. "
+    "Respect the requested medium instead of forcing photorealism. Keep each under 85 words."
 )
 
 TG_BANNER = ("🦗▸ 너무바쁜베짱이 STUDIO ◂🦗\n"
@@ -512,6 +513,17 @@ def _ratio_setting(settings, default="3:4"):
     allowed = {"1:1", "3:4", "4:3", "2:3", "3:2", "9:16", "16:9", "21:9"}
     return val if val in allowed else default
 
+def _bool_setting(settings, key, default=False):
+    val = (settings or {}).get(key, default)
+    if isinstance(val, bool):
+        return val
+    return str(val).strip().lower() in ("1", "true", "yes", "on", "y")
+
+def safe_filename_title(text, fallback="song"):
+    s = re.sub(r"\s+", "_", (text or "").strip())
+    s = re.sub(r"[^0-9A-Za-z가-힣_.-]+", "", s).strip("._-")
+    return (s[:40] or fallback)
+
 def _set_any_megapixels(wf, megapixels):
     for node in wf.values():
         inputs = node.get("inputs") if isinstance(node, dict) else None
@@ -533,6 +545,14 @@ def inject_custom(spec, prompt, image_refs=None, settings=None):
             break
         node, field = pair
         wf[str(node)]["inputs"][field] = image_refs[i]
+    if len(image_refs) > len(spec.get("image_nodes", [])) and spec.get("file", "").endswith("image_boogu_image_0_1_edit_API.json"):
+        base_node = "32"
+        encode_node = "45:36"
+        for i, rel in enumerate(image_refs[1:], 2):
+            node_id = f"{base_node}:{i}"
+            wf[node_id] = copy.deepcopy(wf[base_node])
+            wf[node_id]["inputs"]["image"] = rel
+            wf[encode_node]["inputs"][f"images.image_{i}"] = [node_id, 0]
     for node, field in spec.get("seed_nodes", []):
         wf[str(node)]["inputs"][field] = rseed()
     for node, field, value in spec.get("set_nodes", []):
@@ -547,12 +567,12 @@ def inject_custom(spec, prompt, image_refs=None, settings=None):
 def inject_zit(prompt, settings=None):
     wf = load_wf("toobusy_zimgt.json"); tag = tag_now()
     ratio = _ratio_setting(settings)
-    megapixels = _float_setting(settings, "image_megapixels", 1.0, 0.25, 4.0)
+    upscale = _bool_setting(settings, "zit_upscale", CFG.get("send_upscaled", True))
+    scale_by = _float_setting(settings, "zit_scale_by", 0.5, 0.25, 1.0)
     for n in ("1", "4"):
         wf[n]["inputs"]["positive"] = prompt
         wf[n]["inputs"]["seed"] = rseed()
         wf[n]["inputs"]["ratio_preset"] = ratio
-        wf[n]["inputs"]["megapixels"] = megapixels
         wf[n]["inputs"]["width"] = 0
         wf[n]["inputs"]["height"] = 0
     if not CFG.get("zit_lora", False):
@@ -562,8 +582,12 @@ def inject_zit(prompt, settings=None):
         wf["1"]["inputs"]["model_name"] = wf["4"]["inputs"]["model_name"] = MODELS["zit"]
     wf["2"]["inputs"]["filename_prefix"] = f"pingpong\\img_{tag}"
     wf["5"]["inputs"]["filename_prefix"] = f"pingpong\\img_{tag}_UPS"
-    save = "5" if CFG.get("send_upscaled", True) else "2"
-    return wf, save
+    wf["3"]["inputs"]["scale_by"] = scale_by
+    if upscale:
+        return wf, "5"
+    for node in ("3", "4", "5"):
+        wf.pop(node, None)
+    return wf, "2"
 
 def _apply_ltx_director_assets(td, assets, duration_frames):
     assets = assets or []
@@ -588,15 +612,17 @@ def _apply_ltx_director_assets(td, assets, duration_frames):
             trim = 0
         return start, length, trim
     if images:
-        step = max(1, duration_frames // len(images))
         td["segments"] = []
         for i, a in enumerate(images):
-            start, length, trim = frames(a, min(duration_frames - 1, i * step), max(1, duration_frames - min(duration_frames - 1, i * step)))
+            fallback_start = min(duration_frames - 1, int(a.get("start", i)))
+            start, length, trim = frames(a, fallback_start, int(a.get("length", 1) or 1))
             td["segments"].append({
+                "id": a.get("id") or f"img{i}",
                 "type": "image",
-                "imageFile": a["rel"],
                 "start": start,
                 "length": length,
+                "imageFile": a["rel"],
+                "isEndFrame": bool(a.get("isEndFrame", False)),
                 "trimStart": trim,
             })
     if videos:
@@ -635,6 +661,11 @@ def inject_ltx(prompt, director_assets=None, settings=None):
     wf["131"]["inputs"]["end_frame"] = duration_frames
     td = json.loads(wf["131"]["inputs"]["timeline_data"])
     td["global_prompt"] = prompt
+    td["normalStartFrame"] = 0
+    td["normalDurationFrames"] = duration_frames
+    td["mainTrackEnabled"] = True
+    td["motionTrackEnabled"] = True
+    td["audioTrackEnabled"] = True
     _apply_ltx_director_assets(td, director_assets, duration_frames)
     wf["131"]["inputs"]["timeline_data"] = json.dumps(td, ensure_ascii=False)
     w = _int_setting(settings, "video_width", CFG.get("video_width", 0), 0, 1920)
@@ -647,14 +678,14 @@ def inject_ltx(prompt, director_assets=None, settings=None):
     wf["37"]["inputs"]["filename_prefix"] = f"pingpong/vid_{tag}"
     return wf, "37"
 
-def inject_ace(tags, lyrics):
+def inject_ace(tags, lyrics, title_text=""):
     wf = load_wf("audio_ace_step1_5_xl_turbo_API.json"); tag = tag_now()
     wf["94"]["inputs"]["tags"] = tags
     wf["94"]["inputs"]["lyrics"] = lyrics
     if MODELS.get("ace"):
         wf["104"]["inputs"]["unet_name"] = MODELS["ace"]
     wf["109"]["inputs"]["value"] = rseed()
-    wf["107"]["inputs"]["filename_prefix"] = f"pingpong/song_{tag}"
+    wf["107"]["inputs"]["filename_prefix"] = f"pingpong/song_{tag}_{safe_filename_title(title_text, 'music')}"
     return wf, "107"
 
 def inject_klein(ref_relpath, goal_text):
@@ -699,6 +730,43 @@ def inject_klein_faceswap(char_rel, face_rel, goal_text):
     wf["2"]["inputs"]["seed"] = rseed()
     wf["3"]["inputs"]["seed"] = rseed()
     wf["4"]["inputs"]["filename_prefix"] = f"pingpong/swap_{tag}"
+    return wf, "4"
+
+def inject_klein_board(assets, goal_text, settings=None, flags=None):
+    wf = load_wf("toobusy_flux2klein_vram.json"); tag = tag_now()
+    assets = assets or []
+    items = []
+    blocks = []
+    role_category = {
+        "character_a": "character", "character_b": "character", "character_c": "character", "character_d": "character",
+        "face_a": "face", "face_b": "face", "outfit_a": "outfit", "outfit_b": "outfit",
+        "background_a": "background", "pose_a": "pose", "style_a": "style", "prop_a": "prop",
+    }
+    for i, a in enumerate(assets):
+        role = a.get("role") or ("character_a" if i == 0 else "prop_a")
+        name = a.get("name") or role.replace("_", " ").title()
+        item = {"id": f"ref{i+1}", "role": role, "name": name, "filename": a["rel"], "note": a.get("note", "")}
+        items.append(item)
+        blocks.append({"kind": "reference", "role": role, "category": role_category.get(role, "reference"), "label": name})
+    if goal_text:
+        items.append({"id": "goal1", "type": "text", "text_category": "goal", "text": goal_text})
+    for text in (settings or {}).get("klein_modifiers", []) or []:
+        if isinstance(text, str) and text.strip():
+            blocks.append({"kind": "modifier", "category": "custom", "text": text.strip(), "label": text.strip()[:24]})
+    for flag in flags or (settings or {}).get("klein_flags", []) or []:
+        if flag:
+            blocks.append({"kind": "flag", "flag": flag})
+    if not blocks:
+        blocks.append({"kind": "modifier", "category": "style", "text": "photoreal", "label": "Style"})
+    board = {"version": 1, "global_note": (settings or {}).get("klein_note", ""), "items": items}
+    sel = {"version": 1, "blocks": blocks}
+    wf["7"]["inputs"]["board_json"] = json.dumps(board, ensure_ascii=False)
+    wf["2"]["inputs"]["director_selection_json"] = json.dumps(sel, ensure_ascii=False)
+    if MODELS.get("klein"):
+        wf["3"]["inputs"]["model_name"] = MODELS["klein"]
+    wf["2"]["inputs"]["seed"] = rseed()
+    wf["3"]["inputs"]["seed"] = rseed()
+    wf["4"]["inputs"]["filename_prefix"] = f"pingpong/klein_board_{tag}"
     return wf, "4"
 
 # ---------- 모드 라우팅 ----------
@@ -780,7 +848,7 @@ def do_text(mode, body, director_assets=None, settings=None):
         llm_down()
     log("PAYLOAD:", payload_desc[:200])
     if mode == "song":
-        wf, save = inject_ace(tags, lyrics); kind = "audio"
+        wf, save = inject_ace(tags, lyrics, body); kind = "audio"
         tg_send(f"🎼▸ 작곡 중 ░▒▓█▓▒░ ♪♬\n{payload_desc}")
     elif mode == "video":
         wf, save = inject_ltx(prompt, director_assets, settings); kind = "video"
@@ -828,6 +896,18 @@ def do_faceswap(char_rel, face_rel, goal):
     files = comfy_run(wf, save)
     write_generation_meta(files, "faceswap", goal or "", goal or "")
     tg_send_file("photo", files[0], caption="✦ 페이스 스왑 완료 ✦ 👤↔👤")
+    comfy_free()
+
+def do_klein_board(reference_assets, goal, settings=None, flags=None):
+    if not reference_assets:
+        tg_send("⚠️ Klein 레퍼런스 보드에는 이미지가 최소 1장 필요해요.")
+        return
+    tg_send(f"🎭▸ 레퍼런스 보드 생성 중 ░▒▓█▓▒░\n{goal or '(보드 기반 자동 생성)'}")
+    comfy_free()
+    wf, save = inject_klein_board(reference_assets, goal, settings, flags)
+    files = comfy_run(wf, save)
+    write_generation_meta(files, "klein_board", goal or "", goal or "")
+    tg_send_file("photo", files[0], caption=goal or "✦ 레퍼런스 보드 생성 완료 ✦")
     comfy_free()
 
 # 단계별 대화 상태 (단일 사용자 가정)
