@@ -34,6 +34,7 @@ ALIVE    = os.path.join(GALLERY, ".alive")
 QUEUE    = os.path.join(HERE, "queue")
 HIDDEN   = os.path.join(HERE, "dashboard_hidden.json")
 PRESETS  = os.path.join(HERE, "dashboard_reference_presets.json")
+PROGRESS = os.path.join(HERE, "dashboard_comfy_progress.json")
 PORT     = int(CFG.get("dashboard_port", 8910))
 EVENTS   = []
 CPU_LAST = {"t": 0, "idle": 0, "kernel": 0, "user": 0, "cpu": 0}
@@ -206,6 +207,20 @@ def comfy_snapshot():
         pass
     return snap
 
+def comfy_progress():
+    try:
+        data = json.load(open(PROGRESS, encoding="utf-8"))
+        age = time.time() - float(data.get("t") or 0)
+        if age > 90:
+            return {"active": False}
+        status = data.get("status", "")
+        active = status not in ("done", "error") or age < 12
+        data["active"] = active
+        data["age"] = round(age, 1)
+        return data
+    except Exception:
+        return {"active": False}
+
 def local_queue_count():
     try:
         return len([f for f in os.listdir(QUEUE) if f.endswith(".json")])
@@ -217,12 +232,16 @@ def local_queue_count():
 def system_info():
     snap = comfy_snapshot()
     snap["local_queue"] = local_queue_count()
+    snap["progress"] = comfy_progress()
     return {"cpu": cpu_percent(), "ram": memory_info(), "gpu": gpu_info(), "comfy": snap}
 
 def comfy_log():
     snap = comfy_snapshot()
     local_q = local_queue_count()
     lines = [f"Comfy {'ONLINE' if snap['ok'] else 'OFFLINE'} | running {snap['running']} | pending {snap['pending']} | pingpong queue {local_q}"]
+    prog = snap.get("progress") or {}
+    if prog.get("active"):
+        lines.append(f"progress {prog.get('pct', 0)}% {prog.get('status', '')} {prog.get('text', '')}")
     lines += snap["recent"]
     lines += [f"{e['t']} {e['msg']}" for e in EVENTS[-20:]]
     return lines[-40:]
@@ -1095,7 +1114,9 @@ function pollSystem(){fetch('/api/system').then(function(r){return r.json()}).th
   meter('bgpuload','sgpuload',s.gpu.util,s.gpu.used?(s.gpu.util+'%'):'--');
   meter('bram','sram',s.ram.pct,s.ram.used?(s.ram.used+'/'+s.ram.total+'G'):'--');
   var cq=(s.comfy.pending||0),lq=(s.comfy.local_queue||0),run=(s.comfy.running||0);
-  meter('bcomfy','scomfy',(run||cq||lq)?100:(s.comfy.ok?18:0),s.comfy.ok?('RUN '+run+' / C '+cq+' / Q '+lq):'OFF');
+  var pr=s.comfy.progress||{};
+  if(pr.active){meter('bcomfy','scomfy',pr.pct||0,(pr.pct||0)+'% '+(pr.status||''))}
+  else{meter('bcomfy','scomfy',(run||cq||lq)?35:(s.comfy.ok?18:0),s.comfy.ok?('RUN '+run+' / C '+cq+' / Q '+lq):'OFF')}
 })}
 function toggleLog(){var box=document.getElementById('logbox');box.classList.toggle('open');document.getElementById('logstate').textContent=box.classList.contains('open')?'열림':'접힘';if(box.classList.contains('open'))pollLog()}
 function pollLog(){if(!document.getElementById('logbox').classList.contains('open'))return;fetch('/api/comfy_log').then(function(r){return r.json()}).then(function(d){document.getElementById('logbody').textContent=(d.lines||[]).join('\n')})}

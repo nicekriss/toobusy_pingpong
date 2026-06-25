@@ -12,8 +12,12 @@ VRAM 핑퐁 오케스트레이터 (멀티모드)
 핵심: 24GB 단일 GPU에서 LLM과 ComfyUI가 번갈아 VRAM 점유.
  LLM 올리기 전 ComfyUI /free 필수(동시 상주 시 OOM). LLM은 '생각하는 순간'만 VRAM.
 """
-import os, sys, json, copy, time, random, subprocess, traceback, re, threading, unicodedata, base64, mimetypes
+import os, sys, json, copy, time, random, subprocess, traceback, re, threading, unicodedata, base64, mimetypes, uuid, urllib.parse
 import requests
+try:
+    import websocket
+except Exception:
+    websocket = None
 
 try:  # 윈도우 cp949 콘솔에서 이모지/한글 출력 시 크래시 방지
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -114,6 +118,7 @@ def start_heartbeat():
 
 # 공유 작업 큐 (대시보드가 job json을 떨궈두면 봇이 순서대로 처리 → GPU 충돌 방지)
 QUEUE_DIR = os.path.join(HERE, "queue")
+PROGRESS_PATH = os.path.join(HERE, "dashboard_comfy_progress.json")
 def run_job(job):
     m = job.get("mode")
     txt = (job.get("text") or "").strip()
@@ -518,19 +523,99 @@ def comfy_free():
     except Exception as e:
         log("comfy free fail:", e)
 
+def write_comfy_progress(status, pct=0, text="", prompt_id="", node=""):
+    data = {
+        "t": time.time(),
+        "status": status,
+        "pct": max(0, min(100, int(pct or 0))),
+        "text": str(text or "")[:120],
+        "prompt_id": str(prompt_id or ""),
+        "node": str(node or ""),
+    }
+    tmp = PROGRESS_PATH + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False)
+        os.replace(tmp, PROGRESS_PATH)
+    except Exception:
+        pass
+
+def _comfy_ws_url(client_id):
+    u = urllib.parse.urlparse(COMFY)
+    scheme = "wss" if u.scheme == "https" else "ws"
+    netloc = u.netloc
+    path = (u.path.rstrip("/") if u.path else "") + "/ws"
+    return urllib.parse.urlunparse((scheme, netloc, path, "", urllib.parse.urlencode({"clientId": client_id}), ""))
+
+def _wait_comfy_ws(ws, pid):
+    write_comfy_progress("queued", 1, "queued", pid)
+    last_check = 0
+    while True:
+        try:
+            raw = ws.recv()
+            if not isinstance(raw, str):
+                continue
+            msg = json.loads(raw)
+        except Exception:
+            if time.time() - last_check > 5:
+                last_check = time.time()
+                q = requests.get(f"{COMFY}/queue", timeout=10).json()
+                if not q.get("queue_running") and not q.get("queue_pending"):
+                    break
+            continue
+        typ = msg.get("type")
+        data = msg.get("data") or {}
+        mpid = data.get("prompt_id") or data.get("promptId")
+        if mpid and mpid != pid:
+            continue
+        if typ == "progress":
+            value = float(data.get("value") or 0)
+            maxv = float(data.get("max") or 0)
+            pct = int(value * 100 / maxv) if maxv else 0
+            write_comfy_progress("sampling", pct, f"{int(value)}/{int(maxv)}", pid, data.get("node", ""))
+        elif typ == "executing":
+            node = data.get("node")
+            if node is None:
+                write_comfy_progress("finalizing", 100, "finalizing", pid)
+                break
+            write_comfy_progress("executing", 2, "node " + str(node), pid, node)
+        elif typ == "execution_error":
+            write_comfy_progress("error", 0, data.get("exception_message", "error"), pid)
+            break
+
 def comfy_run(wf, save_node):
-    data = json.dumps({"prompt": wf}).encode("utf-8")
-    r = requests.post(f"{COMFY}/prompt", data=data,
-                      headers={"Content-Type": "application/json"}, timeout=30)
+    client_id = str(uuid.uuid4())
+    ws = None
+    if websocket:
+        try:
+            ws = websocket.create_connection(_comfy_ws_url(client_id), timeout=8)
+            ws.settimeout(5)
+        except Exception as e:
+            log("comfy ws fail:", e)
+            ws = None
+    write_comfy_progress("submitting", 0, "submitting")
+    r = requests.post(f"{COMFY}/prompt", json={"prompt": wf, "client_id": client_id}, timeout=30)
     if r.status_code != 200:
+        write_comfy_progress("error", 0, f"/prompt {r.status_code}")
         raise RuntimeError(f"comfy /prompt {r.status_code}: {r.text[:400]}")
     pid = r.json()["prompt_id"]
     log("queued", pid)
-    while True:
-        q = requests.get(f"{COMFY}/queue", timeout=10).json()
-        if not q["queue_running"] and not q["queue_pending"]:
-            break
-        time.sleep(5)
+    try:
+        if ws:
+            _wait_comfy_ws(ws, pid)
+        else:
+            write_comfy_progress("queued", 1, "queued", pid)
+            while True:
+                q = requests.get(f"{COMFY}/queue", timeout=10).json()
+                if not q["queue_running"] and not q["queue_pending"]:
+                    break
+                time.sleep(5)
+    finally:
+        try:
+            if ws:
+                ws.close()
+        except Exception:
+            pass
     outputs = requests.get(f"{COMFY}/history/{pid}", timeout=15).json()[pid]["outputs"]
     # save_node 우선, 없으면 전체에서 탐색
     files = _files_from(outputs.get(save_node, {}))
@@ -539,6 +624,7 @@ def comfy_run(wf, save_node):
             files += _files_from(node_out)
     if not files:
         raise RuntimeError("결과 파일을 찾지 못함")
+    write_comfy_progress("done", 100, "done", pid)
     return files
 
 def _files_from(node_out):

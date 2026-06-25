@@ -2,6 +2,7 @@
 config.json
 dashboard_hidden.json
 dashboard_reference_presets.json
+dashboard_comfy_progress.json
 
 # 런타임 생성물
 queue/
