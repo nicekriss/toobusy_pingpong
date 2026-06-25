@@ -762,6 +762,12 @@ def inject_klein_board(assets, goal_text, settings=None, flags=None):
     sel = {"version": 1, "blocks": blocks}
     wf["7"]["inputs"]["board_json"] = json.dumps(board, ensure_ascii=False)
     wf["2"]["inputs"]["director_selection_json"] = json.dumps(sel, ensure_ascii=False)
+    wf["2"]["inputs"]["toobusy_bundle"] = ["7", 0]
+    wf["3"]["inputs"]["toobusy_bundle"] = ["8", 0]
+    wf["3"]["inputs"]["use_bundle_prompt"] = True
+    wf["3"]["inputs"]["use_bundle_loras"] = True
+    wf["3"]["inputs"]["reference_slots"] = max(1, min(8, len(assets)))
+    wf["3"]["inputs"]["bundle_reference_order"] = (settings or {}).get("bundle_reference_order", "auto")
     if MODELS.get("klein"):
         wf["3"]["inputs"]["model_name"] = MODELS["klein"]
     wf["2"]["inputs"]["seed"] = rseed()
