@@ -737,16 +737,43 @@ def inject_klein_board(assets, goal_text, settings=None, flags=None):
     assets = assets or []
     items = []
     blocks = []
+    image_count = 0
     role_category = {
         "character_a": "character", "character_b": "character", "character_c": "character", "character_d": "character",
         "face_a": "face", "face_b": "face", "outfit_a": "outfit", "outfit_b": "outfit",
         "background_a": "background", "pose_a": "pose", "style_a": "style", "prop_a": "prop",
     }
+    card_passthrough = (
+        "bg_remove_enabled", "bg_remove_model", "bg_remove_background",
+        "face_erase_enabled", "face_keep_enabled", "face_erase_fill",
+        "face_erase_expand", "face_erase_feather",
+        "face_lora_enabled", "face_lora_name", "face_lora_strength",
+    )
     for i, a in enumerate(assets):
-        role = a.get("role") or ("character_a" if i == 0 else "prop_a")
+        if a.get("type") == "lora" or a.get("kind") == "lora":
+            lora_name = (a.get("lora_name") or a.get("name") or "").strip()
+            if not lora_name:
+                continue
+            items.append({
+                "id": f"lora{i+1}",
+                "type": "lora",
+                "role": a.get("role") or "lora_a",
+                "name": a.get("name") or lora_name,
+                "lora_name": lora_name,
+                "lora_strength": a.get("lora_strength", 1.0),
+                "lora_enabled": a.get("lora_enabled", a.get("enabled", True)),
+            })
+            continue
+        if not a.get("rel"):
+            continue
+        role = a.get("role") or ("character_a" if image_count == 0 else "prop_a")
         name = a.get("name") or role.replace("_", " ").title()
         item = {"id": f"ref{i+1}", "role": role, "name": name, "filename": a["rel"], "note": a.get("note", "")}
+        for key in card_passthrough:
+            if key in a:
+                item[key] = a[key]
         items.append(item)
+        image_count += 1
         if a.get("enabled", True):
             blocks.append({"kind": "reference", "role": role, "category": role_category.get(role, "reference"), "label": name})
     if goal_text:
@@ -767,7 +794,7 @@ def inject_klein_board(assets, goal_text, settings=None, flags=None):
     wf["3"]["inputs"]["toobusy_bundle"] = ["8", 0]
     wf["3"]["inputs"]["use_bundle_prompt"] = True
     wf["3"]["inputs"]["use_bundle_loras"] = True
-    wf["3"]["inputs"]["reference_slots"] = max(1, min(8, len(assets)))
+    wf["3"]["inputs"]["reference_slots"] = max(1, min(8, image_count))
     wf["3"]["inputs"]["bundle_reference_order"] = (settings or {}).get("bundle_reference_order", "auto")
     if MODELS.get("klein"):
         wf["3"]["inputs"]["model_name"] = MODELS["klein"]

@@ -509,16 +509,42 @@ def save_reference_assets(assets, imgs):
     image_assets = [a for a in (assets or []) if isinstance(a, dict) and a.get("kind") == "image"]
     out = []
     default_roles = ["character_a", "face_a", "background_a", "pose_a", "style_a", "prop_a"]
+    passthrough = (
+        "bg_remove_enabled", "bg_remove_model", "bg_remove_background",
+        "face_erase_enabled", "face_keep_enabled", "face_erase_fill",
+        "face_erase_expand", "face_erase_feather",
+        "face_lora_enabled", "face_lora_name", "face_lora_strength",
+    )
     for i, rel in enumerate(rels):
         meta = image_assets[i] if i < len(image_assets) else {}
         role = meta.get("role") or default_roles[min(i, len(default_roles) - 1)]
-        out.append({
+        item = {
             "rel": rel,
             "role": role,
             "enabled": meta.get("enabled", True),
             "name": meta.get("name") or role.replace("_", " ").title(),
             "note": meta.get("note", ""),
-        })
+        }
+        for key in passthrough:
+            if key in meta:
+                item[key] = meta[key]
+        out.append(item)
+    for meta in (assets or []):
+        if not isinstance(meta, dict):
+            continue
+        if meta.get("kind") == "lora" or meta.get("type") == "lora":
+            name = (meta.get("lora_name") or meta.get("name") or "").strip()
+            if not name:
+                continue
+            out.append({
+                "type": "lora",
+                "kind": "lora",
+                "role": meta.get("role") or "lora_a",
+                "name": meta.get("name") or name,
+                "lora_name": name,
+                "lora_strength": meta.get("lora_strength", 1.0),
+                "lora_enabled": meta.get("lora_enabled", meta.get("enabled", True)),
+            })
     return out
 
 def save_director_asset(item, idx):
@@ -762,7 +788,7 @@ body{margin:0;background:#0a0814;color:var(--ink);font-family:'VT323',monospace;
 .folderb{background:var(--b2);border:1px solid var(--ln);color:var(--ink);font-family:'VT323';font-size:17px;border-radius:7px;padding:0 10px;height:38px;cursor:pointer}.folderb:hover{color:var(--cyan);border-color:var(--cyan)}
 .llmbar{display:flex;align-items:center;gap:8px;margin:-8px 0 14px;color:var(--mut);font-size:16px}.llmbar .lk{font-size:9px;color:var(--cyan);min-width:42px}.llmbar select{flex:1;min-width:0;background:#0a0814;border:1px solid var(--ln);color:var(--ink);border-radius:7px;height:30px;font-family:'VT323';font-size:16px;padding:0 8px}.llmbar select:focus{outline:none;border-color:var(--cyan)}.llmbar button{background:var(--b2);border:1px solid var(--ln);color:var(--ink);border-radius:6px;height:30px;padding:0 9px;font-family:'VT323';font-size:15px;cursor:pointer}.llmbar button:hover{border-color:var(--cyan);color:var(--cyan)}.llmstat{max-width:280px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .optbar{display:none;align-items:center;gap:8px;margin:-8px 0 14px;padding:8px 10px;background:rgba(17,13,32,.72);border:1px solid var(--ln);border-radius:9px;color:var(--mut);flex-wrap:wrap}.optbar.on{display:flex}.optbar label{display:flex;align-items:center;gap:6px;font-size:15px}.optbar .ok{font-size:9px;color:var(--amb);margin-right:2px}.optbar select,.optbar input{background:#0a0814;border:1px solid var(--ln);color:var(--ink);border-radius:6px;height:28px;font-family:'VT323';font-size:16px;padding:0 7px}.optbar select:focus,.optbar input:focus{outline:none;border-color:var(--cyan)}.optbar input{width:66px}.optgrp{display:none;gap:8px;align-items:center;flex-wrap:wrap}.optgrp.on{display:flex}
-.assets{display:none;gap:6px;align-items:center;margin:-8px 0 12px;flex-wrap:wrap}.assets.on{display:flex}.asset{display:flex;align-items:center;gap:6px;background:var(--b1);border:1px solid var(--ln);border-radius:7px;padding:4px 7px;font-size:15px}.asset b{color:var(--cyan);font-size:12px}.asset select{background:#0a0814;border:1px solid var(--ln);color:var(--ink);border-radius:5px;height:24px;font-family:'VT323';font-size:14px}.asset .use{display:flex;align-items:center;gap:3px;color:var(--amb);font-size:12px}.asset .use input{accent-color:var(--pink)}.asset.off{opacity:.58}.asset button{border:none;background:rgba(13,11,22,.85);color:var(--ink);border-radius:5px;cursor:pointer}.asset button:hover{background:var(--amb);color:#0a0814}
+.assets{display:none;gap:6px;align-items:center;margin:-8px 0 12px;flex-wrap:wrap}.assets.on{display:flex}.asset{display:flex;align-items:center;gap:6px;background:var(--b1);border:1px solid var(--ln);border-radius:7px;padding:4px 7px;font-size:15px}.asset b{color:var(--cyan);font-size:12px}.asset select,.asset input{background:#0a0814;border:1px solid var(--ln);color:var(--ink);border-radius:5px;height:24px;font-family:'VT323';font-size:14px}.asset .short{width:54px}.asset .lora-name{width:150px}.asset .use{display:flex;align-items:center;gap:3px;color:var(--amb);font-size:12px}.asset .use input{accent-color:var(--pink);height:auto}.asset.off{opacity:.58}.asset button{border:none;background:rgba(13,11,22,.85);color:var(--ink);border-radius:5px;cursor:pointer}.asset button:hover{background:var(--amb);color:#0a0814}
 .director{display:none;margin:-4px 0 14px;border:1px solid var(--pur);border-radius:10px;background:rgba(17,13,32,.72);overflow:hidden}.director.on{display:block}.dhead{display:flex;justify-content:space-between;align-items:center;padding:9px 12px;border-bottom:1px solid var(--ln);font-size:10px;color:var(--cyan)}.dhead button{background:transparent;border:1px solid var(--ln);color:var(--mut);border-radius:6px;height:26px;padding:0 8px;font-family:'VT323';cursor:pointer}.dhead button:hover{color:var(--pink);border-color:var(--pink)}
 .dgrid{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;padding:10px}.dslot{min-width:0;border:1px solid var(--ln);border-radius:8px;background:#0a0814;padding:9px}.dtop{display:flex;justify-content:space-between;align-items:center;gap:8px;margin-bottom:8px}.dtop b{font-size:9px;color:var(--amb)}.dtop button{background:var(--b2);border:1px solid var(--ln);color:var(--ink);border-radius:6px;height:28px;padding:0 8px;font-family:'VT323';font-size:15px;cursor:pointer}.dtop button:hover{color:var(--cyan);border-color:var(--cyan)}
 .dlane{display:flex;flex-direction:column;gap:6px;min-height:44px}.ditem{display:flex;align-items:center;gap:7px;border:1px solid #241d42;border-radius:6px;padding:5px 6px;font-size:15px;background:rgba(255,255,255,.02)}.ditem .thumb{width:38px;height:30px;border-radius:5px;background:#161228;object-fit:cover;display:flex;align-items:center;justify-content:center;color:var(--pink);font-size:15px;flex:none}.ditem span{min-width:0;flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.ditem button{width:24px;height:24px;border:none;border-radius:5px;background:rgba(13,11,22,.85);color:var(--ink);cursor:pointer}.ditem button:hover{background:var(--amb);color:#0a0814}.dhint{color:var(--mut);font-size:14px;line-height:1.25;padding:3px 1px}
@@ -1121,9 +1147,19 @@ function renderDirectorLane(kind,label){var lane=document.getElementById('lane-'
     lane.appendChild(row)
   })
 }
-function roleSelect(a,i){var roles=['character_a','character_b','face_a','face_b','outfit_a','background_a','pose_a','style_a','prop_a'];var h='<select onchange="picked['+i+'].role=this.value;renderReferenceBoard()">';roles.forEach(function(r){h+='<option value="'+r+'"'+((a.role||'')===r?' selected':'')+'>'+r+'</option>'});return h+'</select>'}
+function roleSelect(a,i){var roles=['character_a','character_b','character_c','character_d','face_a','face_b','outfit_a','outfit_b','background_a','pose_a','style_a','prop_a'];var h='<select onchange="picked['+i+'].role=this.value;renderAssets()">';roles.forEach(function(r){h+='<option value="'+r+'"'+((a.role||'')===r?' selected':'')+'>'+r+'</option>'});return h+'</select>'}
+function setPickedBool(i,k,v){picked[i][k]=v;renderReferenceBoard()}
+function setPickedVal(i,k,v){picked[i][k]=v;renderReferenceBoard()}
+function setFaceTool(i,mode){picked[i].face_erase_enabled=mode==='erase';picked[i].face_keep_enabled=mode==='keep';renderAssets()}
+function boardTools(a,i){var role=a.role||'',face=role.indexOf('face_')===0||role.indexOf('character_')===0,mode=a.face_keep_enabled?'keep':(a.face_erase_enabled?'erase':'');var h='<label class="use"><input type="checkbox" '+(a.bg_remove_enabled?'checked':'')+' onchange="setPickedBool('+i+',&quot;bg_remove_enabled&quot;,this.checked)">BG</label>';
+  if(face){h+='<select title="face mask" onchange="setFaceTool('+i+',this.value)"><option value="">FACE</option><option value="erase"'+(mode==='erase'?' selected':'')+'>ERASE</option><option value="keep"'+(mode==='keep'?' selected':'')+'>KEEP</option></select><input class="lora-name" title="face LoRA" placeholder="face lora" value="'+esc(a.face_lora_name||'')+'" onchange="setPickedVal('+i+',&quot;face_lora_name&quot;,this.value);setPickedBool('+i+',&quot;face_lora_enabled&quot;,!!this.value)"><input class="short" title="face LoRA strength" type="number" step="0.05" value="'+(a.face_lora_strength||1)+'" onchange="setPickedVal('+i+',&quot;face_lora_strength&quot;,parseFloat(this.value||1))">'}
+  return h
+}
+function addLoraCard(){var n=prompt('LoRA filename');if(!n)return;picked.push({kind:'lora',type:'lora',role:'lora_a',name:n,lora_name:n,lora_strength:1,lora_enabled:true,enabled:true});renderAssets()}
 function renderAssets(){var box=document.getElementById('assets'),m=document.getElementById('mode').value;box.innerHTML='';box.className='assets'+(picked.length&&m!=='video'?' on':'');
-  picked.forEach(function(a,i){if(!a)return;if(a.enabled===undefined)a.enabled=true;var row=el('div','asset'+(a.enabled===false?' off':''));var board=(a.kind==='image'&&(m==='klein'||m==='faceswap'));var role=board?roleSelect(a,i):'';var use=board?'<label class="use"><input type="checkbox" '+(a.enabled!==false?'checked':'')+' onchange="picked['+i+'].enabled=this.checked;renderAssets()">USE</label>':'';row.innerHTML='<b>'+esc(a.kind.toUpperCase())+'</b>'+use+role+'<span>'+esc(a.name)+'</span><button>×</button>';row.querySelector('button').onclick=function(){picked.splice(i,1);renderAssets()};box.appendChild(row)});
+  var boardMode=(m==='klein'||m==='faceswap');
+  picked.forEach(function(a,i){if(!a)return;if(a.enabled===undefined)a.enabled=true;var row=el('div','asset'+(a.enabled===false?' off':''));var board=(a.kind==='image'&&boardMode),lora=((a.kind==='lora'||a.type==='lora')&&boardMode);var role=board?roleSelect(a,i):'';var use=(board||lora)?'<label class="use"><input type="checkbox" '+(a.enabled!==false?'checked':'')+' onchange="picked['+i+'].enabled=this.checked;picked['+i+'].lora_enabled=this.checked;renderAssets()">USE</label>':'';var tools=board?boardTools(a,i):'';if(lora){tools='<input class="lora-name" placeholder="lora file" value="'+esc(a.lora_name||a.name||'')+'" onchange="picked['+i+'].lora_name=this.value;picked['+i+'].name=this.value;renderReferenceBoard()"><input class="short" type="number" step="0.05" value="'+(a.lora_strength||1)+'" onchange="picked['+i+'].lora_strength=parseFloat(this.value||1);renderReferenceBoard()">'}row.innerHTML='<b>'+esc((lora?'LORA':a.kind).toUpperCase())+'</b>'+use+role+tools+'<span>'+esc(a.name||a.lora_name||'')+'</span><button>×</button>';row.querySelector('button').onclick=function(){picked.splice(i,1);renderAssets()};box.appendChild(row)});
+  if(boardMode){var add=el('div','asset');add.innerHTML='<b>LORA</b><button onclick="addLoraCard()">+ ADD</button>';box.appendChild(add);box.classList.add('on')}
   renderDirectorLane('image','참조 이미지');
   renderDirectorLane('video','모션 영상');
   renderDirectorLane('audio','오디오');
