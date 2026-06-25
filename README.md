@@ -25,7 +25,7 @@
 |---|---|---|
 | **ComfyUI Desktop** | 실제 생성 | 켜져 있어야 함 (포트 8188) |
 | **LM Studio** | 프롬프트 작성용 로컬 LLM | GUI는 안 켜도 됨. `lms` CLI가 자동 기동 |
-| **Python 3.10+** | 봇 스크립트 | 설치 시 "Add to PATH" 체크 |
+| **Python 3.10+** | 봇 스크립트 | 설치 시 "Add to PATH" 체크. 패키지는 `.venv`에 설치됩니다. |
 | **텔레그램 봇 토큰** | 입출력 | @BotFather → `/newbot` |
 
 ---
@@ -58,11 +58,12 @@ ComfyUI Manager 등으로 설치. **봇을 켜면 사전점검이 "뭐가 없는
 ## 4. 설정 (3단계)
 
 1. 이 폴더를 아무 데나 둠 (경로 무관)
-2. **`설치.bat`** 더블클릭 → Python 패키지 설치 + 설정 마법사
+2. **`설치.bat`** 더블클릭 → `.venv` 생성 + Python 패키지 설치 + 설정 마법사
    - 터미널에서 직접 하려면:
    ```bat
-   python -m pip install -r requirements.txt
-   python setup.py
+   python -m venv .venv
+   .venv\Scripts\python.exe -m pip install -r requirements.txt
+   .venv\Scripts\python.exe setup.py
    ```
    - 텔레그램 토큰 붙여넣기
    - 봇에게 메시지 한 번 보내기 → chat_id 자동 인식
@@ -118,7 +119,7 @@ ComfyUI Manager 등으로 설치. **봇을 켜면 사전점검이 "뭐가 없는
 
 ## 6. 문제 해결
 
-- **봇 창이 바로 닫힘** → `config.json` 없음. `python setup.py` 먼저 실행.
+- **봇 창이 바로 닫힘** → `config.json` 없음. `설치.bat`을 먼저 실행.
 - **"⚠️ ○○ 노드 없음"** → 해당 커스텀 노드 미설치. ComfyUI Manager로 설치.
 - **생성은 되는데 결과가 이상** → 모델 파일명이 워크플로와 다름. `workflows/` JSON에서 모델명 수정.
 - **OOM/멈춤** → VRAM 부족. 영상 해상도(`config.json`의 `video_width`)를 낮추거나 더 작은 모델 사용.

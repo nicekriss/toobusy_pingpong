@@ -12,10 +12,15 @@ if not exist "config.json" (
   pause
   exit /b 1
 )
+call "%~dp0ensure_venv.bat"
+if errorlevel 1 (
+  pause
+  exit /b 1
+)
 echo Starting dashboard. Browser opens at http://127.0.0.1:8910
 echo Close this window to stop the dashboard.
 echo.
-python dashboard.py
+"%~dp0.venv\Scripts\python.exe" dashboard.py
 echo.
 echo Dashboard stopped.
 pause

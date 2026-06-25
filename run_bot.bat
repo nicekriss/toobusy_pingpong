@@ -12,6 +12,11 @@ if not exist "config.json" (
   pause
   exit /b 1
 )
+call "%~dp0ensure_venv.bat"
+if errorlevel 1 (
+  pause
+  exit /b 1
+)
 powershell -NoProfile -Command "Get-CimInstance Win32_Process -Filter \"Name='python.exe'\" | Where-Object { $_.CommandLine -like '*pingpong.py*' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force }" >nul 2>&1
 powershell -NoProfile -Command "try{Invoke-RestMethod 'http://127.0.0.1:8188/system_stats' -TimeoutSec 5 | Out-Null; exit 0}catch{exit 1}"
 if errorlevel 1 (
@@ -25,7 +30,7 @@ echo [OK] LM Studio CLI will be started automatically when needed.
 echo.
 echo  Bot is running. Close this window to stop it.
 echo.
-python pingpong.py
+"%~dp0.venv\Scripts\python.exe" pingpong.py
 echo.
 echo  Bot stopped.
 pause

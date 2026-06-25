@@ -6,6 +6,7 @@ dashboard_hidden.json
 queue/
 __pycache__/
 *.pyc
+.venv/
 
 # 배포 산출물
 *.zip
