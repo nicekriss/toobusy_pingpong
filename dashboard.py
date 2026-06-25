@@ -1328,7 +1328,7 @@ function gen(){var m=document.getElementById('mode').value,p=document.getElement
   saveGenOptions();
   api('/api/generate',{mode:m,text:t,images:imageData,assets:picked,settings:gatherSettings()}).then(function(r){return r.json()}).then(function(j){
     if(!j.ok){alert(j.err||'실패');return}
-    p.value='';picked=[];document.getElementById('files').value='';renderAssets();document.getElementById('upinfo').textContent='큐에 추가됨 ✓ 봇이 곧 처리해요';
+    p.value='';if(m!=='klein')picked=[];document.getElementById('files').value='';renderAssets();document.getElementById('upinfo').textContent=m==='klein'?'큐에 추가됨 ✓ 보드는 유지돼요':'큐에 추가됨 ✓ 봇이 곧 처리해요';
   })}
 document.getElementById('prompt').addEventListener('keydown',function(e){if(e.key==='Enter')gen()});
 document.getElementById('prompt').addEventListener('input',renderReferenceBoard);
