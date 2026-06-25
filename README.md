@@ -201,3 +201,18 @@ git push -u origin main
 - `prefix_node`: `filename_prefix`를 넣을 `[노드id, 필드명]`이며 생략할 수 있습니다.
 - `prefix`: `filename_prefix` 앞부분입니다. 뒤에 타임스탬프가 자동으로 붙습니다.
 - `output_node`: ComfyUI 실행 결과에서 우선 확인할 저장 노드 id
+
+## 워크플로우 자동 등록 배치파일
+
+`워크플로우등록.bat` 위로 ComfyUI **Save (API Format)** JSON 파일을 드래그앤드랍하면 `workflows/` 폴더로 복사하고 `config.json`의 `custom_workflows`에 등록합니다.
+
+등록 도구가 자동으로 추정하는 항목:
+
+- 프롬프트 입력 노드
+- 시드 노드
+- 이미지 입력 노드
+- 저장 파일명 prefix 노드
+- 결과 저장 노드
+- 비율 노드(`ratio_preset` 또는 `aspect_ratio`)
+
+특이한 워크플로우는 등록 후 `config.json`에서 노드 id를 한 번 확인해 주세요.
