@@ -1274,29 +1274,21 @@ FEATURE_CHECKS = [
 ]
 
 def preflight():
-    import shutil
-    lines = []
     try:
-        requests.get(f"{COMFY}/system_stats", timeout=5); comfy_ok = True
-    except Exception:
-        comfy_ok = False
-    if not comfy_ok:
-        lines.append("❌ ComfyUI 연결 안 됨 → Comfy Desktop을 먼저 켜세요 (8188)")
-    else:
-        lines.append("✅ ComfyUI 연결됨")
-        for feat, nodes, loader, field, key in FEATURE_CHECKS:
-            missing = [n for n in nodes if not _node_info(n)]
-            if missing:
-                lines.append(f"⚠️ {feat}  ← 노드 없음: {', '.join(missing)}")
-                continue
-            exp = model_of(key)
-            if not _has(exp, _model_list(loader, field)):
-                lines.append(f"⚠️ {feat}  ← 모델 없음: {exp}  (config의 models.{key} 확인)")
-            else:
-                lines.append(f"✅ {feat}")
-    lines.append("✅ LM Studio CLI" if shutil.which("lms") else
-                 "⚠️ lms(LM Studio CLI) 없음 → 텍스트 자동 프롬프트 불가")
-    return comfy_ok, lines
+        import healthcheck
+        rep = healthcheck.run_checks()
+        lines = [f"{healthcheck.icon(level)} {text}" for level, text in rep.rows]
+        comfy_ok = not any(level == "fail" and "ComfyUI 연결" in text for level, text in rep.rows)
+        return comfy_ok, lines[:24]
+    except Exception as e:
+        lines = [f"⚠️ 새 점검 도구 실행 실패: {e}"]
+        try:
+            requests.get(f"{COMFY}/system_stats", timeout=5)
+            lines.append("✅ ComfyUI 연결됨")
+            return True, lines
+        except Exception:
+            lines.append("❌ ComfyUI 연결 안 됨")
+            return False, lines
 
 CONSOLE_BANNER = r"""
    ____  _____ _   _  ____    ____  _____ _   _  ____

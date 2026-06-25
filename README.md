@@ -68,10 +68,12 @@ ComfyUI Manager 등으로 설치. **봇을 켜면 사전점검이 "뭐가 없는
    - 텔레그램 토큰 붙여넣기
    - 봇에게 메시지 한 번 보내기 → chat_id 자동 인식
    - ComfyUI 경로 자동 감지, LM 모델 선택
+   - 마지막에 `healthcheck.py`가 실행되어 ComfyUI, LM Studio, 워크플로 파일, 스냅샷, 주요 노드/모델 상태를 점검합니다.
    - → `config.json` 자동 작성
 3. **`run_bot.bat`** 더블클릭 → 봇 가동
 
 이후엔 **ComfyUI 켜고 → `run_bot.bat`** 만 하면 됩니다.
+문제가 생기면 **`점검.bat`** 을 더블클릭해서 현재 준비 상태를 다시 확인하세요.
 
 ---
 
@@ -138,10 +140,12 @@ pingpong/
 ├─ 핑퐁시작.bat / 대시보드.bat
 │                      # 한글 호환용 실행 래퍼
 ├─ setup.py            # 설정 마법사 본체
+├─ healthcheck.py      # 설치/실행 점검 도구
+├─ 점검.bat            # 점검 도구 실행
 ├─ pingpong.py         # 봇 오케스트레이터 (+공유 큐 처리)
 ├─ dashboard.py        # 갤러리 대시보드 서버
 ├─ config.example.json # 설정 예시 (복사해서 config.json)
-├─ workflows/          # ComfyUI 워크플로 4종 (API 포맷)
+├─ workflows/          # ComfyUI 워크플로들 (API 포맷)
 └─ (config.json, queue/ 등은 .gitignore 처리)
 ```
 

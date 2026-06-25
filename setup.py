@@ -10,6 +10,7 @@ except Exception:
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 CFG_PATH = os.path.join(HERE, "config.json")
+EXAMPLE_PATH = os.path.join(HERE, "config.example.json")
 
 def get(url):
     with urllib.request.urlopen(url, timeout=20) as r:
@@ -46,6 +47,18 @@ def find_comfy_outputs():
 def input_dir_for(out_dir):
     """output 폴더 기준으로 같은 위치의 input 폴더 추정."""
     return os.path.join(os.path.dirname(out_dir.rstrip("\\/")), "input")
+
+def example_custom_workflows():
+    try:
+        with open(EXAMPLE_PATH, "r", encoding="utf-8") as f:
+            raw = json.load(f).get("custom_workflows") or {}
+    except Exception:
+        return {}
+    out = {}
+    for name, spec in raw.items():
+        if isinstance(spec, dict) and spec.get("file") and os.path.isfile(os.path.join(HERE, spec["file"])):
+            out[name] = spec
+    return out
 
 def list_lms_models():
     if not shutil.which("lms"):
@@ -180,6 +193,7 @@ def main():
             "klein": "FLUX2\\flux-2-klein-9b-kv-fp8.safetensors",
             "ace": "aceStepAudioGen_v15XLTurbo.safetensors",
         },
+        "custom_workflows": example_custom_workflows(),
     }
     with open(CFG_PATH, "w", encoding="utf-8") as f:
         json.dump(cfg, f, ensure_ascii=False, indent=2)

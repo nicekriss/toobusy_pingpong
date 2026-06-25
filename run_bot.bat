@@ -28,6 +28,9 @@ if errorlevel 1 (
 )
 echo [OK] LM Studio CLI will be started automatically when needed.
 echo.
+echo [check] Quick health check...
+"%~dp0.venv\Scripts\python.exe" healthcheck.py
+echo.
 echo  Bot is running. Close this window to stop it.
 echo.
 "%~dp0.venv\Scripts\python.exe" pingpong.py

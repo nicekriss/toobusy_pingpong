@@ -55,6 +55,44 @@
         "21:9": "21:9 (Cinematic)"
       }
     },
+    "크레아2": {
+      "file": "workflows/image_krea2_turbo_t2i_API.json",
+      "trigger": "/크레아",
+      "type": "image",
+      "llm": "image",
+      "prompt_nodes": [
+        [
+          "30:19",
+          "value"
+        ]
+      ],
+      "seed_nodes": [
+        [
+          "30:3",
+          "seed"
+        ]
+      ],
+      "prefix_node": [
+        "29",
+        "filename_prefix"
+      ],
+      "prefix": "pingpong/krea2_",
+      "output_node": "29",
+      "ratio_node": [
+        "49",
+        "aspect_ratio"
+      ],
+      "ratio_map": {
+        "1:1": "1:1 (Square)",
+        "3:4": "3:4 (Portrait)",
+        "4:3": "4:3 (Landscape)",
+        "2:3": "2:3 (Portrait)",
+        "3:2": "3:2 (Landscape)",
+        "9:16": "9:16 (Portrait)",
+        "16:9": "16:9 (Landscape)",
+        "21:9": "21:9 (Cinematic)"
+      }
+    },
     "부구편집": {
       "file": "workflows/image_boogu_image_0_1_edit_API.json",
       "trigger": "/부구편집",

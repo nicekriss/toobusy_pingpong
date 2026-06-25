@@ -31,4 +31,7 @@ echo [2/2] Starting config wizard...
 echo.
 "%~dp0.venv\Scripts\python.exe" setup.py
 echo.
+echo [check] Running install health check...
+"%~dp0.venv\Scripts\python.exe" healthcheck.py
+echo.
 pause
