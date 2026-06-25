@@ -33,6 +33,7 @@ TRASH    = os.path.join(GALLERY, ".trash")
 ALIVE    = os.path.join(GALLERY, ".alive")
 QUEUE    = os.path.join(HERE, "queue")
 HIDDEN   = os.path.join(HERE, "dashboard_hidden.json")
+PRESETS  = os.path.join(HERE, "dashboard_reference_presets.json")
 PORT     = int(CFG.get("dashboard_port", 8910))
 EVENTS   = []
 CPU_LAST = {"t": 0, "idle": 0, "kernel": 0, "user": 0, "cpu": 0}
@@ -391,6 +392,56 @@ def save_hidden(s):
     except Exception:
         pass
 
+def load_reference_presets():
+    try:
+        data = json.load(open(PRESETS, encoding="utf-8"))
+        return data if isinstance(data, dict) else {"presets": []}
+    except Exception:
+        return {"presets": []}
+
+def save_reference_presets(data):
+    tmp = PRESETS + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+        f.write("\n")
+    os.replace(tmp, PRESETS)
+
+def reference_preset_list():
+    data = load_reference_presets()
+    rows = []
+    for p in data.get("presets", []):
+        assets = p.get("assets", []) if isinstance(p, dict) else []
+        rows.append({
+            "id": p.get("id", ""),
+            "name": p.get("name", ""),
+            "updated_at": p.get("updated_at", ""),
+            "count": len(assets),
+        })
+    return {"presets": rows}
+
+def reference_preset_get(pid):
+    for p in load_reference_presets().get("presets", []):
+        if p.get("id") == pid:
+            return p
+    return None
+
+def reference_preset_save(name, assets):
+    name = (name or "").strip()[:80] or time.strftime("preset_%m%d_%H%M%S")
+    pid = re.sub(r"[^0-9A-Za-z가-힣_.-]+", "_", name).strip("_")[:60] or "preset"
+    if not pid.endswith("_" + time.strftime("%m%d")):
+        pid = pid + "_" + time.strftime("%m%d_%H%M%S")
+    data = load_reference_presets()
+    rows = [p for p in data.get("presets", []) if p.get("id") != pid]
+    rows.append({
+        "id": pid,
+        "name": name,
+        "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "assets": assets if isinstance(assets, list) else [],
+    })
+    data["presets"] = rows[-50:]
+    save_reference_presets(data)
+    return rows[-1]
+
 def scan(page=1, per=48):
     hidden = load_hidden()
     page = max(1, int(page or 1))
@@ -669,6 +720,15 @@ class H(BaseHTTPRequestHandler):
             self._json({"lines": comfy_log()})
         elif p == "/api/youtube_latest":
             self._json(youtube_latest())
+        elif p == "/api/reference_presets":
+            self._json(reference_preset_list())
+        elif p == "/api/reference_preset":
+            qs = urllib.parse.parse_qs(parsed.query)
+            preset = reference_preset_get(qs.get("id", [""])[0])
+            if not preset:
+                self._json({"ok": False, "err": "preset not found"}, 404)
+            else:
+                self._json({"ok": True, "preset": preset})
         elif p.startswith("/media/"):
             self.serve_media(urllib.parse.unquote(p[len("/media/"):]))
         else:
@@ -736,6 +796,13 @@ class H(BaseHTTPRequestHandler):
             event("dashboard restart requested")
             restart_self()
             return self._json({"ok": True})
+        if p == "/api/reference_preset_save":
+            try:
+                preset = reference_preset_save(body.get("name", ""), body.get("assets", []))
+                event("saved reference preset: " + preset.get("name", ""))
+                return self._json({"ok": True, "preset": preset})
+            except Exception as e:
+                return self._json({"ok": False, "err": str(e)}, 500)
         if p == "/api/hide":
             h = load_hidden(); h.add(body.get("rel", "")); save_hidden(h)
             return self._json({"ok": True})
@@ -824,7 +891,7 @@ body{margin:0;background:#0a0814;color:var(--ink);font-family:'VT323',monospace;
 .dgrid{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;padding:10px}.dslot{min-width:0;border:1px solid var(--ln);border-radius:8px;background:#0a0814;padding:9px}.dtop{display:flex;justify-content:space-between;align-items:center;gap:8px;margin-bottom:8px}.dtop b{font-size:9px;color:var(--amb)}.dtop button{background:var(--b2);border:1px solid var(--ln);color:var(--ink);border-radius:6px;height:28px;padding:0 8px;font-family:'VT323';font-size:15px;cursor:pointer}.dtop button:hover{color:var(--cyan);border-color:var(--cyan)}
 .dlane{display:flex;flex-direction:column;gap:6px;min-height:44px}.ditem{display:flex;align-items:center;gap:7px;border:1px solid #241d42;border-radius:6px;padding:5px 6px;font-size:15px;background:rgba(255,255,255,.02)}.ditem .thumb{width:38px;height:30px;border-radius:5px;background:#161228;object-fit:cover;display:flex;align-items:center;justify-content:center;color:var(--pink);font-size:15px;flex:none}.ditem span{min-width:0;flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.ditem button{width:24px;height:24px;border:none;border-radius:5px;background:rgba(13,11,22,.85);color:var(--ink);cursor:pointer}.ditem button:hover{background:var(--amb);color:#0a0814}.dhint{color:var(--mut);font-size:14px;line-height:1.25;padding:3px 1px}
 .tl{padding:0 10px 10px}.tlbar{height:20px;border:1px solid var(--ln);border-radius:7px;background:#0a0814;position:relative;overflow:hidden}.tlseg{position:absolute;top:3px;height:14px;border-radius:4px;background:var(--cyan);opacity:.8}.tlseg.video{background:var(--pink)}.tlseg.audio{background:var(--amb)}.tlcap{display:flex;justify-content:space-between;color:var(--mut);font-size:13px;margin-top:4px}.ditem{flex-wrap:wrap}.ditem .dmain{display:flex;align-items:center;gap:7px;width:100%}.dtime{display:grid;grid-template-columns:repeat(3,1fr);gap:5px;width:100%;padding-left:45px}.dtime label{font-size:9px;color:var(--mut);display:flex;flex-direction:column;gap:2px}.dtime input{min-width:0;background:#0a0814;border:1px solid var(--ln);border-radius:5px;color:var(--ink);font-family:'VT323';font-size:15px;height:24px;padding:0 5px}.dtime input:focus{outline:none;border-color:var(--cyan)}
-.refboard{display:none;margin:-4px 0 14px;border:1px solid var(--pink);border-radius:10px;background:rgba(17,13,32,.72);overflow:hidden}.refboard.on{display:block}.rbody{display:grid;grid-template-columns:220px minmax(0,1fr);gap:10px;padding:10px}.refboard.swap .rbody{grid-template-columns:220px 220px minmax(0,1fr)}.rphoto{border:1px dashed var(--ln);border-radius:8px;min-height:168px;background:#0a0814;display:flex;align-items:center;justify-content:center;overflow:hidden;color:var(--mut);font-size:16px;text-align:center;padding:8px;gap:6px;flex-wrap:wrap}.rphoto img{width:100%;height:100%;object-fit:cover}.rphoto.multi img{width:calc(50% - 3px);height:76px;border-radius:5px}.rphoto.off{display:none}.rmeta{border:1px solid var(--ln);border-radius:8px;background:#0a0814;padding:10px;display:flex;flex-direction:column;gap:8px}.rmeta .rk{font-size:9px;color:var(--amb)}.rmeta .rv{font-size:18px;color:var(--ink);line-height:1.2}.racts{display:flex;gap:8px;flex-wrap:wrap}.racts button{background:var(--b2);border:1px solid var(--ln);color:var(--ink);border-radius:6px;height:30px;padding:0 9px;font-family:'VT323';font-size:15px;cursor:pointer}.racts button:hover{border-color:var(--cyan);color:var(--cyan)}
+.refboard{display:none;margin:-4px 0 14px;border:1px solid var(--pink);border-radius:10px;background:rgba(17,13,32,.72);overflow:hidden}.refboard.on{display:block}.rbody{display:grid;grid-template-columns:220px minmax(0,1fr);gap:10px;padding:10px}.refboard.swap .rbody{grid-template-columns:220px 220px minmax(0,1fr)}.rphoto{border:1px dashed var(--ln);border-radius:8px;min-height:168px;background:#0a0814;display:flex;align-items:center;justify-content:center;overflow:hidden;color:var(--mut);font-size:16px;text-align:center;padding:8px;gap:6px;flex-wrap:wrap}.rphoto img{width:100%;height:100%;object-fit:cover}.rphoto.multi img{width:calc(50% - 3px);height:76px;border-radius:5px}.rphoto.off{display:none}.rmeta{border:1px solid var(--ln);border-radius:8px;background:#0a0814;padding:10px;display:flex;flex-direction:column;gap:8px}.rmeta .rk{font-size:9px;color:var(--amb)}.rmeta .rv{font-size:18px;color:var(--ink);line-height:1.2}.racts{display:flex;gap:8px;flex-wrap:wrap}.racts button,.racts input,.racts select{background:var(--b2);border:1px solid var(--ln);color:var(--ink);border-radius:6px;height:30px;padding:0 9px;font-family:'VT323';font-size:15px}.racts input,.racts select{background:#0a0814;min-width:0}.racts input{width:138px}.racts select{width:170px}.racts button{cursor:pointer}.racts button:hover{border-color:var(--cyan);color:var(--cyan)}
 .boardmode .content,.boardmode .videoFoldbar,.boardmode .mon,.boardmode #assets{display:none}.boardmode .refboard{min-height:calc(100vh - 250px)}.boardmode .rbody{display:grid;grid-template-columns:minmax(0,1fr) 300px;min-height:520px}.boardmode .rphoto{position:relative;display:block;min-height:520px;padding:0;overflow:auto;text-align:left;background-image:linear-gradient(rgba(255,255,255,.035) 1px,transparent 1px),linear-gradient(90deg,rgba(255,255,255,.035) 1px,transparent 1px);background-size:28px 28px}.boardmode .rphoto.empty{display:flex;align-items:center;justify-content:center;text-align:center;padding:24px}.boardmode .rphoto.drag{border-color:var(--cyan);box-shadow:0 0 24px rgba(86,225,255,.2)}.boardmode .rmeta{margin-top:0}.bcard{position:absolute;width:202px;background:var(--b1);border:1px solid var(--ln);border-radius:8px;overflow:hidden;text-align:left;box-shadow:0 10px 26px rgba(0,0,0,.26)}.bcard.off{opacity:.48}.bcard.dragging{z-index:8;cursor:grabbing;border-color:var(--cyan);box-shadow:0 0 22px rgba(86,225,255,.25)}.bcard img{width:100%;height:132px;object-fit:cover;display:block}.bcard .bdrag{height:26px;display:flex;align-items:center;justify-content:space-between;gap:6px;padding:0 7px;background:#0a0814;border-bottom:1px solid var(--ln);color:var(--cyan);font-size:9px;cursor:grab}.bcard .bdrag span{min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.bcard .bdel{width:22px;height:20px;border:none;border-radius:5px;background:rgba(255,255,255,.06);color:var(--ink);cursor:pointer}.bcard .bdel:hover{background:var(--amb);color:#0a0814}.bcard .bm{padding:7px;display:flex;flex-direction:column;gap:6px}.bcard .bn{font-size:15px;color:var(--ink);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.bcard label{display:flex;align-items:center;gap:4px;color:var(--amb);font-size:12px}.bcard .brow{display:flex;gap:5px;align-items:center;flex-wrap:wrap}.bcard select,.bcard input,.bcard textarea{min-width:0;background:#0a0814;border:1px solid var(--ln);color:var(--ink);border-radius:5px;font-family:'VT323';font-size:14px}.bcard select,.bcard input{height:24px}.bcard textarea{width:100%;height:44px;resize:vertical;padding:5px}.bcard select{flex:1}.bcard .short{width:50px;flex:none}.bcard .lora-name{width:100%;flex:none}.bcard .lora-tile{height:132px;display:flex;align-items:center;justify-content:center;background:linear-gradient(135deg,#211936,#0a0814);color:var(--pink);font-size:34px}.bcard input[type=checkbox]{height:auto;accent-color:var(--pink)}
 .sysbar{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin:-6px 0 14px}.meter{background:var(--b1);border:1px solid var(--ln);border-radius:7px;padding:6px 8px}.meter .mt{display:flex;justify-content:space-between;font-size:9px;color:var(--mut);margin-bottom:5px}.meter .mb{height:5px;background:#0a0814;border-radius:9px;overflow:hidden}.meter .mf{height:100%;background:linear-gradient(90deg,var(--cyan),var(--pink));width:0%}
 .shake{animation:sh .3s}@keyframes sh{0%,100%{transform:translateX(0)}25%{transform:translateX(-5px)}75%{transform:translateX(5px)}}
@@ -964,7 +1031,7 @@ body{margin:0;background:#0a0814;color:var(--ink);font-family:'VT323',monospace;
 </aside></div></div>
 <div class="lb" id="lb"><div class="lbtools"><button onclick="lbHide()">👁</button><button onclick="lbDel()">🗑</button><button onclick="closeLb()">✕</button></div><button class="nav prev" onclick="step(-1)">‹</button><img id="lbimg" onclick="toggleZoom()"><button class="nav next" onclick="step(1)">›</button><div class="lbcap" id="lbcap"></div></div>
 <script>
-var IMGS=[],VIDS=[],AUDS=[],CUSTOMS=[],LORAS=[],AUDDUR={},ai=0,cur=0,curAudioRel='',IMGKEY='',VIDKEY='',AUDKEY='',DURATION_FRAMES=120,IMGPAGE=1,IMGPAGES=1,IMGTOTAL=0,IMGPER=48;
+var IMGS=[],VIDS=[],AUDS=[],CUSTOMS=[],LORAS=[],BOARD_PRESETS=[],AUDDUR={},ai=0,cur=0,curAudioRel='',IMGKEY='',VIDKEY='',AUDKEY='',DURATION_FRAMES=120,IMGPAGE=1,IMGPAGES=1,IMGTOTAL=0,IMGPER=48;
 function api(p,b){return fetch(p,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b)})}
 function el(t,c){var e=document.createElement(t);if(c)e.className=c;return e}
 function esc(s){return String(s||'').replace(/[&<>"']/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]})}
@@ -988,6 +1055,11 @@ function saveLlmModel(){var sel=document.getElementById('llm'),model=sel.value;i
   }).catch(function(){setLlmStatus('저장 실패')})
 }
 function loadLoras(){fetch('/api/loras').then(function(r){return r.json()}).then(function(d){LORAS=d.loras||[];renderAssets()}).catch(function(){LORAS=[]})}
+function loadBoardPresets(){fetch('/api/reference_presets').then(function(r){return r.json()}).then(function(d){BOARD_PRESETS=d.presets||[];fillPresetSelect()}).catch(function(){BOARD_PRESETS=[];fillPresetSelect()})}
+function fillPresetSelect(){var s=document.getElementById('presetSel');if(!s)return;var cur=s.value;s.innerHTML='<option value="">Load Preset</option>'+BOARD_PRESETS.map(function(p){return '<option value="'+esc(p.id)+'"'+(p.id===cur?' selected':'')+'>'+esc(p.name||p.id)+' · '+(p.count||0)+'</option>'}).join('')}
+function boardPresetAssets(){return picked.filter(function(a){return a&&(a.kind==='image'||a.kind==='lora'||a.type==='lora')}).map(function(a){return JSON.parse(JSON.stringify(a))})}
+function saveBoardPreset(){var inp=document.getElementById('presetName'),name=(inp&&inp.value.trim())||('board_'+new Date().toISOString().slice(5,16).replace(/[-T:]/g,'')),assets=boardPresetAssets();if(!assets.length){alert('저장할 카드가 없어요');return}api('/api/reference_preset_save',{name:name,assets:assets}).then(function(r){return r.json()}).then(function(j){if(!j.ok){alert(j.err||'프리셋 저장 실패');return}if(inp)inp.value='';loadBoardPresets();document.getElementById('upinfo').textContent='Reference preset 저장됨 ✓'})}
+function loadBoardPreset(){var s=document.getElementById('presetSel'),id=s&&s.value;if(!id)return;fetch('/api/reference_preset?id='+encodeURIComponent(id)).then(function(r){return r.json()}).then(function(j){if(!j.ok||!j.preset){alert(j.err||'프리셋 로드 실패');return}picked=(j.preset.assets||[]).map(function(a){if(a.kind==='lora'||a.type==='lora'){a.kind='lora';a.type='lora'}else{a.kind='image'}return a});renderAssets();document.getElementById('upinfo').textContent='Reference preset 불러옴 ✓'})}
 function optVal(id){var e=document.getElementById(id);return e?e.value:''}
 function optNum(id,def){var v=parseFloat(optVal(id));return isNaN(v)?def:v}
 function loadGenOptions(){
@@ -1190,7 +1262,7 @@ function renderReferenceBoard(){var photo=document.getElementById('rphoto'),face
     if(imgs.length||loras.length){var order=0;photo.innerHTML=picked.map(function(a,i){if(!a)return'';if(a.kind==='image')return boardImageCard(a,i,order++);if(a.kind==='lora'||a.type==='lora')return boardLoraCard(a,i,order++);return''}).join('')}else{photo.textContent='이미지를 이 보드에 드래그하거나 참조 이미지 추가를 눌러주세요'}
     name.textContent=imgs.length+' images · '+loras.length+' loras';
     goal.textContent=text||'카드를 움직이고 각 카드의 역할/모듈을 고르면 Reference Board 번들로 들어가요.';
-    acts.innerHTML='<button onclick="openPicker(\'image\')">Add files</button><button onclick="addLoraCard()">Add LoRA</button><button onclick="clearReference()">Clear cards</button>';
+    acts.innerHTML='<button onclick="openPicker(\'image\')">Add files</button><button onclick="addLoraCard()">Add LoRA</button><input id="presetName" placeholder="Preset name"><button onclick="saveBoardPreset()">Save Preset</button><select id="presetSel"></select><button onclick="loadBoardPreset()">Load</button><button onclick="clearReference()">Clear cards</button>';fillPresetSelect();
     return
   }
   if(m==='faceswap'){
@@ -1274,7 +1346,7 @@ for(var y=0;y<6;y++)for(var x=0;x<7;x++)if(rows[y][x]==='1')hs+='<rect x='+(x*6.
 document.getElementById('hbox').innerHTML='<svg class="heart on" viewBox="0 0 46 40">'+hs+'</svg>';
 var faceOpt=document.querySelector('#mode option[value="faceswap"]');if(faceOpt)faceOpt.remove();
 var kleinOpt=document.querySelector('#mode option[value="klein"]');if(kleinOpt)kleinOpt.textContent='Flux2 Klein';
-loadGenOptions();initVideoFold();loadModes();loadLlmModels();loadLoras();load();loadYoutube();poll();pollSystem();setInterval(load,5000);setInterval(poll,2000);setInterval(pollSystem,3000);setInterval(pollLog,3000);setInterval(loadYoutube,1800000);
+loadGenOptions();initVideoFold();loadModes();loadLlmModels();loadLoras();loadBoardPresets();load();loadYoutube();poll();pollSystem();setInterval(load,5000);setInterval(poll,2000);setInterval(pollSystem,3000);setInterval(pollLog,3000);setInterval(loadYoutube,1800000);
 </script></body></html>'''
 
 
