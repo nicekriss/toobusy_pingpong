@@ -339,9 +339,16 @@ def clean_llm_prompt(out):
     text = (out or "").replace("\r", "\n").strip()
     text = re.sub(r"<think>[\s\S]*?</think>", " ", text, flags=re.I)
     text = re.sub(r"```(?:json|text)?|```", " ", text, flags=re.I)
+    option = re.search(
+        r"(?:^|\n|\s)option\s*1\s*(?:\([^)]*\))?\s*[:：]\s*(.+?)(?=(?:\s|\n)option\s*2\s*(?:\([^)]*\))?\s*[:：]|$)",
+        text,
+        flags=re.I | re.S,
+    )
+    if option:
+        text = option.group(1).strip()
     text = re.sub(r"^\s*(?:under\s+\d+\s+words?\??\s*)?(?:let'?s\s+count|word\s+count)\s*[:\-]\s*", "", text, flags=re.I)
     text = re.sub(r"\s*\(\s*\d+\s+words?\s*\)\s*\.?\s*$", "", text, flags=re.I)
-    text = re.sub(r'^[\*\s\-]*(?:attempt|draft|final|version|option|prompt|answer|output|here(?:\s+is)?)\s*\d*\s*[:\*\-]+\s*',
+    text = re.sub(r'^[\*\s\-]*(?:attempt|draft|final|version|option|prompt|answer|output|here(?:\s+is)?)\s*\d*(?:\s*\([^)]*\))?\s*[:：\*\-]+\s*',
                   '', text, flags=re.I)
     markers = [
         r"\bfinal\s+prompt\s*[:\-]",
