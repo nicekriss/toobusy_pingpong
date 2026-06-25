@@ -799,6 +799,14 @@ class H(BaseHTTPRequestHandler):
                 return self._json({"ok": True})
             except Exception as e:
                 return self._json({"ok": False, "err": str(e)}, 500)
+        if p == "/api/interrupt":
+            try:
+                req = urllib.request.Request(COMFY + "/interrupt", data=b"{}", headers={"Content-Type": "application/json"}, method="POST")
+                urllib.request.urlopen(req, timeout=5).read()
+                event("comfy interrupt requested")
+                return self._json({"ok": True})
+            except Exception as e:
+                return self._json({"ok": False, "err": str(e)}, 500)
         if p == "/api/llm_model":
             model = (body.get("model") or "").strip()
             if not model:
@@ -968,6 +976,7 @@ body{margin:0;background:#0a0814;color:var(--ink);font-family:'VT323',monospace;
   <button class="up" id="up" style="display:none" onclick="document.getElementById('files').click()">📷 사진</button>
   <input type="file" id="files" accept="image/*" multiple style="display:none" onchange="filePick()">
   <button class="genb pix" onclick="gen()">생성 ▸</button>
+  <button class="folderb" onclick="stopComfy()">■ 정지</button>
   <button class="folderb" onclick="openGallery()">📁 폴더</button>
   <button class="folderb" onclick="restartDash()">↻ 재시작</button>
 </div>
@@ -1055,6 +1064,7 @@ function api(p,b){return fetch(p,{method:'POST',headers:{'Content-Type':'applica
 function el(t,c){var e=document.createElement(t);if(c)e.className=c;return e}
 function esc(s){return String(s||'').replace(/[&<>"']/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]})}
 function openGallery(){api('/api/open_gallery',{}).then(function(r){return r.json()}).then(function(j){if(!j.ok)alert(j.err||'폴더를 열 수 없어요')})}
+function stopComfy(){if(!confirm('현재 ComfyUI 생성을 정지할까요?'))return;api('/api/interrupt',{}).then(function(r){return r.json()}).then(function(j){if(!j.ok)alert(j.err||'정지 요청 실패');else document.getElementById('upinfo').textContent='ComfyUI 정지 요청 보냄'})}
 function restartDash(){if(!confirm('대시보드를 다시 시작할까요?'))return;api('/api/restart_dashboard',{}).then(function(){setTimeout(function(){location.reload()},1800)})}
 function setLlmStatus(t){document.getElementById('llmstat').textContent=t||''}
 function loadLlmModels(){var sel=document.getElementById('llm');setLlmStatus('LM Studio 확인 중...');
