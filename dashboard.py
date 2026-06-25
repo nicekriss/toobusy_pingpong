@@ -8,6 +8,7 @@
 """
 import os, sys, json, time, base64, re, mimetypes, threading, webbrowser, struct, zlib, subprocess
 import urllib.request
+import urllib.parse
 import html as html_lib
 import xml.etree.ElementTree as ET
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -41,6 +42,7 @@ CPU_LAST = {"t": 0, "idle": 0, "kernel": 0, "user": 0, "cpu": 0}
 YOUTUBE_CHANNEL_ID = "UC4xLnbcb7AxfJ8wdkiobaKQ"
 YT_CACHE = {"t": 0, "data": None}
 LORA_CACHE = {"t": 0, "data": []}
+MODE_STATUS_CACHE = {"t": 0, "data": {}}
 HIDDEN_SUBPROCESS_FLAGS = 0
 if os.name == "nt" and hasattr(subprocess, "CREATE_NO_WINDOW"):
     HIDDEN_SUBPROCESS_FLAGS = subprocess.CREATE_NO_WINDOW
@@ -77,6 +79,7 @@ def write_config(data):
     CFG = data
     CUSTOM = CFG.get("custom_workflows", {}) or {}
     LMAPI = CFG.get("lmstudio_api", "http://127.0.0.1:1234").rstrip("/")
+    MODE_STATUS_CACHE["t"] = 0
 
 def _add_model(out, seen, model_id, label=None, source=""):
     model_id = (model_id or "").strip()
@@ -546,6 +549,182 @@ def custom_modes():
         })
     return out
 
+def _norm_model(name):
+    return str(name or "").replace("\\", "/").lower()
+
+def _comfy_json(path, timeout=5):
+    return json.load(urllib.request.urlopen(COMFY + path, timeout=timeout))
+
+def comfy_is_online():
+    try:
+        _comfy_json("/system_stats", timeout=3)
+        return True
+    except Exception:
+        return False
+
+def comfy_node_info(cls):
+    try:
+        data = _comfy_json("/object_info/" + urllib.parse.quote(str(cls), safe=""), timeout=5)
+        return data.get(cls) if isinstance(data, dict) else None
+    except Exception:
+        return None
+
+def comfy_input_options(info, field):
+    if not info:
+        return None
+    for section in ("required", "optional"):
+        try:
+            opts = info["input"][section][field][0]
+            if isinstance(opts, list):
+                return opts
+        except Exception:
+            pass
+    return None
+
+def comfy_has_model(expected, options):
+    if not expected or options is None:
+        return True
+    return _norm_model(expected) in [_norm_model(o) for o in options]
+
+def workflow_classes_and_models(path):
+    data = json.load(open(path, encoding="utf-8"))
+    classes = []
+    model_refs = []
+    model_ext = (".safetensors", ".ckpt", ".gguf", ".pt", ".pth", ".bin", ".onnx", ".vae", ".lora")
+    if not isinstance(data, dict):
+        return classes, model_refs
+    for node_id, node in data.items():
+        if not isinstance(node, dict):
+            continue
+        cls = node.get("class_type")
+        if cls:
+            classes.append(str(cls))
+        inputs = node.get("inputs") or {}
+        if not isinstance(inputs, dict):
+            continue
+        for field, value in inputs.items():
+            if not isinstance(value, str):
+                continue
+            v = value.strip()
+            low = v.lower()
+            if low.endswith(model_ext) or "\\" in v or "/" in v:
+                model_refs.append((str(node_id), str(cls or ""), str(field), v))
+    return sorted(set(classes)), model_refs
+
+BUILTIN_MODE_CHECKS = {
+    "image": {
+        "label": "Z-Image Turbo",
+        "nodes": ["ToobusyZImageTurbo", "ToobusyHiresUpscale"],
+        "loader": "ToobusyZImageTurbo",
+        "field": "model_name",
+        "model_key": "zit",
+    },
+    "video": {
+        "label": "LTX Director",
+        "nodes": ["LTXDirector", "UnetLoaderGGUF", "VAEDecodeTiled"],
+        "loader": "UnetLoaderGGUF",
+        "field": "unet_name",
+        "model_key": "ltx_gguf",
+    },
+    "song": {
+        "label": "ACE Step Audio",
+        "nodes": ["TextEncodeAceStepAudio1.5"],
+        "loader": "UNETLoader",
+        "field": "unet_name",
+        "model_key": "ace",
+    },
+    "klein": {
+        "label": "Flux2 Klein",
+        "nodes": ["ToobusyFlux2Klein", "ToobusyReferenceBoard"],
+        "loader": "ToobusyFlux2Klein",
+        "field": "model_name",
+        "model_key": "klein",
+    },
+    "faceswap": {
+        "label": "Flux2 Klein Face",
+        "nodes": ["ToobusyFlux2Klein", "ToobusyReferenceBoard"],
+        "loader": "ToobusyFlux2Klein",
+        "field": "model_name",
+        "model_key": "klein",
+    },
+}
+
+def builtin_mode_status(mode, online):
+    check = BUILTIN_MODE_CHECKS.get(mode) or {}
+    missing = []
+    need = []
+    if not online:
+        missing.append("ComfyUI 연결")
+    for node in check.get("nodes", []):
+        need.append(node)
+        if online and not comfy_node_info(node):
+            missing.append("커스텀 노드: " + node)
+    expected = (CFG.get("models") or {}).get(check.get("model_key"), "")
+    if expected:
+        need.append("모델: " + expected)
+        if online and check.get("loader") and check.get("field"):
+            opts = comfy_input_options(comfy_node_info(check["loader"]), check["field"])
+            if not comfy_has_model(expected, opts):
+                missing.append("모델: " + expected)
+    return {
+        "label": check.get("label", mode),
+        "ready": not missing,
+        "needs": need,
+        "missing": missing,
+    }
+
+def custom_mode_status(name, spec, online):
+    missing = []
+    need = []
+    rel = spec.get("file") or ""
+    path = os.path.join(HERE, rel)
+    if rel:
+        need.append("워크플로우: " + rel)
+    if not rel or not os.path.isfile(path):
+        missing.append("워크플로우 파일: " + (rel or "미설정"))
+        return {"label": name, "ready": False, "needs": need, "missing": missing}
+    if not online:
+        missing.append("ComfyUI 연결")
+        return {"label": name, "ready": False, "needs": need, "missing": missing}
+    try:
+        classes, model_refs = workflow_classes_and_models(path)
+    except Exception as e:
+        return {"label": name, "ready": False, "needs": need, "missing": ["워크플로우 읽기 실패: " + str(e)[:120]]}
+    for cls in classes:
+        if not comfy_node_info(cls):
+            missing.append("커스텀 노드: " + cls)
+            if len(missing) >= 8:
+                break
+    if len(missing) < 8:
+        for node_id, cls, field, value in model_refs:
+            info = comfy_node_info(cls)
+            opts = comfy_input_options(info, field)
+            if opts is not None:
+                need.append("모델: " + value)
+                if not comfy_has_model(value, opts):
+                    missing.append("모델: " + value)
+            if len(missing) >= 8:
+                break
+    if len(missing) >= 8:
+        missing.append("...더 있음")
+    return {
+        "label": name,
+        "ready": not missing,
+        "needs": sorted(set(need)),
+        "missing": missing,
+    }
+
+def mode_statuses():
+    if time.time() - MODE_STATUS_CACHE["t"] < 20:
+        return MODE_STATUS_CACHE["data"]
+    online = comfy_is_online()
+    out = {mode: builtin_mode_status(mode, online) for mode in BUILTIN_MODE_CHECKS}
+    for name, spec in CUSTOM.items():
+        if isinstance(spec, dict):
+            out["custom:" + name] = custom_mode_status(name, spec, online)
+    MODE_STATUS_CACHE.update({"t": time.time(), "data": out})
+    return out
+
 def comfy_loras():
     if time.time() - LORA_CACHE["t"] < 30:
         return LORA_CACHE["data"]
@@ -728,7 +907,7 @@ class H(BaseHTTPRequestHandler):
         elif p == "/api/status":
             self._json(status())
         elif p == "/api/modes":
-            self._json({"custom": custom_modes()})
+            self._json({"custom": custom_modes(), "status": mode_statuses()})
         elif p == "/api/llm_models":
             self._json(lmstudio_models())
         elif p == "/api/loras":
@@ -911,6 +1090,7 @@ body{margin:0;background:#0a0814;color:var(--ink);font-family:'VT323',monospace;
 .up{background:#0a0814;border:1px solid var(--ln);color:var(--mut);height:38px;padding:0 10px;border-radius:7px;cursor:pointer;font-family:'VT323';font-size:17px}.up:hover{color:var(--cyan);border-color:var(--cyan)}
 .genb{background:var(--pink);border:none;color:#220812;font-family:'Press Start 2P';font-size:10px;border-radius:7px;padding:0 14px;height:38px;cursor:pointer}.genb:hover{background:#ff85a8}
 .folderb{background:var(--b2);border:1px solid var(--ln);color:var(--ink);font-family:'VT323';font-size:17px;border-radius:7px;padding:0 10px;height:38px;cursor:pointer}.folderb:hover{color:var(--cyan);border-color:var(--cyan)}
+.modehint{display:none;margin:-8px 0 14px;padding:8px 10px;border:1px solid var(--ln);border-radius:8px;background:rgba(17,13,32,.72);color:var(--mut);font-size:16px;line-height:1.25}.modehint.on{display:block}.modehint.ok{border-color:rgba(141,255,176,.32);color:var(--grn)}.modehint.bad{border-color:rgba(255,93,143,.48);color:var(--amb)}.modehint b{font-family:'Press Start 2P';font-size:9px;color:var(--cyan);margin-right:8px}.modehint .miss{color:var(--pink)}
 .llmbar{display:flex;align-items:center;gap:8px;margin:-8px 0 14px;color:var(--mut);font-size:16px}.llmbar .lk{font-size:9px;color:var(--cyan);min-width:42px}.llmbar select{flex:1;min-width:0;background:#0a0814;border:1px solid var(--ln);color:var(--ink);border-radius:7px;height:30px;font-family:'VT323';font-size:16px;padding:0 8px}.llmbar select:focus{outline:none;border-color:var(--cyan)}.llmbar button{background:var(--b2);border:1px solid var(--ln);color:var(--ink);border-radius:6px;height:30px;padding:0 9px;font-family:'VT323';font-size:15px;cursor:pointer}.llmbar button:hover{border-color:var(--cyan);color:var(--cyan)}.llmstat{max-width:280px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .optbar{display:none;align-items:center;gap:8px;margin:-8px 0 14px;padding:8px 10px;background:rgba(17,13,32,.72);border:1px solid var(--ln);border-radius:9px;color:var(--mut);flex-wrap:wrap}.optbar.on{display:flex}.optbar label{display:flex;align-items:center;gap:6px;font-size:15px}.optbar .ok{font-size:9px;color:var(--amb);margin-right:2px}.optbar select,.optbar input{background:#0a0814;border:1px solid var(--ln);color:var(--ink);border-radius:6px;height:28px;font-family:'VT323';font-size:16px;padding:0 7px}.optbar select:focus,.optbar input:focus{outline:none;border-color:var(--cyan)}.optbar input{width:66px}.optgrp{display:none;gap:8px;align-items:center;flex-wrap:wrap}.optgrp.on{display:flex}
 .assets{display:none;gap:6px;align-items:center;margin:-8px 0 12px;flex-wrap:wrap}.assets.on{display:flex}.asset{display:flex;align-items:center;gap:6px;background:var(--b1);border:1px solid var(--ln);border-radius:7px;padding:4px 7px;font-size:15px}.asset b{color:var(--cyan);font-size:12px}.asset select,.asset input{background:#0a0814;border:1px solid var(--ln);color:var(--ink);border-radius:5px;height:24px;font-family:'VT323';font-size:14px}.asset .short{width:54px}.asset .lora-name{width:150px}.asset .use{display:flex;align-items:center;gap:3px;color:var(--amb);font-size:12px}.asset .use input{accent-color:var(--pink);height:auto}.asset.off{opacity:.58}.asset button{border:none;background:rgba(13,11,22,.85);color:var(--ink);border-radius:5px;cursor:pointer}.asset button:hover{background:var(--amb);color:#0a0814}
@@ -980,6 +1160,7 @@ body{margin:0;background:#0a0814;color:var(--ink);font-family:'VT323',monospace;
   <button class="folderb" onclick="openGallery()">📁 폴더</button>
   <button class="folderb" onclick="restartDash()">↻ 재시작</button>
 </div>
+<div class="modehint" id="modehint"></div>
 <div class="llmbar">
   <span class="lk pix">LLM</span>
   <select id="llm" onchange="saveLlmModel()"><option value="">모델 목록 불러오는 중...</option></select>
@@ -1059,7 +1240,7 @@ body{margin:0;background:#0a0814;color:var(--ink);font-family:'VT323',monospace;
 </aside></div></div>
 <div class="lb" id="lb"><div class="lbtools"><button onclick="lbHide()">👁</button><button onclick="lbDel()">🗑</button><button onclick="closeLb()">✕</button></div><button class="nav prev" onclick="step(-1)">‹</button><img id="lbimg" onclick="toggleZoom()"><button class="nav next" onclick="step(1)">›</button><div class="lbcap" id="lbcap"></div></div>
 <script>
-var IMGS=[],VIDS=[],AUDS=[],CUSTOMS=[],LORAS=[],BOARD_PRESETS=[],AUDDUR={},ai=0,cur=0,curAudioRel='',IMGKEY='',VIDKEY='',AUDKEY='',DURATION_FRAMES=120,IMGPAGE=1,IMGPAGES=1,IMGTOTAL=0,IMGPER=48;
+var IMGS=[],VIDS=[],AUDS=[],CUSTOMS=[],LORAS=[],BOARD_PRESETS=[],AUDDUR={},MODE_STATUS={},ai=0,cur=0,curAudioRel='',IMGKEY='',VIDKEY='',AUDKEY='',DURATION_FRAMES=120,IMGPAGE=1,IMGPAGES=1,IMGTOTAL=0,IMGPER=48;
 function api(p,b){return fetch(p,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b)})}
 function el(t,c){var e=document.createElement(t);if(c)e.className=c;return e}
 function esc(s){return String(s||'').replace(/[&<>"']/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]})}
@@ -1148,12 +1329,25 @@ function load(){fetch('/api/list?page='+IMGPAGE+'&per='+IMGPER).then(function(r)
 function goPage(p){p=Math.max(1,Math.min(IMGPAGES,p||1));if(p===IMGPAGE)return;IMGPAGE=p;IMGKEY='';load();window.scrollTo({top:document.getElementById('grid').offsetTop-180,behavior:'smooth'})}
 function renderPager(){var p=document.getElementById('pager'),info=document.getElementById('pinfo');if(!p)return;p.classList.toggle('on',IMGPAGES>1);info.textContent=IMGPAGE+' / '+IMGPAGES+'  ·  '+IMGTOTAL+' imgs';var b=p.querySelectorAll('button');b[0].disabled=b[1].disabled=IMGPAGE<=1;b[2].disabled=b[3].disabled=IMGPAGE>=IMGPAGES}
 function loadModes(){fetch('/api/modes').then(function(r){return r.json()}).then(function(d){
-  CUSTOMS=d.custom||[];var sel=document.getElementById('mode');
+  CUSTOMS=d.custom||[];MODE_STATUS=d.status||{};var sel=document.getElementById('mode');
   CUSTOMS.forEach(function(c){if(sel.querySelector('option[value="'+c.mode+'"]'))return;
     var o=document.createElement('option');o.value=c.mode;o.textContent=c.label;sel.appendChild(o)
   });
   modeChg();
 })}
+function renderModeHint(m){
+  var box=document.getElementById('modehint'),st=MODE_STATUS[m]||{};
+  if(!box)return;
+  var missing=st.missing||[],needs=st.needs||[];
+  box.className='modehint on '+(missing.length?'bad':'ok');
+  if(!st.label&&!missing.length&&!needs.length){box.className='modehint';box.innerHTML='';return}
+  if(missing.length){
+    box.innerHTML='<b>READY CHECK</b><span class="miss">필요함: '+esc(missing.join(' · '))+'</span>';
+  }else{
+    var tail=needs.length?' · 확인됨: '+esc(needs.slice(0,4).join(' · '))+(needs.length>4?' · ...':''):'';
+    box.innerHTML='<b>READY CHECK</b>준비됨'+tail;
+  }
+}
 function renderImgs(){var g=document.getElementById('grid');g.innerHTML='';
   if(!IMGS.length){g.innerHTML='<div class="empty">아직 생성된 이미지가 없어요. 위에서 생성해보세요!</div>';return}
   IMGS.forEach(function(it,i){var c=el('div','card');
@@ -1241,6 +1435,7 @@ function modeChg(){var m=document.getElementById('mode').value,p=document.getEle
   ['zup','zscale'].forEach(function(id){var e=document.getElementById(id),l=e&&e.closest('label');if(l)l.style.display=(m==='image')?'flex':'none'});
   eo.classList.toggle('on',!!(c&&c.type==='image'));
   vo.classList.toggle('on',m==='video'||!!(c&&c.type==='video'));
+  renderModeHint(m);
   pickRole='';
   var useBoard=needsReferenceBoard(m,c);
   u.style.display=useBoard?'block':'none';u.textContent='📌 보드';u.onclick=openReferenceBoard;
