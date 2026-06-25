@@ -194,7 +194,7 @@ git push -u origin main
 - `file`: 리포 루트 기준 워크플로 API-format JSON 경로
 - `trigger`: 텔레그램 명령 프리픽스
 - `type`: `image`, `video`, `audio` 중 하나이며 전송 방식을 결정합니다.
-- `llm`: `image`는 이미지 프롬프트 생성, `video`는 영상 프롬프트 생성, `none`은 사용자 텍스트를 그대로 사용합니다.
+- `llm`: `image`는 이미지 프롬프트 생성, `video`는 영상 프롬프트 생성, `refsheet_video`는 첫 참조 이미지를 비전 LLM이 보고 영상 프롬프트를 생성, `none`은 사용자 텍스트를 그대로 사용합니다.
 - `prompt_nodes`: 최종 프롬프트 문자열을 넣을 `[노드id, 필드명]` 목록
 - `image_nodes`: 대시보드에서 첨부한 이미지를 넣을 `[노드id, 필드명]` 목록입니다. 예: `LoadImage`의 `image`
 - `seed_nodes`: 랜덤 시드를 넣을 `[노드id, 필드명]` 목록이며 생략할 수 있습니다.

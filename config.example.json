@@ -96,7 +96,7 @@
       "file": "workflows/LTX-2.3_ICLoRA_Ingredients_Single_Stage_Distilled_API.json",
       "trigger": "/레퍼영상",
       "type": "video",
-      "llm": "none",
+      "llm": "refsheet_video",
       "prompt_nodes": [
         [
           "2483",

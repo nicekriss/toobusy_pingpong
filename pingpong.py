@@ -12,7 +12,7 @@ VRAM 핑퐁 오케스트레이터 (멀티모드)
 핵심: 24GB 단일 GPU에서 LLM과 ComfyUI가 번갈아 VRAM 점유.
  LLM 올리기 전 ComfyUI /free 필수(동시 상주 시 OOM). LLM은 '생각하는 순간'만 VRAM.
 """
-import os, sys, json, copy, time, random, subprocess, traceback, re, threading, unicodedata
+import os, sys, json, copy, time, random, subprocess, traceback, re, threading, unicodedata, base64, mimetypes
 import requests
 
 try:  # 윈도우 cp949 콘솔에서 이모지/한글 출력 시 크래시 방지
@@ -169,6 +169,15 @@ VIDEO_SYS = (
     "Output only the final prompt sentence, with no analysis, no self-talk, no labels, no word counts, no markdown. "
     "Describe subject, scene, action, temporal motion, camera motion, lighting, and atmosphere. "
     "If the user requests spoken dialogue, keep the spoken line in the user's original language inside quotes. Keep under 80 words."
+)
+REFSHEET_VIDEO_SYS = (
+    "You are writing a prompt for an LTX 2.3 image-to-video workflow that receives a reference sheet image. "
+    "Study the reference sheet image and describe the character, outfit, props, palette, style, and relevant environment first. "
+    "Then combine it with the user's video request into one production-ready video prompt in English. "
+    "The user only writes the desired video content; do not ask them to separately describe the sheet. "
+    "If the user's request includes Korean spoken dialogue, keep that dialogue exactly in Korean inside quotes. "
+    "Never translate spoken Korean dialogue into English. Other non-dialogue prompt text may be English. "
+    "Output only the final prompt, no analysis, no markdown fences, no alternatives."
 )
 SONG_SYS = (
     "You are a professional songwriter and music producer. Given a theme (any language), respond "
@@ -334,6 +343,50 @@ def _chat(model_id, system, user, max_tokens=800, temp=0.5, no_think=True):
 def llm_prompt(model_id, system, user):
     out = _chat(model_id, system, user)
     return clean_llm_prompt(out)
+
+def _input_image_data_url(relpath):
+    rel = str(relpath or "").replace("\\", "/").lstrip("/")
+    full = os.path.abspath(os.path.join(INPUTDIR, rel))
+    root = os.path.abspath(INPUTDIR)
+    if not (full == root or full.startswith(root + os.sep)):
+        raise ValueError("image path outside ComfyUI input dir")
+    mime = mimetypes.guess_type(full)[0] or "image/png"
+    with open(full, "rb") as f:
+        payload = base64.b64encode(f.read()).decode("ascii")
+    return f"data:{mime};base64,{payload}"
+
+def clean_refsheet_prompt(out):
+    text = (out or "").replace("\r", "\n").strip()
+    text = re.sub(r"<think>[\s\S]*?</think>", " ", text, flags=re.I)
+    text = re.sub(r"```(?:json|text)?|```", " ", text, flags=re.I)
+    text = re.sub(r'^[\*\s\-]*(?:final\s+prompt|prompt|output|answer|here(?:\s+is)?)\s*[:：\*\-]+\s*', '', text, flags=re.I)
+    text = re.sub(r"\s+", " ", text).strip().strip('"').strip("*").strip()
+    if len(text) > 2600:
+        text = text[:2600].rsplit(" ", 1)[0].strip()
+    return text
+
+def llm_refsheet_video_prompt(model_id, user, image_ref):
+    image_url = _input_image_data_url(image_ref)
+    content = [
+        {"type": "text", "text": (user or "").strip() + " /no_think"},
+        {"type": "image_url", "image_url": {"url": image_url}},
+    ]
+    body = {
+        "model": model_id,
+        "messages": [
+            {"role": "system", "content": REFSHEET_VIDEO_SYS},
+            {"role": "user", "content": content},
+        ],
+        "temperature": 0.45,
+        "max_tokens": 1400,
+    }
+    r = requests.post(f"{LMAPI}/v1/chat/completions", json=body, timeout=300)
+    r.raise_for_status()
+    msg = r.json()["choices"][0]["message"]
+    out = (msg.get("content") or "").strip() or (msg.get("reasoning_content") or "").strip()
+    if "</think>" in out:
+        out = out.split("</think>")[-1].strip()
+    return clean_refsheet_prompt(out)
 
 def clean_llm_prompt(out):
     text = (out or "").replace("\r", "\n").strip()
@@ -855,14 +908,18 @@ def do_custom_text(mode, body, image_refs=None, settings=None):
             tg_send(f"⚠️ {name} 워크플로는 이미지 {required_images}장이 필요해요. 대시보드에서 이미지를 첨부해 실행해주세요.")
             return
         comfy_free()
-        if spec.get("llm", "none") == "none":
+        llm_mode = spec.get("llm", "none")
+        if llm_mode == "none":
             prompt = body
         else:
             tg_send("🧠▸ 두뇌 가동...")
             mid = llm_up()
             try:
-                sys_p = VIDEO_SYS if spec["llm"] == "video" else IMAGE_SYS
-                prompt = llm_prompt(mid, sys_p, body)
+                if llm_mode == "refsheet_video":
+                    prompt = llm_refsheet_video_prompt(mid, body, image_refs[0])
+                else:
+                    sys_p = VIDEO_SYS if llm_mode == "video" else IMAGE_SYS
+                    prompt = llm_prompt(mid, sys_p, body)
             finally:
                 llm_down()
         tg_send("▸ 생성 중 ░▒▓ : " + prompt[:120])
