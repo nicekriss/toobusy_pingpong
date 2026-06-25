@@ -16,6 +16,7 @@
     "klein": "FLUX2\\flux-2-klein-9b-kv-fp8.safetensors",
     "ace": "aceStepAudioGen_v15XLTurbo.safetensors"
   },
+  "model_overrides": {},
   "custom_workflows": {
     "스티커": {
       "file": "workflows/my_sticker.json",

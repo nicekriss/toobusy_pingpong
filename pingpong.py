@@ -66,12 +66,41 @@ CUSTOM = CFG.get("custom_workflows", {}) or {}
 def model_of(key):
     return MODELS.get(key) or DEFAULT_MODELS[key]
 
-def reload_custom_workflows():
-    global CFG, CUSTOM
+def reload_runtime_config():
+    global CFG, CUSTOM, MODELS
     try:
         latest = json.load(open(CFG_PATH, encoding="utf-8"))
         CFG = latest
         CUSTOM = latest.get("custom_workflows", {}) or {}
+        MODELS = latest.get("models", {}) or {}
+    except Exception as e:
+        log("config reload failed:", e)
+    return CFG
+
+def model_override_key(mode, node, field):
+    return "|".join([str(mode or ""), str(node or ""), str(field or "")])
+
+def apply_model_overrides(wf, mode, settings=None):
+    cfg = reload_runtime_config()
+    overrides = dict(cfg.get("model_overrides", {}) or {})
+    overrides.update((settings or {}).get("model_overrides", {}) or {})
+    for node_id, node in wf.items():
+        inputs = node.get("inputs") if isinstance(node, dict) else None
+        if not isinstance(inputs, dict):
+            continue
+        for field in list(inputs.keys()):
+            value = overrides.get(model_override_key(mode, node_id, field))
+            if value:
+                inputs[field] = value
+    return wf
+
+def reload_custom_workflows():
+    global CFG, CUSTOM, MODELS
+    try:
+        latest = json.load(open(CFG_PATH, encoding="utf-8"))
+        CFG = latest
+        CUSTOM = latest.get("custom_workflows", {}) or {}
+        MODELS = latest.get("models", {}) or {}
     except Exception as e:
         log("custom workflow reload failed:", e)
     return CUSTOM
@@ -688,7 +717,7 @@ def _set_any_megapixels(wf, megapixels):
             if key == "megapixels" or key.endswith(".megapixels"):
                 inputs[key] = megapixels
 
-def inject_custom(spec, prompt, image_refs=None, settings=None):
+def inject_custom(spec, prompt, image_refs=None, settings=None, mode_name=None):
     wf_path = os.path.join(HERE, spec["file"])
     wf = json.load(open(wf_path, encoding="utf-8"))
     tag = tag_now()
@@ -726,6 +755,7 @@ def inject_custom(spec, prompt, image_refs=None, settings=None):
     if spec.get("prefix_node"):
         node, field = spec["prefix_node"]
         wf[str(node)]["inputs"][field] = spec.get("prefix", "pingpong/custom_") + tag
+    apply_model_overrides(wf, mode_name or "custom", settings)
     return wf, str(spec["output_node"])
 
 def inject_zit(prompt, settings=None):
@@ -748,9 +778,11 @@ def inject_zit(prompt, settings=None):
     wf["5"]["inputs"]["filename_prefix"] = f"pingpong\\img_{tag}_UPS"
     wf["3"]["inputs"]["scale_by"] = scale_by
     if upscale:
+        apply_model_overrides(wf, "image", settings)
         return wf, "5"
     for node in ("3", "4", "5"):
         wf.pop(node, None)
+    apply_model_overrides(wf, "image", settings)
     return wf, "2"
 
 def _apply_ltx_director_assets(td, assets, duration_frames):
@@ -878,6 +910,7 @@ def inject_ltx(prompt, director_assets=None, settings=None):
         wf["131"]["inputs"]["custom_height"] = 0
     if MODELS.get("ltx_gguf"):
         wf["137"]["inputs"]["unet_name"] = MODELS["ltx_gguf"]
+    apply_model_overrides(wf, "video", settings)
     wf["30"]["inputs"]["noise_seed"] = rseed()
     wf["37"]["inputs"]["filename_prefix"] = f"pingpong/vid_{tag}"
     return wf, "37"
@@ -888,6 +921,7 @@ def inject_ace(tags, lyrics, title_text=""):
     wf["94"]["inputs"]["lyrics"] = lyrics
     if MODELS.get("ace"):
         wf["104"]["inputs"]["unet_name"] = MODELS["ace"]
+    apply_model_overrides(wf, "song", {})
     wf["109"]["inputs"]["value"] = rseed()
     wf["107"]["inputs"]["filename_prefix"] = f"pingpong/song_{tag}_{safe_filename_title(title_text, 'music')}"
     return wf, "107"
@@ -907,6 +941,7 @@ def inject_klein(ref_relpath, goal_text):
     wf["2"]["inputs"]["director_selection_json"] = json.dumps(sel, ensure_ascii=False)
     if MODELS.get("klein"):
         wf["3"]["inputs"]["model_name"] = MODELS["klein"]
+    apply_model_overrides(wf, "klein", {})
     wf["2"]["inputs"]["seed"] = rseed()
     wf["3"]["inputs"]["seed"] = rseed()
     wf["4"]["inputs"]["filename_prefix"] = f"pingpong/klein_{tag}"
@@ -931,6 +966,7 @@ def inject_klein_faceswap(char_rel, face_rel, goal_text):
     wf["2"]["inputs"]["director_selection_json"] = json.dumps(sel, ensure_ascii=False)
     if MODELS.get("klein"):
         wf["3"]["inputs"]["model_name"] = MODELS["klein"]
+    apply_model_overrides(wf, "faceswap", {})
     wf["2"]["inputs"]["seed"] = rseed()
     wf["3"]["inputs"]["seed"] = rseed()
     wf["4"]["inputs"]["filename_prefix"] = f"pingpong/swap_{tag}"
@@ -1002,6 +1038,7 @@ def inject_klein_board(assets, goal_text, settings=None, flags=None):
     wf["3"]["inputs"]["bundle_reference_order"] = (settings or {}).get("bundle_reference_order", "auto")
     if MODELS.get("klein"):
         wf["3"]["inputs"]["model_name"] = MODELS["klein"]
+    apply_model_overrides(wf, "klein", settings)
     wf["2"]["inputs"]["seed"] = rseed()
     wf["3"]["inputs"]["seed"] = rseed()
     wf["4"]["inputs"]["filename_prefix"] = f"pingpong/klein_board_{tag}"
@@ -1052,7 +1089,7 @@ def do_custom_text(mode, body, image_refs=None, settings=None):
             finally:
                 llm_down()
         tg_send("▸ 생성 중 ░▒▓ : " + prompt[:120])
-        wf, out = inject_custom(spec, prompt, image_refs, settings)
+        wf, out = inject_custom(spec, prompt, image_refs, settings, "custom:" + name)
         files = comfy_run(wf, out)
         write_generation_meta(files, "custom:" + name, body, prompt)
         tg_send_file(kind, files[0], caption=prompt[:1000])

@@ -775,6 +775,17 @@ def builtin_mode_status(mode, online):
         if online and not comfy_node_info(node):
             missing.append("커스텀 노드: " + node)
     expected = (CFG.get("models") or {}).get(check.get("model_key"), "")
+    overrides = (read_config().get("model_overrides", {}) or {})
+    path = workflow_path_for_mode(mode)
+    if path and os.path.isfile(path) and check.get("loader") and check.get("field"):
+        try:
+            _, refs = workflow_classes_and_models(path)
+            for node_id, cls, field, value in refs:
+                if cls == check.get("loader") and field == check.get("field"):
+                    expected = overrides.get(model_override_key(mode, node_id, field), expected or value)
+                    break
+        except Exception:
+            pass
     if expected:
         need.append("모델: " + expected)
         if online and check.get("loader") and check.get("field"):
@@ -791,6 +802,8 @@ def builtin_mode_status(mode, online):
 def custom_mode_status(name, spec, online):
     missing = []
     need = []
+    mode = "custom:" + name
+    overrides = (read_config().get("model_overrides", {}) or {})
     rel = spec.get("file") or ""
     path = os.path.join(HERE, rel)
     if rel:
@@ -812,6 +825,7 @@ def custom_mode_status(name, spec, online):
                 break
     if len(missing) < 8:
         for node_id, cls, field, value in model_refs:
+            value = overrides.get(model_override_key(mode, node_id, field), value)
             info = comfy_node_info(cls)
             opts = comfy_input_options(info, field)
             if opts is not None:
@@ -866,6 +880,64 @@ def comfy_loras():
     names = sorted(set(names), key=str.lower)
     LORA_CACHE.update({"t": time.time(), "data": names})
     return names
+
+BUILTIN_WORKFLOW_FILES = {
+    "image": "workflows/toobusy_zimgt.json",
+    "video": "workflows/LTX_Director_2_Workflow_ggufdis_API.json",
+    "song": "workflows/audio_ace_step1_5_xl_turbo_API.json",
+    "klein": "workflows/toobusy_flux2klein_vram.json",
+    "faceswap": "workflows/toobusy_flux2klein_vram.json",
+}
+
+def model_override_key(mode, node, field):
+    return "|".join([str(mode or ""), str(node or ""), str(field or "")])
+
+def workflow_path_for_mode(mode):
+    if mode in BUILTIN_WORKFLOW_FILES:
+        return os.path.join(HERE, BUILTIN_WORKFLOW_FILES[mode])
+    if isinstance(mode, str) and mode.startswith("custom:"):
+        name = mode.split(":", 1)[1]
+        spec = CUSTOM.get(name)
+        if not spec:
+            for k, v in CUSTOM.items():
+                if str(k).lower() == name.lower():
+                    spec = v
+                    break
+        if spec and spec.get("file"):
+            return os.path.join(HERE, spec["file"])
+    return None
+
+def model_fields_for_mode(mode):
+    path = workflow_path_for_mode(mode)
+    if not path or not os.path.isfile(path):
+        return {"ok": False, "fields": [], "err": "workflow not found"}
+    cfg = read_config()
+    overrides = cfg.get("model_overrides", {}) or {}
+    try:
+        _, refs = workflow_classes_and_models(path)
+    except Exception as e:
+        return {"ok": False, "fields": [], "err": str(e)}
+    fields = []
+    seen = set()
+    for node_id, cls, field, value in refs:
+        key = model_override_key(mode, node_id, field)
+        if key in seen:
+            continue
+        seen.add(key)
+        opts = comfy_input_options(comfy_node_info(cls), field) or []
+        if not opts:
+            continue
+        fields.append({
+            "key": key,
+            "mode": mode,
+            "node": node_id,
+            "class": cls,
+            "field": field,
+            "original": value,
+            "current": overrides.get(key, value),
+            "options": opts,
+        })
+    return {"ok": True, "fields": fields}
 
 def requested_image_count(text):
     text = text or ""
@@ -1062,6 +1134,9 @@ class H(BaseHTTPRequestHandler):
             self._json(lmstudio_models())
         elif p == "/api/loras":
             self._json({"loras": comfy_loras()})
+        elif p == "/api/model_fields":
+            qs = urllib.parse.parse_qs(parsed.query)
+            self._json(model_fields_for_mode(qs.get("mode", [""])[0]))
         elif p == "/api/system":
             self._json(system_info())
         elif p == "/api/comfy_log":
@@ -1152,6 +1227,26 @@ class H(BaseHTTPRequestHandler):
             event("dashboard restart requested")
             restart_self()
             return self._json({"ok": True})
+        if p == "/api/model_override":
+            mode = (body.get("mode") or "").strip()
+            node = (body.get("node") or "").strip()
+            field = (body.get("field") or "").strip()
+            value = (body.get("value") or "").strip()
+            if not mode or not node or not field:
+                return self._json({"ok": False, "err": "missing model override key"}, 400)
+            try:
+                cfg = read_config()
+                overrides = cfg.setdefault("model_overrides", {})
+                key = model_override_key(mode, node, field)
+                if value:
+                    overrides[key] = value
+                else:
+                    overrides.pop(key, None)
+                write_config(cfg)
+                event("model override saved: " + key)
+                return self._json({"ok": True})
+            except Exception as e:
+                return self._json({"ok": False, "err": str(e)}, 500)
         if p == "/api/reference_preset_save":
             try:
                 preset = reference_preset_save(body.get("name", ""), body.get("assets", []))
@@ -1345,6 +1440,7 @@ body{margin:0;background:#0a0814;color:var(--ink);font-family:'VT323',monospace;
     <label>WIDTH <select id="vwidth"><option value="0" selected>AUTO</option><option value="512">512</option><option value="640">640</option><option value="768">768</option><option value="960">960</option><option value="1024">1024</option></select></label>
     <label>FPS <select id="vfps"><option value="16">16</option><option value="24" selected>24</option><option value="30">30</option></select></label>
   </div>
+  <div class="optgrp" id="modelopts"></div>
 </div>
 <div class="assets" id="assets"></div>
 <div class="director" id="director">
@@ -1434,6 +1530,23 @@ function saveLlmModel(){var sel=document.getElementById('llm'),model=sel.value;i
   }).catch(function(){setLlmStatus('저장 실패')})
 }
 function loadLoras(){fetch('/api/loras').then(function(r){return r.json()}).then(function(d){LORAS=d.loras||[];renderAssets()}).catch(function(){LORAS=[]})}
+function shortModelName(s){s=String(s||'');return s.length>42?'...'+s.slice(-39):s}
+function loadModelFields(){var m=document.getElementById('mode').value,box=document.getElementById('modelopts');if(!box)return;box.classList.remove('on');box.innerHTML='';
+  fetch('/api/model_fields?mode='+encodeURIComponent(m)).then(function(r){return r.json()}).then(function(d){
+    var fields=(d&&d.fields)||[];if(!fields.length){box.classList.remove('on');return}
+    box.classList.add('on');
+    box.innerHTML='<span class="ok pix">MODELS</span>';
+    fields.forEach(function(f){
+      var lab=document.createElement('label'),sel=document.createElement('select');
+      lab.textContent=(f.class||'Model')+' '+f.field+' ';
+      (f.options||[]).forEach(function(o){var op=document.createElement('option');op.value=o;op.textContent=shortModelName(o);sel.appendChild(op)});
+      if(f.current)sel.value=f.current;
+      sel.title=(f.original||'')+' -> '+(f.current||'');
+      sel.onchange=function(){api('/api/model_override',{mode:m,node:f.node,field:f.field,value:sel.value}).then(function(r){return r.json()}).then(function(j){if(!j.ok)alert(j.err||'model save failed');else{MODE_STATUS={};loadModes()}})};
+      lab.appendChild(sel);box.appendChild(lab)
+    })
+  }).catch(function(){box.classList.remove('on');box.innerHTML=''})
+}
 function loadBoardPresets(){fetch('/api/reference_presets').then(function(r){return r.json()}).then(function(d){BOARD_PRESETS=d.presets||[];fillPresetSelect()}).catch(function(){BOARD_PRESETS=[];fillPresetSelect()})}
 function fillPresetSelect(){var s=document.getElementById('presetSel');if(!s)return;var cur=s.value;s.innerHTML='<option value="">Load Preset</option>'+BOARD_PRESETS.map(function(p){return '<option value="'+esc(p.id)+'"'+(p.id===cur?' selected':'')+'>'+esc(p.name||p.id)+' · '+(p.count||0)+'</option>'}).join('')}
 function boardPresetAssets(){return picked.filter(function(a){return a&&(a.kind==='image'||a.kind==='audio'||a.kind==='lora'||a.type==='lora')}).map(function(a){return JSON.parse(JSON.stringify(a))})}
@@ -1617,6 +1730,7 @@ function modeChg(){var m=document.getElementById('mode').value,p=document.getEle
   eo.classList.toggle('on',!!(c&&c.type==='image'));
   vo.classList.toggle('on',m==='video'||!!(c&&c.type==='video'));
   renderModeHint(m);
+  loadModelFields();
   pickRole='';
   var useBoard=needsReferenceBoard(m,c);
   u.style.display=useBoard?'block':'none';u.textContent='📌 보드';u.onclick=openReferenceBoard;
