@@ -6,7 +6,7 @@
 - 숨김(복구 가능)/삭제(.trash 이동) 지원
 실행: python dashboard.py  (또는 대시보드.bat)
 """
-import os, sys, json, time, base64, re, mimetypes, threading, webbrowser, struct, zlib, subprocess
+import os, sys, json, time, base64, re, mimetypes, threading, webbrowser, struct, zlib, subprocess, socket
 import urllib.request
 import urllib.parse
 import html as html_lib
@@ -41,6 +41,7 @@ BIND_HOST = CFG.get("dashboard_host", "127.0.0.1")
 OPEN_HOST = "127.0.0.1" if BIND_HOST in ("0.0.0.0", "::", "") else BIND_HOST
 EVENTS   = []
 CPU_LAST = {"t": 0, "idle": 0, "kernel": 0, "user": 0, "cpu": 0}
+LAN_IP_CACHE = {"t": 0, "ip": ""}
 YOUTUBE_CHANNEL_ID = "UC4xLnbcb7AxfJ8wdkiobaKQ"
 YT_CACHE = {"t": 0, "data": None}
 LORA_CACHE = {"t": 0, "data": []}
@@ -57,6 +58,31 @@ def run_hidden(args, **kwargs):
     if HIDDEN_SUBPROCESS_FLAGS and "creationflags" not in kwargs:
         kwargs["creationflags"] = HIDDEN_SUBPROCESS_FLAGS
     return subprocess.run(args, **kwargs)
+
+def local_lan_ip():
+    now = time.time()
+    if LAN_IP_CACHE["ip"] and now - LAN_IP_CACHE["t"] < 60:
+        return LAN_IP_CACHE["ip"]
+    ip = ""
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.settimeout(0.2)
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+        s.close()
+    except Exception:
+        ip = ""
+    if not ip or ip.startswith("127.") or ip.startswith("169.254."):
+        try:
+            for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
+                candidate = info[4][0]
+                if candidate and not candidate.startswith("127.") and not candidate.startswith("169.254."):
+                    ip = candidate
+                    break
+        except Exception:
+            pass
+    LAN_IP_CACHE.update({"t": now, "ip": ip or "127.0.0.1"})
+    return LAN_IP_CACHE["ip"]
 
 IMG_EXT = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
 VID_EXT = {".mp4", ".webm", ".mov", ".mkv"}
@@ -648,7 +674,18 @@ def status():
         queued = len([f for f in os.listdir(QUEUE) if f.endswith(".json")])
     except FileNotFoundError:
         queued = 0
-    return {"alive": alive or gen, "heartbeat": alive, "generating": gen, "queued": queued}
+    lan_url = ""
+    if BIND_HOST in ("0.0.0.0", "::", ""):
+        lan_url = "http://%s:%s" % (local_lan_ip(), PORT)
+    return {
+        "alive": alive or gen,
+        "heartbeat": alive,
+        "generating": gen,
+        "queued": queued,
+        "dashboard_host": BIND_HOST,
+        "dashboard_port": PORT,
+        "lan_url": lan_url,
+    }
 
 def custom_modes():
     out = []
@@ -1327,6 +1364,7 @@ body{margin:0;background:#0a0814;color:var(--ink);font-family:'VT323',monospace;
 .bar{display:flex;align-items:center;justify-content:space-between;margin-bottom:14px}
 .brand{font-size:15px;line-height:1.9;color:var(--cyan)}.brand b{color:var(--pink)}.brand small{display:block;font-size:9px;color:var(--mut)}
 .stat{display:flex;align-items:center;gap:8px;font-size:10px;color:var(--mut)}
+.lanurl{max-width:260px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;color:var(--amb);cursor:pointer}.lanurl:hover{color:var(--cyan)}
 .heart{width:46px;height:40px;display:inline-block}
 .heart.on{animation:beat 1s infinite}@keyframes beat{0%,100%{transform:scale(1)}45%{transform:scale(1.32)}}
 .dot{width:8px;height:8px;border-radius:50%;display:inline-block;background:#555}
@@ -1410,7 +1448,7 @@ body{margin:0;background:#0a0814;color:var(--ink);font-family:'VT323',monospace;
 </style></head><body><div class="wrap"><div class="topstick">
 <div class="bar">
   <div class="brand pix">너무바쁜베짱이 <b>STUDIO</b><small>PING·PONG GALLERY v1.0</small></div>
-  <div class="stat pix"><span id="hbox"></span><span><span class="dot" id="dot"></span> <span id="hstate">…</span></span></div>
+  <div class="stat pix"><span id="lanurl" class="lanurl" title="LAN address"></span><span id="hbox"></span><span><span class="dot" id="dot"></span> <span id="hstate">…</span></span></div>
 </div>
 <div class="genbar">
   <select id="mode" class="msel" onchange="modeChg()"><option value="image">이미지</option><option value="video">영상</option><option value="song">음악</option><option value="klein">인물합성</option><option value="faceswap">페이스스왑</option></select>
@@ -1897,7 +1935,8 @@ if(boardDrop){
 ['track-main','track-audio'].forEach(function(id){var t=document.getElementById(id);if(!t)return;t.addEventListener('dragover',function(e){directorDragOver(t,e)});t.addEventListener('dragleave',function(){t.classList.remove('drop')});t.addEventListener('drop',function(e){directorDropAsset(t,e)})});
 
 function poll(){fetch('/api/status').then(function(r){return r.json()}).then(function(s){
-  var hb=document.getElementById('hbox'),dot=document.getElementById('dot'),st=document.getElementById('hstate');
+  var hb=document.getElementById('hbox'),dot=document.getElementById('dot'),st=document.getElementById('hstate'),lan=document.getElementById('lanurl');
+  if(lan){lan.textContent=s.lan_url?('LAN '+s.lan_url):'';lan.title=s.lan_url?'click to copy':'';lan.onclick=function(){if(s.lan_url&&navigator.clipboard)navigator.clipboard.writeText(s.lan_url)}}
   hb.firstChild&&hb.firstChild.classList&&hb.firstChild.classList.toggle('on',s.alive);
   dot.className='dot'+(s.alive?' a':'');
   st.textContent=!s.alive?'OFFLINE':(s.generating||s.queued?'GENERATING'+(s.queued?(' ('+s.queued+')'):''):'ONLINE')
