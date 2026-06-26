@@ -37,6 +37,8 @@ HIDDEN   = os.path.join(HERE, "dashboard_hidden.json")
 PRESETS  = os.path.join(HERE, "dashboard_reference_presets.json")
 PROGRESS = os.path.join(HERE, "dashboard_comfy_progress.json")
 PORT     = int(CFG.get("dashboard_port", 8910))
+BIND_HOST = CFG.get("dashboard_host", "127.0.0.1")
+OPEN_HOST = "127.0.0.1" if BIND_HOST in ("0.0.0.0", "::", "") else BIND_HOST
 EVENTS   = []
 CPU_LAST = {"t": 0, "idle": 0, "kernel": 0, "user": 0, "cpu": 0}
 YOUTUBE_CHANNEL_ID = "UC4xLnbcb7AxfJ8wdkiobaKQ"
@@ -1911,11 +1913,13 @@ loadGenOptions();initVideoFold();loadModes();loadLlmModels();loadLoras();loadBoa
 
 def main():
     os.makedirs(QUEUE, exist_ok=True)
-    srv = ReusableThreadingHTTPServer(("127.0.0.1", PORT), H)
-    url = "http://127.0.0.1:%d" % PORT
+    srv = ReusableThreadingHTTPServer((BIND_HOST, PORT), H)
+    url = "http://%s:%d" % (OPEN_HOST, PORT)
     print("=" * 52)
     print("  너무바쁜베짱이 핑퐁 갤러리 대시보드")
     print("  " + url)
+    if BIND_HOST == "0.0.0.0":
+        print("  LAN 접속: http://<미니PC_IP>:%d" % PORT)
     print("  생성 폴더:", GALLERY)
     print("=" * 52, flush=True)
     try:

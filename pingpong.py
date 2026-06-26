@@ -53,6 +53,8 @@ MODEL    = CFG["llm_model"]
 OUTDIR   = CFG.get("comfy_output_dir") or _auto_out
 INPUTDIR = CFG.get("comfy_input_dir") or _auto_in
 DASHBOARD_PORT = int(CFG.get("dashboard_port", 8910))
+DASHBOARD_HOST = CFG.get("dashboard_host", "127.0.0.1")
+DASHBOARD_OPEN_HOST = "127.0.0.1" if DASHBOARD_HOST in ("0.0.0.0", "::", "") else DASHBOARD_HOST
 
 # VRAM 급에 맞게 갈아끼울 수 있는 모델 파일명 (config "models"로 덮어쓰기, 없으면 기본값)
 DEFAULT_MODELS = {
@@ -278,7 +280,7 @@ def enqueue_job(job):
     json.dump(job, open(os.path.join(QUEUE_DIR, fn), "w", encoding="utf-8"), ensure_ascii=False)
 
 def start_dashboard():
-    page_url = f"http://127.0.0.1:{DASHBOARD_PORT}"
+    page_url = f"http://{DASHBOARD_OPEN_HOST}:{DASHBOARD_PORT}"
     status_url = page_url + "/api/status"
     try:
         requests.get(status_url, timeout=1)
