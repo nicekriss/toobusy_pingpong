@@ -677,12 +677,15 @@ def status():
     lan_url = ""
     if BIND_HOST in ("0.0.0.0", "::", ""):
         lan_url = "http://%s:%s" % (local_lan_ip(), PORT)
+    configured_host = read_config().get("dashboard_host", "127.0.0.1")
     return {
         "alive": alive or gen,
         "heartbeat": alive,
         "generating": gen,
         "queued": queued,
         "dashboard_host": BIND_HOST,
+        "configured_dashboard_host": configured_host,
+        "dashboard_host_restart_needed": configured_host != BIND_HOST,
         "dashboard_port": PORT,
         "lan_url": lan_url,
     }
@@ -1266,6 +1269,13 @@ class H(BaseHTTPRequestHandler):
             event("dashboard restart requested")
             restart_self()
             return self._json({"ok": True})
+        if p == "/api/dashboard_host":
+            public = bool(body.get("public"))
+            cfg = read_config()
+            cfg["dashboard_host"] = "0.0.0.0" if public else "127.0.0.1"
+            write_config(cfg)
+            event("dashboard LAN public %s" % ("on" if public else "off"))
+            return self._json({"ok": True, "host": cfg["dashboard_host"], "restart_needed": cfg["dashboard_host"] != BIND_HOST})
         if p == "/api/model_override":
             mode = (body.get("mode") or "").strip()
             node = (body.get("node") or "").strip()
@@ -1375,6 +1385,7 @@ body{margin:0;background:#0a0814;color:var(--ink);font-family:'VT323',monospace;
 .up{background:#0a0814;border:1px solid var(--ln);color:var(--mut);height:38px;padding:0 10px;border-radius:7px;cursor:pointer;font-family:'VT323';font-size:17px}.up:hover{color:var(--cyan);border-color:var(--cyan)}
 .genb{background:var(--pink);border:none;color:#220812;font-family:'Press Start 2P';font-size:10px;border-radius:7px;padding:0 14px;height:38px;cursor:pointer}.genb:hover{background:#ff85a8}
 .folderb{background:var(--b2);border:1px solid var(--ln);color:var(--ink);font-family:'VT323';font-size:17px;border-radius:7px;padding:0 10px;height:38px;cursor:pointer}.folderb:hover:not(:disabled){color:var(--cyan);border-color:var(--cyan)}.folderb:disabled{opacity:.38;cursor:default;color:var(--mut);border-color:var(--ln)}
+.lansw{display:flex;align-items:center;gap:7px;background:rgba(17,13,32,.7);border:1px solid var(--ln);color:var(--mut);height:38px;padding:0 9px;border-radius:7px;font-family:'VT323';font-size:15px;cursor:pointer;white-space:nowrap}.lansw .knob{width:28px;height:15px;border-radius:999px;background:#3b3457;position:relative}.lansw .knob:after{content:"";position:absolute;top:2px;left:2px;width:11px;height:11px;border-radius:50%;background:var(--mut);transition:.15s}.lansw.on{color:var(--grn);border-color:rgba(141,255,176,.45)}.lansw.on .knob{background:#24553a}.lansw.on .knob:after{left:15px;background:var(--grn)}.lansw.warn{color:var(--amb);border-color:rgba(255,209,102,.55)}
 .modehint{display:none;margin:-8px 0 14px;padding:8px 10px;border:1px solid var(--ln);border-radius:8px;background:rgba(17,13,32,.72);color:var(--mut);font-size:16px;line-height:1.25}.modehint.on{display:block}.modehint.ok{border-color:rgba(141,255,176,.32);color:var(--grn)}.modehint.bad{border-color:rgba(255,93,143,.48);color:var(--amb)}.modehint b{font-family:'Press Start 2P';font-size:9px;color:var(--cyan);margin-right:8px}.modehint .miss{color:var(--pink)}
 .modehint{position:relative;padding-right:118px}.modelToggle{position:absolute;right:8px;top:7px;background:var(--b2);border:1px solid var(--ln);color:var(--mut);border-radius:6px;height:25px;padding:0 8px;font-family:'VT323';font-size:14px;cursor:pointer}.modelToggle:hover,.modelToggle.warn{border-color:var(--amb);color:var(--amb)}
 .modelPanel{display:none;margin:-8px 0 14px;padding:9px 10px;background:rgba(10,8,20,.9);border:1px solid var(--ln);border-radius:9px;color:var(--mut);gap:8px;align-items:center;flex-wrap:wrap}.modelPanel.on{display:flex}.modelPanel label{display:flex;align-items:center;gap:6px;font-size:15px}.modelPanel .ok{font-size:9px;color:var(--amb);margin-right:2px}.modelPanel select{background:#0a0814;border:1px solid var(--ln);color:var(--ink);border-radius:6px;height:28px;font-family:'VT323';font-size:16px;padding:0 7px;max-width:260px}.modelPanel select:focus{outline:none;border-color:var(--cyan)}
@@ -1458,6 +1469,7 @@ body{margin:0;background:#0a0814;color:var(--ink);font-family:'VT323',monospace;
   <button class="genb pix" onclick="gen()">생성 ▸</button>
   <button class="folderb" id="stopbtn" onclick="stopComfy()" disabled title="큐가 돌 때 활성화돼요">■ 정지</button>
   <button class="folderb" onclick="openGallery()">📁 폴더</button>
+  <button class="lansw" id="lansw" onclick="toggleLan()" title="다른 PC에서 대시보드 접속 허용"><span>LAN</span><span class="knob"></span><span id="lanstate">로컬</span></button>
   <button class="folderb" onclick="restartDash()">↻ 재시작</button>
 </div>
 <div class="modehint" id="modehint"></div>
@@ -1554,6 +1566,21 @@ function openGallery(){api('/api/open_gallery',{}).then(function(r){return r.jso
 function setStopEnabled(on){var b=document.getElementById('stopbtn');if(!b)return;b.disabled=!on;b.title=on?'현재 ComfyUI 생성을 정지합니다':'큐가 돌 때 활성화돼요'}
 function stopComfy(){var b=document.getElementById('stopbtn');if(b&&b.disabled)return;if(!confirm('현재 ComfyUI 생성을 정지할까요?'))return;api('/api/interrupt',{}).then(function(r){return r.json()}).then(function(j){if(!j.ok)alert(j.err||'정지 요청 실패');else{document.getElementById('upinfo').textContent='ComfyUI 정지 요청 보냄';setStopEnabled(false)}})}
 function restartDash(){if(!confirm('대시보드를 다시 시작할까요?'))return;api('/api/restart_dashboard',{}).then(function(){setTimeout(function(){location.reload()},1800)})}
+function setLanSwitch(s){
+  var b=document.getElementById('lansw'),t=document.getElementById('lanstate');if(!b||!t)return;
+  var on=(s.configured_dashboard_host||s.dashboard_host)==='0.0.0.0';
+  b.classList.toggle('on',on);b.classList.toggle('warn',!!s.dashboard_host_restart_needed);
+  t.textContent=s.dashboard_host_restart_needed?(on?'재시작 필요':'끄려면 재시작'):(on?'공개':'로컬');
+  b.title=on?'다른 PC 접속 허용 중':'이 PC에서만 접속';
+}
+function toggleLan(){
+  var b=document.getElementById('lansw'),turnOn=!(b&&b.classList.contains('on'));
+  api('/api/dashboard_host',{public:turnOn}).then(function(r){return r.json()}).then(function(j){
+    if(!j.ok){alert(j.err||'LAN 설정 변경 실패');return}
+    poll();
+    document.getElementById('upinfo').textContent='LAN 설정 변경됨 · 대시보드 재시작 후 적용';
+  })
+}
 function setLlmStatus(t){document.getElementById('llmstat').textContent=t||''}
 function loadLlmModels(){var sel=document.getElementById('llm');setLlmStatus('LM Studio 확인 중...');
   fetch('/api/llm_models').then(function(r){return r.json()}).then(function(d){
@@ -1937,6 +1964,7 @@ if(boardDrop){
 function poll(){fetch('/api/status').then(function(r){return r.json()}).then(function(s){
   var hb=document.getElementById('hbox'),dot=document.getElementById('dot'),st=document.getElementById('hstate'),lan=document.getElementById('lanurl');
   if(lan){lan.textContent=s.lan_url?('LAN '+s.lan_url):'';lan.title=s.lan_url?'click to copy':'';lan.onclick=function(){if(s.lan_url&&navigator.clipboard)navigator.clipboard.writeText(s.lan_url)}}
+  setLanSwitch(s);
   hb.firstChild&&hb.firstChild.classList&&hb.firstChild.classList.toggle('on',s.alive);
   dot.className='dot'+(s.alive?' a':'');
   st.textContent=!s.alive?'OFFLINE':(s.generating||s.queued?'GENERATING'+(s.queued?(' ('+s.queued+')'):''):'ONLINE')
