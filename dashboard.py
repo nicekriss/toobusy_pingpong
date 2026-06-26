@@ -896,6 +896,13 @@ def mode_statuses():
     MODE_STATUS_CACHE.update({"t": time.time(), "data": out})
     return out
 
+def mode_generate_error(mode):
+    st = mode_statuses().get(mode)
+    missing = (st or {}).get("missing") or []
+    if missing:
+        return "준비되지 않은 기능이에요: " + " · ".join(str(x) for x in missing)
+    return ""
+
 def comfy_loras():
     if time.time() - LORA_CACHE["t"] < 30:
         return LORA_CACHE["data"]
@@ -1211,6 +1218,9 @@ class H(BaseHTTPRequestHandler):
             imgs = body.get("images", [])
             assets = body.get("assets", [])
             settings = body.get("settings", {}) if isinstance(body.get("settings", {}), dict) else {}
+            ready_err = mode_generate_error(mode)
+            if ready_err:
+                return self._json({"ok": False, "err": ready_err}, 400)
             if mode in ("klein", "faceswap"):
                 refs = save_reference_assets(assets, imgs)
                 rels = [r.get("rel") for r in refs if r.get("rel")]
@@ -1383,7 +1393,7 @@ body{margin:0;background:#0a0814;color:var(--ink);font-family:'VT323',monospace;
 .msel,.gi{background:#0a0814;border:1px solid var(--ln);color:var(--ink);border-radius:7px;height:38px;font-family:'VT323';font-size:19px;padding:0 8px}
 .gi{flex:1}.gi::placeholder{color:var(--mut)}
 .up{background:#0a0814;border:1px solid var(--ln);color:var(--mut);height:38px;padding:0 10px;border-radius:7px;cursor:pointer;font-family:'VT323';font-size:17px}.up:hover{color:var(--cyan);border-color:var(--cyan)}
-.genb{background:var(--pink);border:none;color:#220812;font-family:'Press Start 2P';font-size:10px;border-radius:7px;padding:0 14px;height:38px;cursor:pointer}.genb:hover{background:#ff85a8}
+.genb{background:var(--pink);border:none;color:#220812;font-family:'Press Start 2P';font-size:10px;border-radius:7px;padding:0 14px;height:38px;cursor:pointer}.genb:hover:not(:disabled){background:#ff85a8}.genb:disabled{opacity:.42;cursor:default;filter:saturate(.35)}
 .folderb{background:var(--b2);border:1px solid var(--ln);color:var(--ink);font-family:'VT323';font-size:17px;border-radius:7px;padding:0 10px;height:38px;cursor:pointer}.folderb:hover:not(:disabled){color:var(--cyan);border-color:var(--cyan)}.folderb:disabled{opacity:.38;cursor:default;color:var(--mut);border-color:var(--ln)}
 .lansw{display:flex;align-items:center;gap:7px;background:rgba(17,13,32,.7);border:1px solid var(--ln);color:var(--mut);height:38px;padding:0 9px;border-radius:7px;font-family:'VT323';font-size:15px;cursor:pointer;white-space:nowrap}.lansw .knob{width:28px;height:15px;border-radius:999px;background:#3b3457;position:relative}.lansw .knob:after{content:"";position:absolute;top:2px;left:2px;width:11px;height:11px;border-radius:50%;background:var(--mut);transition:.15s}.lansw.on{color:var(--grn);border-color:rgba(141,255,176,.45)}.lansw.on .knob{background:#24553a}.lansw.on .knob:after{left:15px;background:var(--grn)}.lansw.warn{color:var(--amb);border-color:rgba(255,209,102,.55)}
 .modehint{display:none;margin:-8px 0 14px;padding:8px 10px;border:1px solid var(--ln);border-radius:8px;background:rgba(17,13,32,.72);color:var(--mut);font-size:16px;line-height:1.25}.modehint.on{display:block}.modehint.ok{border-color:rgba(141,255,176,.32);color:var(--grn)}.modehint.bad{border-color:rgba(255,93,143,.48);color:var(--amb)}.modehint b{font-family:'Press Start 2P';font-size:9px;color:var(--cyan);margin-right:8px}.modehint .miss{color:var(--pink)}
@@ -1466,7 +1476,7 @@ body{margin:0;background:#0a0814;color:var(--ink);font-family:'VT323',monospace;
   <input id="prompt" class="gi" placeholder="무엇을 만들까요? 예: 노을 지는 바닷가">
   <button class="up" id="up" style="display:none" onclick="document.getElementById('files').click()">📷 사진</button>
   <input type="file" id="files" accept="image/*" multiple style="display:none" onchange="filePick()">
-  <button class="genb pix" onclick="gen()">생성 ▸</button>
+  <button class="genb pix" id="genbtn" onclick="gen()">생성 ▸</button>
   <button class="folderb" id="stopbtn" onclick="stopComfy()" disabled title="큐가 돌 때 활성화돼요">■ 정지</button>
   <button class="folderb" onclick="openGallery()">📁 폴더</button>
   <button class="lansw" id="lansw" onclick="toggleLan()" title="다른 PC에서 대시보드 접속 허용"><span>LAN</span><span class="knob"></span><span id="lanstate">로컬</span></button>
@@ -1686,12 +1696,15 @@ function loadModes(){fetch('/api/modes').then(function(r){return r.json()}).then
   CUSTOMS.forEach(function(c){if(sel.querySelector('option[value="'+c.mode+'"]'))return;
     var o=document.createElement('option');o.value=c.mode;o.textContent=c.label;sel.appendChild(o)
   });
+  markModeOptions();
   modeChg();
 })}
+function markModeOptions(){var sel=document.getElementById('mode');if(!sel)return;Array.prototype.forEach.call(sel.options,function(o){if(!o.dataset.base)o.dataset.base=o.textContent.replace(/\s*⚠$/,'');var st=MODE_STATUS[o.value]||{},bad=(st.missing||[]).length;o.textContent=o.dataset.base+(bad?' ⚠':'');o.title=bad?('필요함: '+(st.missing||[]).join(' · ')):''})}
 function renderModeHint(m){
   var box=document.getElementById('modehint'),st=MODE_STATUS[m]||{};
   if(!box)return;
   var missing=st.missing||[],needs=st.needs||[];
+  setGenerateReady(!missing.length,missing);
   box.className='modehint on '+(missing.length?'bad':'ok');
   if(!st.label&&!missing.length&&!needs.length){box.className='modehint';box.innerHTML='';return}
   var modelWarn=missing.some(function(x){var s=String(x);return s.indexOf('모델')>=0||s.toLowerCase().indexOf('model')>=0});
@@ -1702,6 +1715,11 @@ function renderModeHint(m){
     var tail=needs.length?' · 확인됨: '+esc(needs.slice(0,4).join(' · '))+(needs.length>4?' · ...':''):'';
     box.innerHTML='<b>READY CHECK</b>준비됨'+tail+btn;
   }
+}
+function setGenerateReady(ok,missing){
+  var b=document.getElementById('genbtn');if(!b)return;
+  b.disabled=!ok;
+  b.title=ok?'생성 시작':('준비되지 않음: '+(missing||[]).join(' · '));
 }
 function renderImgs(){var g=document.getElementById('grid');g.innerHTML='';
   if(!IMGS.length){g.innerHTML='<div class="empty">아직 생성된 이미지가 없어요. 위에서 생성해보세요!</div>';return}
@@ -1939,6 +1957,8 @@ function filePick(){var fs=document.getElementById('files').files,done=0;
   pickRole='';
 }
 function gen(){var m=document.getElementById('mode').value,p=document.getElementById('prompt'),t=p.value.trim();
+  var st=MODE_STATUS[m]||{},missing=st.missing||[],gb=document.getElementById('genbtn');
+  if((gb&&gb.disabled)||missing.length){alert('준비되지 않은 기능이에요.\n'+missing.join('\n'));return}
   if((m==='image'||m==='video'||m==='song'||m.indexOf('custom:')===0)&&!t){p.classList.add('shake');setTimeout(function(){p.classList.remove('shake')},300);return}
   var imageData=picked.filter(function(x){return x&&x.kind==='image'&&x.enabled!==false}).map(function(x){return x.data});
   if(m==='klein'&&imageData.length<1){alert('사진 1장을 첨부하세요');return}
