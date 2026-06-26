@@ -743,6 +743,24 @@ def comfy_has_model(expected, options):
         return True
     return _norm_model(expected) in [_norm_model(o) for o in options]
 
+def comfy_models_root():
+    return CFG.get("comfy_models_dir") or os.path.join(os.path.dirname(INPUTDIR), "models")
+
+def model_folder_hint(cls, field, expected=""):
+    low = " ".join([str(cls or ""), str(field or ""), str(expected or "")]).lower()
+    folder = ""
+    if "lora" in low:
+        folder = "loras"
+    elif "vae" in low:
+        folder = "vae"
+    elif "unet" in low or expected.lower().endswith(".gguf"):
+        folder = "unet"
+    elif "clip" in low:
+        folder = "clip"
+    elif "checkpoint" in low or "ckpt" in low:
+        folder = "checkpoints"
+    return os.path.join(comfy_models_root(), folder) if folder else comfy_models_root()
+
 def workflow_classes_and_models(path):
     data = json.load(open(path, encoding="utf-8"))
     classes = []
@@ -885,20 +903,35 @@ def custom_mode_status(name, spec, online):
         "missing": missing,
     }
 
-def mode_statuses():
-    if time.time() - MODE_STATUS_CACHE["t"] < 20:
+def mode_status_for(mode, online=None):
+    if online is None:
+        online = comfy_is_online()
+    if mode in BUILTIN_MODE_CHECKS:
+        return builtin_mode_status(mode, online)
+    if isinstance(mode, str) and mode.startswith("custom:"):
+        name = mode.split(":", 1)[1]
+        spec = CUSTOM.get(name)
+        if isinstance(spec, dict):
+            return custom_mode_status(name, spec, online)
+    return {"label": mode, "ready": True, "needs": [], "missing": []}
+
+def mode_statuses(force=False):
+    if not force and time.time() - MODE_STATUS_CACHE["t"] < 5:
         return MODE_STATUS_CACHE["data"]
     online = comfy_is_online()
-    out = {mode: builtin_mode_status(mode, online) for mode in BUILTIN_MODE_CHECKS}
+    out = {mode: mode_status_for(mode, online) for mode in BUILTIN_MODE_CHECKS}
     for name, spec in CUSTOM.items():
         if isinstance(spec, dict):
-            out["custom:" + name] = custom_mode_status(name, spec, online)
+            out["custom:" + name] = mode_status_for("custom:" + name, online)
     MODE_STATUS_CACHE.update({"t": time.time(), "data": out})
     return out
 
 def mode_generate_error(mode):
-    st = mode_statuses().get(mode)
+    st = mode_status_for(mode)
     missing = (st or {}).get("missing") or []
+    model_missing = [str(x).split(":", 1)[1].strip() for x in missing if "모델:" in str(x)]
+    if model_missing:
+        return "모델 '%s' 이 ComfyUI에 없어요. models 폴더에 넣고 새로고침하세요." % model_missing[0]
     if missing:
         return "준비되지 않은 기능이에요: " + " · ".join(str(x) for x in missing)
     return ""
@@ -974,8 +1007,8 @@ def model_fields_for_mode(mode):
             continue
         seen.add(key)
         opts = comfy_input_options(comfy_node_info(cls), field) or []
-        if not opts:
-            continue
+        current = overrides.get(key, value)
+        installed_value = next((o for o in opts if _norm_model(o) == _norm_model(current)), "")
         fields.append({
             "key": key,
             "mode": mode,
@@ -983,8 +1016,11 @@ def model_fields_for_mode(mode):
             "class": cls,
             "field": field,
             "original": value,
-            "current": overrides.get(key, value),
+            "current": current,
+            "installed": bool(installed_value) or comfy_has_model(current, opts),
+            "installed_value": installed_value,
             "options": opts,
+            "model_dir": model_folder_hint(cls, field, current),
         })
     return {"ok": True, "fields": fields}
 
@@ -1178,7 +1214,9 @@ class H(BaseHTTPRequestHandler):
         elif p == "/api/status":
             self._json(status())
         elif p == "/api/modes":
-            self._json({"custom": custom_modes(), "status": mode_statuses()})
+            qs = urllib.parse.parse_qs(parsed.query)
+            force = qs.get("force", ["0"])[0] in ("1", "true", "yes")
+            self._json({"custom": custom_modes(), "status": mode_statuses(force)})
         elif p == "/api/llm_models":
             self._json(lmstudio_models())
         elif p == "/api/loras":
@@ -1218,6 +1256,11 @@ class H(BaseHTTPRequestHandler):
             imgs = body.get("images", [])
             assets = body.get("assets", [])
             settings = body.get("settings", {}) if isinstance(body.get("settings", {}), dict) else {}
+            if isinstance(mode, str) and mode.startswith("custom:"):
+                spec = CUSTOM.get(mode.split(":", 1)[1], {}) or {}
+                need = len(spec.get("image_nodes", []))
+                if need and len(imgs) < need:
+                    return self._json({"ok": False, "err": f"이 기능은 사진 {need}장이 필요해요"}, 400)
             ready_err = mode_generate_error(mode)
             if ready_err:
                 return self._json({"ok": False, "err": ready_err}, 400)
@@ -1294,6 +1337,14 @@ class H(BaseHTTPRequestHandler):
             if not mode or not node or not field:
                 return self._json({"ok": False, "err": "missing model override key"}, 400)
             try:
+                if value:
+                    fields = model_fields_for_mode(mode).get("fields", [])
+                    match = next((f for f in fields if f.get("node") == node and f.get("field") == field), None)
+                    options = (match or {}).get("options") or []
+                    if not options:
+                        return self._json({"ok": False, "err": "ComfyUI에 설치된 후보 모델이 없어요."}, 400)
+                    if not comfy_has_model(value, options):
+                        return self._json({"ok": False, "err": "설치된 모델만 선택할 수 있어요: " + value}, 400)
                 cfg = read_config()
                 overrides = cfg.setdefault("model_overrides", {})
                 key = model_override_key(mode, node, field)
@@ -1397,8 +1448,8 @@ body{margin:0;background:#0a0814;color:var(--ink);font-family:'VT323',monospace;
 .folderb{background:var(--b2);border:1px solid var(--ln);color:var(--ink);font-family:'VT323';font-size:17px;border-radius:7px;padding:0 10px;height:38px;cursor:pointer}.folderb:hover:not(:disabled){color:var(--cyan);border-color:var(--cyan)}.folderb:disabled{opacity:.38;cursor:default;color:var(--mut);border-color:var(--ln)}
 .lansw{display:flex;align-items:center;gap:7px;background:rgba(17,13,32,.7);border:1px solid var(--ln);color:var(--mut);height:38px;padding:0 9px;border-radius:7px;font-family:'VT323';font-size:15px;cursor:pointer;white-space:nowrap}.lansw .knob{width:28px;height:15px;border-radius:999px;background:#3b3457;position:relative}.lansw .knob:after{content:"";position:absolute;top:2px;left:2px;width:11px;height:11px;border-radius:50%;background:var(--mut);transition:.15s}.lansw.on{color:var(--grn);border-color:rgba(141,255,176,.45)}.lansw.on .knob{background:#24553a}.lansw.on .knob:after{left:15px;background:var(--grn)}.lansw.warn{color:var(--amb);border-color:rgba(255,209,102,.55)}
 .modehint{display:none;margin:-8px 0 14px;padding:8px 10px;border:1px solid var(--ln);border-radius:8px;background:rgba(17,13,32,.72);color:var(--mut);font-size:16px;line-height:1.25}.modehint.on{display:block}.modehint.ok{border-color:rgba(141,255,176,.32);color:var(--grn)}.modehint.bad{border-color:rgba(255,93,143,.48);color:var(--amb)}.modehint b{font-family:'Press Start 2P';font-size:9px;color:var(--cyan);margin-right:8px}.modehint .miss{color:var(--pink)}
-.modehint{position:relative;padding-right:118px}.modelToggle{position:absolute;right:8px;top:7px;background:var(--b2);border:1px solid var(--ln);color:var(--mut);border-radius:6px;height:25px;padding:0 8px;font-family:'VT323';font-size:14px;cursor:pointer}.modelToggle:hover,.modelToggle.warn{border-color:var(--amb);color:var(--amb)}
-.modelPanel{display:none;margin:-8px 0 14px;padding:9px 10px;background:rgba(10,8,20,.9);border:1px solid var(--ln);border-radius:9px;color:var(--mut);gap:8px;align-items:center;flex-wrap:wrap}.modelPanel.on{display:flex}.modelPanel label{display:flex;align-items:center;gap:6px;font-size:15px}.modelPanel .ok{font-size:9px;color:var(--amb);margin-right:2px}.modelPanel select{background:#0a0814;border:1px solid var(--ln);color:var(--ink);border-radius:6px;height:28px;font-family:'VT323';font-size:16px;padding:0 7px;max-width:260px}.modelPanel select:focus{outline:none;border-color:var(--cyan)}
+.modehint{position:relative;padding-right:210px}.modelToggle{position:absolute;right:8px;top:7px;background:var(--b2);border:1px solid var(--ln);color:var(--mut);border-radius:6px;height:25px;padding:0 8px;font-family:'VT323';font-size:14px;cursor:pointer}.modehint .modelRefresh{position:absolute;right:90px;top:7px;height:25px}.modelToggle:hover,.modelToggle.warn{border-color:var(--amb);color:var(--amb)}
+.modelPanel{display:none;margin:-8px 0 14px;padding:9px 10px;background:rgba(10,8,20,.9);border:1px solid var(--ln);border-radius:9px;color:var(--mut);gap:8px;align-items:center;flex-wrap:wrap}.modelPanel.on{display:flex}.modelPanel label{display:flex;align-items:center;gap:6px;font-size:15px}.modelPanel .ok{font-size:9px;color:var(--amb);margin-right:2px}.modelPanel .bad{color:var(--pink)}.modelPanel .hint{font-size:14px;color:var(--mut);max-width:420px}.modelPanel select{background:#0a0814;border:1px solid var(--ln);color:var(--ink);border-radius:6px;height:28px;font-family:'VT323';font-size:16px;padding:0 7px;max-width:260px}.modelPanel select.warn{border-color:var(--pink);color:var(--pink)}.modelPanel select:focus{outline:none;border-color:var(--cyan)}.modelRefresh{background:var(--b2);border:1px solid var(--ln);color:var(--ink);border-radius:6px;height:28px;padding:0 8px;font-family:'VT323';font-size:15px;cursor:pointer}.modelRefresh:hover{border-color:var(--cyan);color:var(--cyan)}
 .llmbar{display:flex;align-items:center;gap:8px;margin:-8px 0 14px;color:var(--mut);font-size:16px}.llmbar .lk{font-size:9px;color:var(--cyan);min-width:42px}.llmbar select{flex:1;min-width:0;background:#0a0814;border:1px solid var(--ln);color:var(--ink);border-radius:7px;height:30px;font-family:'VT323';font-size:16px;padding:0 8px}.llmbar select:focus{outline:none;border-color:var(--cyan)}.llmbar button{background:var(--b2);border:1px solid var(--ln);color:var(--ink);border-radius:6px;height:30px;padding:0 9px;font-family:'VT323';font-size:15px;cursor:pointer}.llmbar button:hover{border-color:var(--cyan);color:var(--cyan)}.llmstat{max-width:280px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .optbar{display:none;align-items:center;gap:8px;margin:-8px 0 14px;padding:8px 10px;background:rgba(17,13,32,.72);border:1px solid var(--ln);border-radius:9px;color:var(--mut);flex-wrap:wrap}.optbar.on{display:flex}.optbar label{display:flex;align-items:center;gap:6px;font-size:15px}.optbar .ok{font-size:9px;color:var(--amb);margin-right:2px}.optbar select,.optbar input{background:#0a0814;border:1px solid var(--ln);color:var(--ink);border-radius:6px;height:28px;font-family:'VT323';font-size:16px;padding:0 7px}.optbar select:focus,.optbar input:focus{outline:none;border-color:var(--cyan)}.optbar input{width:66px}.optgrp{display:none;gap:8px;align-items:center;flex-wrap:wrap}.optgrp.on{display:flex}
 .assets{display:none;gap:6px;align-items:center;margin:-8px 0 12px;flex-wrap:wrap}.assets.on{display:flex}.asset{display:flex;align-items:center;gap:6px;background:var(--b1);border:1px solid var(--ln);border-radius:7px;padding:4px 7px;font-size:15px}.asset b{color:var(--cyan);font-size:12px}.asset select,.asset input{background:#0a0814;border:1px solid var(--ln);color:var(--ink);border-radius:5px;height:24px;font-family:'VT323';font-size:14px}.asset .short{width:54px}.asset .lora-name{width:150px}.asset .use{display:flex;align-items:center;gap:3px;color:var(--amb);font-size:12px}.asset .use input{accent-color:var(--pink);height:auto}.asset.off{opacity:.58}.asset button{border:none;background:rgba(13,11,22,.85);color:var(--ink);border-radius:5px;cursor:pointer}.asset button:hover{background:var(--amb);color:#0a0814}
@@ -1497,7 +1548,7 @@ body{margin:0;background:#0a0814;color:var(--ink);font-family:'VT323',monospace;
     <label>SCALE <select id="zscale"><option value="0.5" selected>0.5</option><option value="0.6">0.6</option><option value="0.75">0.75</option><option value="1">1.0</option></select></label>
   </div>
   <div class="optgrp" id="editopts">
-    <label>SIZE <select id="emp"><option value="0.5">0.5MP</option><option value="1" selected>1MP</option><option value="1.5">1.5MP</option><option value="2">2MP</option><option value="3">3MP</option></select></label>
+    <label>SIZE <select id="emp"><option value="0.5">0.5MP</option><option value="1" selected>1MP</option><option value="1.5">1.5MP</option><option value="2">2MP</option></select></label>
   </div>
   <div class="optgrp" id="vidopts">
     <label>SECONDS <input id="vsec" type="number" min="1" max="20" value="5"></label>
@@ -1611,20 +1662,26 @@ function saveLlmModel(){var sel=document.getElementById('llm'),model=sel.value;i
 function loadLoras(){fetch('/api/loras').then(function(r){return r.json()}).then(function(d){LORAS=d.loras||[];renderAssets()}).catch(function(){LORAS=[]})}
 function shortModelName(s){s=String(s||'');return s.length>42?'...'+s.slice(-39):s}
 function toggleModelPanel(){MODELPANEL=!MODELPANEL;loadModelFields()}
+function refreshModes(){MODE_STATUS={};fetch('/api/modes?force=1').then(function(r){return r.json()}).then(function(d){CUSTOMS=d.custom||[];MODE_STATUS=d.status||{};markModeOptions();modeChg()})}
 function loadModelFields(){var m=document.getElementById('mode').value,box=document.getElementById('modelopts');if(!box)return;box.classList.remove('on');box.innerHTML='';
   fetch('/api/model_fields?mode='+encodeURIComponent(m)).then(function(r){return r.json()}).then(function(d){
     var fields=(d&&d.fields)||[];if(!fields.length){box.classList.remove('on');return}
     if(!MODELPANEL)return;
     box.classList.add('on');
-    box.innerHTML='<span class="ok pix">MODELS</span>';
+    box.innerHTML='<span class="ok pix">MODELS</span><button class="modelRefresh" onclick="refreshModes()">새로고침</button>';
     fields.forEach(function(f){
-      var lab=document.createElement('label'),sel=document.createElement('select');
+      var lab=document.createElement('label'),opts=f.options||[];
       lab.textContent=(f.class||'Model')+' '+f.field+' ';
-      (f.options||[]).forEach(function(o){var op=document.createElement('option');op.value=o;op.textContent=shortModelName(o);sel.appendChild(op)});
-      if(f.current)sel.value=f.current;
-      sel.title=(f.original||'')+' -> '+(f.current||'');
-      sel.onchange=function(){api('/api/model_override',{mode:m,node:f.node,field:f.field,value:sel.value}).then(function(r){return r.json()}).then(function(j){if(!j.ok)alert(j.err||'model save failed');else{MODE_STATUS={};loadModes()}})};
-      lab.appendChild(sel);box.appendChild(lab)
+      if(!opts.length){
+        var msg=document.createElement('span');msg.className='hint bad';msg.textContent='ComfyUI에 모델 파일을 넣고 새로고침하세요: '+(f.current||f.original||'모델')+' → '+(f.model_dir||'ComfyUI/models');lab.appendChild(msg);box.appendChild(lab);return
+      }
+      var sel=document.createElement('select');
+      if(!f.installed){var miss=document.createElement('option');miss.value='';miss.textContent='⚠ 미설치 — 선택 필요';miss.disabled=true;miss.selected=true;sel.appendChild(miss);sel.classList.add('warn')}
+      opts.forEach(function(o){var op=document.createElement('option');op.value=o;op.textContent=shortModelName(o);sel.appendChild(op)});
+      if(f.installed)sel.value=f.installed_value||f.current;
+      sel.title='기대 파일: '+(f.current||f.original||'')+'\n폴더: '+(f.model_dir||'ComfyUI/models');
+      sel.onchange=function(){if(!sel.value)return;api('/api/model_override',{mode:m,node:f.node,field:f.field,value:sel.value}).then(function(r){return r.json()}).then(function(j){if(!j.ok)alert(j.err||'model save failed');else refreshModes()})};
+      lab.appendChild(sel);var hint=document.createElement('span');hint.className='hint';hint.textContent='기대: '+(f.current||f.original||'')+' · 폴더: '+(f.model_dir||'ComfyUI/models');lab.appendChild(hint);box.appendChild(lab)
     })
   }).catch(function(){box.classList.remove('on');box.innerHTML=''})
 }
@@ -1705,10 +1762,11 @@ function renderModeHint(m){
   if(!box)return;
   var missing=st.missing||[],needs=st.needs||[];
   setGenerateReady(!missing.length,missing);
+  if(missing.length)MODELPANEL=true;
   box.className='modehint on '+(missing.length?'bad':'ok');
   if(!st.label&&!missing.length&&!needs.length){box.className='modehint';box.innerHTML='';return}
   var modelWarn=missing.some(function(x){var s=String(x);return s.indexOf('모델')>=0||s.toLowerCase().indexOf('model')>=0});
-  var btn='<button class="modelToggle'+(modelWarn?' warn':'')+'" onclick="toggleModelPanel()">모델 설정</button>';
+  var btn='<button class="modelToggle'+(modelWarn?' warn':'')+'" onclick="toggleModelPanel()">모델 설정</button><button class="modelRefresh" onclick="refreshModes()">새로고침</button>';
   if(missing.length){
     box.innerHTML='<b>READY CHECK</b><span class="miss">필요함: '+esc(missing.join(' · '))+'</span>'+btn;
   }else{

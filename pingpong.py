@@ -750,7 +750,7 @@ def inject_custom(spec, prompt, image_refs=None, settings=None, mode_name=None):
         seconds = _int_setting(settings, "video_seconds", int(spec.get("default_seconds", 5) or 5), 1, 60)
         wf[str(node)]["inputs"][field] = seconds * fps + extra
     if settings and spec.get("type") == "image":
-        _set_any_megapixels(wf, _float_setting(settings, "image_megapixels", 1.0, 0.25, 4.0))
+        _set_any_megapixels(wf, _float_setting(settings, "image_megapixels", 1.0, 0.25, 2.0))
         if spec.get("ratio_node"):
             node, field = spec["ratio_node"]
             wf[str(node)]["inputs"][field] = _custom_ratio_value(spec, _ratio_setting(settings))
