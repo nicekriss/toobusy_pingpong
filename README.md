@@ -44,6 +44,8 @@ ComfyUI Manager 등으로 설치. **봇을 켜면 사전점검이 "뭐가 없는
 ## 3. 모델 파일 (ComfyUI `models` 폴더에)
 
 워크플로가 참조하는 파일명·하위폴더 그대로 있어야 합니다.
+대시보드의 **READY CHECK → 모델 설정**에서 빠진 모델은 `다운로드` 버튼으로 받을 수 있습니다.
+다운로드 파일은 기본적으로 Comfy Desktop 공유 폴더의 `models` 아래에 저장됩니다. 다른 위치를 쓰면 `config.json`에 `comfy_models_dir`를 지정하세요.
 
 - **ZIT:** `ZIT/zImageTurbo_turbo.safetensors`, `ZIT/zImageTurbo_turbo_txt.safetensors`, `zImageTurboVAE_v10.safetensors`, (LoRA) `ZIT/ZIT_normal_girl01.safetensors`, (업스케일) `4x-ClearRealityV1_Soft.pth`
 - **Flux2 Klein:** `FLUX2/flux-2-klein-9b-kv-fp8.safetensors`, `qwenLayerwiseForKlein9b_fp8FP32.safetensors`, `flux2DevFP8GGUF_flux2DevVAE.safetensors`, `gemma4_e4b_it_fp8_scaled.safetensors`
@@ -51,7 +53,7 @@ ComfyUI Manager 등으로 설치. **봇을 켜면 사전점검이 "뭐가 없는
 - **ACE Step 1.5:** `aceStepAudioGen_v15XLTurbo.safetensors`, `aceStepAudioGen_tencQwen06bAce15.safetensors`, `aceStepAudioGen_tencQwen4bAce15.safetensors`, `aceStepAudioGen_vae.safetensors`
 - **로컬 LLM (LM Studio):** 무검열 코딩 모델 1개 (예: `qwen3.5-35b-a3b-uncensored`). LM Studio에서 미리 다운로드해 두기.
 
-> 파일명이 다르면 `workflows/` 안의 해당 JSON에서 모델명을 본인 것으로 바꾸세요.
+> 파일명이 다르면 대시보드의 **모델 설정**에서 설치된 모델을 선택하세요. 새로 추가한 커스텀 워크플로의 모델 다운로드 링크는 `config.json`의 `model_downloads`에 직접 추가할 수 있습니다.
 
 ---
 

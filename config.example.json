@@ -6,6 +6,7 @@
   "lmstudio_api": "http://127.0.0.1:1234",
   "comfy_output_dir": "",
   "comfy_input_dir": "",
+  "comfy_models_dir": "",
   "send_upscaled": true,
   "zit_lora": false,
   "video_width": 0,
@@ -18,6 +19,7 @@
     "ace": "aceStepAudioGen_v15XLTurbo.safetensors"
   },
   "model_overrides": {},
+  "model_downloads": {},
   "custom_workflows": {
     "스티커": {
       "file": "workflows/my_sticker.json",

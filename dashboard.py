@@ -47,6 +47,7 @@ YT_CACHE = {"t": 0, "data": None}
 LORA_CACHE = {"t": 0, "data": []}
 MODE_STATUS_CACHE = {"t": 0, "data": {}}
 AUDIO_LYRICS_CACHE = {}
+MODEL_DOWNLOADS = {}
 HIDDEN_SUBPROCESS_FLAGS = 0
 if os.name == "nt" and hasattr(subprocess, "CREATE_NO_WINDOW"):
     HIDDEN_SUBPROCESS_FLAGS = subprocess.CREATE_NO_WINDOW
@@ -753,13 +754,103 @@ def model_folder_hint(cls, field, expected=""):
         folder = "loras"
     elif "vae" in low:
         folder = "vae"
-    elif "unet" in low or expected.lower().endswith(".gguf"):
-        folder = "unet"
     elif "clip" in low:
-        folder = "clip"
+        folder = "text_encoders"
+    elif "upscale" in low:
+        folder = "upscale_models"
+    elif "unet" in low or "model_name" in low or expected.lower().endswith(".gguf"):
+        folder = "diffusion_models"
     elif "checkpoint" in low or "ckpt" in low:
         folder = "checkpoints"
     return os.path.join(comfy_models_root(), folder) if folder else comfy_models_root()
+
+DEFAULT_MODEL_DOWNLOADS = {
+    "ZIT\\zImageTurbo_turbo.safetensors": {"repo": "Comfy-Org/z_image_turbo", "file": "split_files/diffusion_models/z_image_turbo_bf16.safetensors", "folder": "diffusion_models"},
+    "ZIT\\zImageTurbo_turbo_txt.safetensors": {"repo": "Comfy-Org/z_image_turbo", "file": "split_files/text_encoders/qwen_3_4b_fp8_mixed.safetensors", "folder": "text_encoders"},
+    "zImageTurboVAE_v10.safetensors": {"repo": "Comfy-Org/z_image_turbo", "file": "split_files/vae/ae.safetensors", "folder": "vae"},
+    "krea2_turbo_fp8_scaled.safetensors": {"repo": "Comfy-Org/Krea-2", "file": "diffusion_models/krea2_turbo_fp8_scaled.safetensors", "folder": "diffusion_models"},
+    "qwen3vl_4b_fp8_scaled.safetensors": {"repo": "Comfy-Org/Krea-2", "file": "text_encoders/qwen3vl_4b_fp8_scaled.safetensors", "folder": "text_encoders"},
+    "qwen_image_vae.safetensors": {"repo": "Comfy-Org/Krea-2", "file": "vae/qwen_image_vae.safetensors", "folder": "vae"},
+    "boogu_image_edit_fp8_scaled.safetensors": {"repo": "Comfy-Org/Boogu-Image", "file": "diffusion_models/boogu_image_edit_fp8_scaled.safetensors", "folder": "diffusion_models"},
+    "qwen3vl_8b_fp8_scaled.safetensors": {"repo": "Comfy-Org/Boogu-Image", "file": "text_encoders/qwen3vl_8b_fp8_scaled.safetensors", "folder": "text_encoders"},
+    "ae.safetensors": {"repo": "Comfy-Org/z_image_turbo", "file": "split_files/vae/ae.safetensors", "folder": "vae"},
+    "FLUX2\\flux-2-klein-9b-kv-fp8.safetensors": {"repo": "black-forest-labs/FLUX.2-klein-9b-kv-fp8", "file": "flux-2-klein-9b-kv-fp8.safetensors", "folder": "diffusion_models"},
+    "flux2DevFP8GGUF_flux2DevVAE.safetensors": {"repo": "Comfy-Org/flux2-dev", "file": "split_files/vae/flux2-vae.safetensors", "folder": "vae"},
+    "gemma4_e4b_it_fp8_scaled.safetensors": {"repo": "Comfy-Org/gemma-4", "file": "text_encoders/gemma4_e4b_it_fp8_scaled.safetensors", "folder": "text_encoders"},
+    "LTX23\\ltx23DEVGGUFUnsloth_q4km.gguf": {"repo": "unsloth/LTX-2.3-GGUF", "file": "ltx-2.3-22b-dev-Q4_K_M.gguf", "folder": "diffusion_models"},
+    "LTX23\\ltx-2.3-22b-distilled-lora-384-1.1.safetensors": {"repo": "DeepBeepMeep/LTX-2", "file": "ltx-2.3-22b-distilled-lora-384-1.1.safetensors", "folder": "loras"},
+    "LTX23\\ltx-2.3-22b-ic-lora-ingredients-0.9.safetensors": {"repo": "DeepBeepMeep/LTX-2", "file": "ltx-2.3-22b-ic-lora-ingredients-0.9.safetensors", "folder": "loras"},
+    "gemma_3_12B_it_fp4_mixed.safetensors": {"repo": "Comfy-Org/ltx-2", "file": "split_files/text_encoders/gemma_3_12B_it_fp4_mixed.safetensors", "folder": "text_encoders"},
+    "LTX23\\ltx23FP4_ltx23TextProjection.safetensors": {"repo": "Kijai/LTX2.3_comfy", "file": "text_encoders/ltx-2.3_text_projection_bf16.safetensors", "folder": "text_encoders"},
+    "LTX23\\ltx23FP4_ltx23AudioVae.safetensors": {"repo": "Kijai/LTX2.3_comfy", "file": "vae/LTX23_audio_vae_bf16.safetensors", "folder": "vae"},
+    "LTX23\\ltx23FP4_ltx23VideoVae.safetensors": {"repo": "Kijai/LTX2.3_comfy", "file": "vae/LTX23_video_vae_bf16.safetensors", "folder": "vae"},
+    "LTX23\\taeltx2_3.safetensors": {"repo": "Kijai/LTX2.3_comfy", "file": "vae/taeltx2_3.safetensors", "folder": "vae"},
+    "ltx-2.3-spatial-upscaler-x2-1.1.safetensors": {"repo": "DeepBeepMeep/LTX-2", "file": "ltx-2.3-spatial-upscaler-x2-1.1.safetensors", "folder": "upscale_models"},
+}
+
+def model_download_url(entry):
+    if entry.get("url"):
+        return entry["url"]
+    return "https://huggingface.co/%s/resolve/main/%s" % (entry["repo"], urllib.parse.quote(entry["file"].replace("\\", "/"), safe="/"))
+
+def model_download_entry(expected):
+    downloads = dict(DEFAULT_MODEL_DOWNLOADS)
+    downloads.update(CFG.get("model_downloads", {}) or {})
+    direct = downloads.get(expected)
+    if not direct:
+        direct = downloads.get(os.path.basename(str(expected).replace("\\", "/")))
+    if not direct:
+        return None
+    entry = dict(direct)
+    entry["target"] = expected
+    entry["url"] = model_download_url(entry)
+    return entry
+
+def model_target_path(entry):
+    rel = str(entry.get("target") or "")
+    folder = entry.get("folder") or ""
+    return os.path.join(comfy_models_root(), folder, *rel.replace("\\", "/").split("/"))
+
+def public_download_status():
+    return {k: {kk: vv for kk, vv in v.items() if kk not in ("thread",)} for k, v in MODEL_DOWNLOADS.items()}
+
+def download_model_worker(target, entry):
+    task = MODEL_DOWNLOADS[target]
+    try:
+        full = model_target_path(entry)
+        os.makedirs(os.path.dirname(full), exist_ok=True)
+        tmp = full + ".part"
+        req = urllib.request.Request(entry["url"], headers={"User-Agent": "pingpong-dashboard/1.0"})
+        with urllib.request.urlopen(req, timeout=30) as r, open(tmp, "wb") as f:
+            total = int(r.headers.get("Content-Length") or 0)
+            done = 0
+            while True:
+                chunk = r.read(1024 * 1024)
+                if not chunk:
+                    break
+                f.write(chunk)
+                done += len(chunk)
+                task.update({"done": done, "total": total, "pct": int(done * 100 / total) if total else 0})
+        os.replace(tmp, full)
+        task.update({"state": "done", "pct": 100, "path": full})
+        MODE_STATUS_CACHE["t"] = 0
+        LORA_CACHE["t"] = 0
+    except Exception as e:
+        task.update({"state": "error", "err": str(e)[:300]})
+
+def start_model_download(target):
+    entry = model_download_entry(target)
+    if not entry:
+        return False, "다운로드 링크가 등록되지 않은 모델이에요."
+    current = MODEL_DOWNLOADS.get(target)
+    if current and current.get("state") in ("downloading", "queued"):
+        return True, "이미 다운로드 중이에요."
+    task = {"state": "downloading", "target": target, "url": entry["url"], "done": 0, "total": 0, "pct": 0}
+    MODEL_DOWNLOADS[target] = task
+    th = threading.Thread(target=download_model_worker, args=(target, entry), daemon=True)
+    task["thread"] = th
+    th.start()
+    return True, "다운로드 시작"
 
 def workflow_classes_and_models(path):
     data = json.load(open(path, encoding="utf-8"))
@@ -1021,6 +1112,8 @@ def model_fields_for_mode(mode):
             "installed_value": installed_value,
             "options": opts,
             "model_dir": model_folder_hint(cls, field, current),
+            "download": model_download_entry(current),
+            "download_status": public_download_status().get(current),
         })
     return {"ok": True, "fields": fields}
 
@@ -1224,6 +1317,8 @@ class H(BaseHTTPRequestHandler):
         elif p == "/api/model_fields":
             qs = urllib.parse.parse_qs(parsed.query)
             self._json(model_fields_for_mode(qs.get("mode", [""])[0]))
+        elif p == "/api/model_downloads":
+            self._json({"downloads": public_download_status()})
         elif p == "/api/system":
             self._json(system_info())
         elif p == "/api/comfy_log":
@@ -1364,6 +1459,12 @@ class H(BaseHTTPRequestHandler):
                 return self._json({"ok": True, "preset": preset})
             except Exception as e:
                 return self._json({"ok": False, "err": str(e)}, 500)
+        if p == "/api/download_model":
+            target = (body.get("target") or "").strip()
+            if not target:
+                return self._json({"ok": False, "err": "missing target"}, 400)
+            ok, msg = start_model_download(target)
+            return self._json({"ok": ok, "msg": msg, "downloads": public_download_status()}, 200 if ok else 404)
         if p == "/api/hide":
             h = load_hidden(); h.add(body.get("rel", "")); save_hidden(h)
             return self._json({"ok": True})
@@ -1619,7 +1720,7 @@ body{margin:0;background:#0a0814;color:var(--ink);font-family:'VT323',monospace;
 </aside></div></div>
 <div class="lb" id="lb"><div class="lbtools"><button onclick="lbHide()">👁</button><button onclick="lbDel()">🗑</button><button onclick="closeLb()">✕</button></div><button class="nav prev" onclick="step(-1)">‹</button><img id="lbimg" onclick="toggleZoom()"><button class="nav next" onclick="step(1)">›</button><div class="lbcap" id="lbcap"></div></div>
 <script>
-var IMGS=[],VIDS=[],AUDS=[],CUSTOMS=[],LORAS=[],BOARD_PRESETS=[],AUDDUR={},MODE_STATUS={},SHUFFLE=false,MODELPANEL=false,DTDRAG=null,DTEDIT=-1,ai=0,cur=0,curAudioRel='',IMGKEY='',VIDKEY='',AUDKEY='',DURATION_FRAMES=120,IMGPAGE=1,IMGPAGES=1,IMGTOTAL=0,IMGPER=48;
+var IMGS=[],VIDS=[],AUDS=[],CUSTOMS=[],LORAS=[],BOARD_PRESETS=[],AUDDUR={},MODE_STATUS={},DOWNLOAD_SEEN={},SHUFFLE=false,MODELPANEL=false,DTDRAG=null,DTEDIT=-1,ai=0,cur=0,curAudioRel='',IMGKEY='',VIDKEY='',AUDKEY='',DURATION_FRAMES=120,IMGPAGE=1,IMGPAGES=1,IMGTOTAL=0,IMGPER=48;
 function api(p,b){return fetch(p,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b)})}
 function el(t,c){var e=document.createElement(t);if(c)e.className=c;return e}
 function esc(s){return String(s||'').replace(/[&<>"']/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]})}
@@ -1663,6 +1764,9 @@ function loadLoras(){fetch('/api/loras').then(function(r){return r.json()}).then
 function shortModelName(s){s=String(s||'');return s.length>42?'...'+s.slice(-39):s}
 function toggleModelPanel(){MODELPANEL=!MODELPANEL;loadModelFields()}
 function refreshModes(){MODE_STATUS={};fetch('/api/modes?force=1').then(function(r){return r.json()}).then(function(d){CUSTOMS=d.custom||[];MODE_STATUS=d.status||{};markModeOptions();modeChg()})}
+function downloadText(st){if(!st)return'';if(st.state==='done')return'다운로드 완료';if(st.state==='error')return'실패: '+(st.err||'');return'다운로드 '+(st.pct||0)+'%'}
+function startModelDownload(target){api('/api/download_model',{target:target}).then(function(r){return r.json()}).then(function(j){if(!j.ok){alert(j.err||j.msg||'다운로드 실패');return}document.getElementById('upinfo').textContent='모델 다운로드 시작: '+target;setTimeout(loadModelFields,700)})}
+function pollModelDownloads(){fetch('/api/model_downloads').then(function(r){return r.json()}).then(function(d){var active=false,done=false;Object.keys(d.downloads||{}).forEach(function(k){var st=d.downloads[k];if(st.state==='downloading')active=true;if(st.state==='done'&&!DOWNLOAD_SEEN[k]){DOWNLOAD_SEEN[k]=1;done=true}});if(active&&MODELPANEL)loadModelFields();if(done)refreshModes()}).catch(function(){})}
 function loadModelFields(){var m=document.getElementById('mode').value,box=document.getElementById('modelopts');if(!box)return;box.classList.remove('on');box.innerHTML='';
   fetch('/api/model_fields?mode='+encodeURIComponent(m)).then(function(r){return r.json()}).then(function(d){
     var fields=(d&&d.fields)||[];if(!fields.length){box.classList.remove('on');return}
@@ -1673,7 +1777,9 @@ function loadModelFields(){var m=document.getElementById('mode').value,box=docum
       var lab=document.createElement('label'),opts=f.options||[];
       lab.textContent=(f.class||'Model')+' '+f.field+' ';
       if(!opts.length){
-        var msg=document.createElement('span');msg.className='hint bad';msg.textContent='ComfyUI에 모델 파일을 넣고 새로고침하세요: '+(f.current||f.original||'모델')+' → '+(f.model_dir||'ComfyUI/models');lab.appendChild(msg);box.appendChild(lab);return
+        var msg=document.createElement('span');msg.className='hint bad';msg.textContent='ComfyUI에 모델 파일을 넣고 새로고침하세요: '+(f.current||f.original||'모델')+' → '+(f.model_dir||'ComfyUI/models');lab.appendChild(msg);
+        if(f.download){var db=document.createElement('button');db.className='modelRefresh';db.textContent=downloadText(f.download_status)||'다운로드';db.onclick=function(){startModelDownload(f.current)};lab.appendChild(db)}
+        box.appendChild(lab);return
       }
       var sel=document.createElement('select');
       if(!f.installed){var miss=document.createElement('option');miss.value='';miss.textContent='⚠ 미설치 — 선택 필요';miss.disabled=true;miss.selected=true;sel.appendChild(miss);sel.classList.add('warn')}
@@ -1681,7 +1787,9 @@ function loadModelFields(){var m=document.getElementById('mode').value,box=docum
       if(f.installed)sel.value=f.installed_value||f.current;
       sel.title='기대 파일: '+(f.current||f.original||'')+'\n폴더: '+(f.model_dir||'ComfyUI/models');
       sel.onchange=function(){if(!sel.value)return;api('/api/model_override',{mode:m,node:f.node,field:f.field,value:sel.value}).then(function(r){return r.json()}).then(function(j){if(!j.ok)alert(j.err||'model save failed');else refreshModes()})};
-      lab.appendChild(sel);var hint=document.createElement('span');hint.className='hint';hint.textContent='기대: '+(f.current||f.original||'')+' · 폴더: '+(f.model_dir||'ComfyUI/models');lab.appendChild(hint);box.appendChild(lab)
+      lab.appendChild(sel);var hint=document.createElement('span');hint.className='hint';hint.textContent='기대: '+(f.current||f.original||'')+' · 폴더: '+(f.model_dir||'ComfyUI/models');lab.appendChild(hint);
+      if(!f.installed&&f.download){var db=document.createElement('button');db.className='modelRefresh';db.textContent=downloadText(f.download_status)||'다운로드';db.onclick=function(){startModelDownload(f.current)};lab.appendChild(db)}
+      box.appendChild(lab)
     })
   }).catch(function(){box.classList.remove('on');box.innerHTML=''})
 }
@@ -2052,7 +2160,7 @@ for(var y=0;y<6;y++)for(var x=0;x<7;x++)if(rows[y][x]==='1')hs+='<rect x='+(x*6.
 document.getElementById('hbox').innerHTML='<svg class="heart on" viewBox="0 0 46 40">'+hs+'</svg>';
 var faceOpt=document.querySelector('#mode option[value="faceswap"]');if(faceOpt)faceOpt.remove();
 var kleinOpt=document.querySelector('#mode option[value="klein"]');if(kleinOpt)kleinOpt.textContent='Flux2 Klein';
-loadGenOptions();initVideoFold();loadModes();loadLlmModels();loadLoras();loadBoardPresets();load();loadYoutube();poll();pollSystem();setInterval(load,5000);setInterval(poll,2000);setInterval(pollSystem,3000);setInterval(pollLog,3000);setInterval(loadYoutube,1800000);
+loadGenOptions();initVideoFold();loadModes();loadLlmModels();loadLoras();loadBoardPresets();load();loadYoutube();poll();pollSystem();setInterval(load,5000);setInterval(poll,2000);setInterval(pollSystem,3000);setInterval(pollLog,3000);setInterval(pollModelDownloads,2500);setInterval(loadYoutube,1800000);
 </script></body></html>'''
 
 
