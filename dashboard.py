@@ -26,8 +26,18 @@ CUSTOM = CFG.get("custom_workflows", {}) or {}
 def _auto(k, *parts):
     base = os.path.join(os.environ.get("LOCALAPPDATA", ""), "Comfy-Desktop", "ComfyUI-Shared")
     return CFG.get(k) or os.path.join(base, *parts)
-OUTDIR   = _auto("comfy_output_dir", "output")
-INPUTDIR = _auto("comfy_input_dir", "input")
+def _desktop_storage_value(key):
+    settings_path = os.path.join(os.environ.get("APPDATA", ""), "Comfy Desktop", "settings.json")
+    try:
+        data = json.load(open(settings_path, encoding="utf-8"))
+        val = data.get(key)
+        if val:
+            return os.path.expandvars(os.path.expanduser(str(val)))
+    except Exception:
+        pass
+    return ""
+OUTDIR   = CFG.get("comfy_output_dir") or _desktop_storage_value("outputDir") or _auto("comfy_output_dir", "output")
+INPUTDIR = CFG.get("comfy_input_dir") or _desktop_storage_value("inputDir") or _auto("comfy_input_dir", "input")
 COMFY    = CFG.get("comfy_api", "http://127.0.0.1:8188").rstrip("/")
 LMAPI    = CFG.get("lmstudio_api", "http://127.0.0.1:1234").rstrip("/")
 GALLERY  = os.path.join(OUTDIR, "pingpong")

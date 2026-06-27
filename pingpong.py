@@ -29,9 +29,22 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 CFG_PATH = os.path.join(HERE, "config.json")
 
 def auto_comfy_dirs():
-    """ComfyUI Desktop 기본 공유 폴더 자동 감지 (%LOCALAPPDATA%)."""
+    """Detect the user-selected shared input/output folders when available."""
+    settings_path = os.path.join(os.environ.get("APPDATA", ""), "Comfy Desktop", "settings.json")
+    try:
+        data = json.load(open(settings_path, encoding="utf-8"))
+        out_dir = data.get("outputDir")
+        in_dir = data.get("inputDir")
+        if out_dir and in_dir:
+            return (
+                os.path.expandvars(os.path.expanduser(str(out_dir))),
+                os.path.expandvars(os.path.expanduser(str(in_dir))),
+            )
+    except Exception:
+        pass
     base = os.path.join(os.environ.get("LOCALAPPDATA", ""), "Comfy-Desktop", "ComfyUI-Shared")
     return os.path.join(base, "output"), os.path.join(base, "input")
+
 
 if not os.path.exists(CFG_PATH):
     print("=" * 52)
@@ -667,8 +680,40 @@ def _files_from(node_out):
         if isinstance(v, list):
             for it in v:
                 if isinstance(it, dict) and "filename" in it:
-                    out.append(os.path.join(OUTDIR, it.get("subfolder", ""), it["filename"]))
+                    out.append(_comfy_result_path(it))
     return out
+
+def _comfy_result_path(item):
+    filename = str(item.get("filename") or "")
+    subfolder = str(item.get("subfolder") or "")
+    folder_type = str(item.get("type") or item.get("folder_type") or "output").lower()
+    if os.path.isabs(filename):
+        return filename
+    roots = []
+    if folder_type == "input":
+        roots.append(INPUTDIR)
+    else:
+        roots.append(OUTDIR)
+        if folder_type == "temp":
+            roots.append(os.path.join(os.path.dirname(OUTDIR), "temp"))
+    roots.extend([OUTDIR, INPUTDIR])
+    seen = set()
+    for root in roots:
+        full = os.path.abspath(os.path.join(root, subfolder, filename))
+        key = os.path.normcase(full)
+        if key in seen:
+            continue
+        seen.add(key)
+        if os.path.exists(full):
+            return full
+    for root in (OUTDIR, INPUTDIR):
+        try:
+            for cur, _, files in os.walk(root):
+                if filename in files:
+                    return os.path.join(cur, filename)
+        except Exception:
+            pass
+    return os.path.abspath(os.path.join(roots[0], subfolder, filename))
 
 # ---------- 워크플로 주입 ----------
 def load_wf(name):
