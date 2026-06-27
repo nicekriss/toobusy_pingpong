@@ -241,7 +241,7 @@ git push -u origin main
 
 이 레포에는 현재 핑퐁 워크플로우를 돌리는 데 사용한 ComfyUI Desktop 스냅샷이 포함되어 있습니다.
 
-- `snapshots/snapshot-comfy-post-update-20260625.json`
+- `snapshots/snapshot-comfy-post-update-20260627.json`
 - ComfyUI Desktop 또는 ComfyUI Manager의 snapshot restore/import 기능으로 복원합니다.
 - 이 스냅샷은 custom nodes와 Python dependencies 기준 환경을 맞추기 위한 용도입니다.
 - 모델 파일 자체는 용량 때문에 포함되지 않습니다. `config.json`의 `models` 값과 README의 모델 안내를 확인해서 별도로 준비해야 합니다.

@@ -22,7 +22,7 @@ HERE = Path(__file__).resolve().parent
 CONFIG = HERE / "config.json"
 EXAMPLE = HERE / "config.example.json"
 WORKFLOWS = HERE / "workflows"
-SNAPSHOT = HERE / "snapshots" / "snapshot-comfy-post-update-20260625.json"
+SNAPSHOT = HERE / "snapshots" / "snapshot-comfy-post-update-20260627.json"
 
 
 def auto_comfy_dirs():
@@ -138,7 +138,7 @@ def check_workflow_files(rep, cfg, example):
     if SNAPSHOT.is_file():
         rep.ok(f"Comfy 스냅샷 있음: {SNAPSHOT.relative_to(HERE)}")
     else:
-        rep.warn("Comfy 스냅샷 없음: snapshots/snapshot-comfy-post-update-20260625.json")
+        rep.warn("Comfy 스냅샷 없음: snapshots/snapshot-comfy-post-update-20260627.json")
 
 
 def check_config(rep):
