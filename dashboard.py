@@ -775,8 +775,13 @@ DEFAULT_MODEL_DOWNLOADS = {
     "qwen3vl_8b_fp8_scaled.safetensors": {"repo": "Comfy-Org/Boogu-Image", "file": "text_encoders/qwen3vl_8b_fp8_scaled.safetensors", "folder": "text_encoders"},
     "ae.safetensors": {"repo": "Comfy-Org/z_image_turbo", "file": "split_files/vae/ae.safetensors", "folder": "vae"},
     "FLUX2\\flux-2-klein-9b-kv-fp8.safetensors": {"repo": "black-forest-labs/FLUX.2-klein-9b-kv-fp8", "file": "flux-2-klein-9b-kv-fp8.safetensors", "folder": "diffusion_models"},
+    "qwenLayerwiseForKlein9b_fp8FP32.safetensors": {"repo": "Comfy-Org/flux2-dev", "file": "split_files/text_encoders/mistral_3_small_flux2_fp8.safetensors", "folder": "text_encoders"},
     "flux2DevFP8GGUF_flux2DevVAE.safetensors": {"repo": "Comfy-Org/flux2-dev", "file": "split_files/vae/flux2-vae.safetensors", "folder": "vae"},
     "gemma4_e4b_it_fp8_scaled.safetensors": {"repo": "Comfy-Org/gemma-4", "file": "text_encoders/gemma4_e4b_it_fp8_scaled.safetensors", "folder": "text_encoders"},
+    "aceStepAudioGen_v15XLTurbo.safetensors": {"repo": "Comfy-Org/ACE-Step-v1-5", "file": "split_files/diffusion_models/aceStepAudioGen_v15XLTurbo.safetensors", "folder": "diffusion_models", "gated": True},
+    "aceStepAudioGen_tencQwen06bAce15.safetensors": {"repo": "Comfy-Org/ACE-Step-v1-5", "file": "split_files/text_encoders/aceStepAudioGen_tencQwen06bAce15.safetensors", "folder": "text_encoders", "gated": True},
+    "aceStepAudioGen_tencQwen4bAce15.safetensors": {"repo": "Comfy-Org/ACE-Step-v1-5", "file": "split_files/text_encoders/aceStepAudioGen_tencQwen4bAce15.safetensors", "folder": "text_encoders", "gated": True},
+    "aceStepAudioGen_vae.safetensors": {"repo": "Comfy-Org/ACE-Step-v1-5", "file": "split_files/vae/aceStepAudioGen_vae.safetensors", "folder": "vae", "gated": True},
     "LTX23\\ltx23DEVGGUFUnsloth_q4km.gguf": {"repo": "unsloth/LTX-2.3-GGUF", "file": "ltx-2.3-22b-dev-Q4_K_M.gguf", "folder": "diffusion_models"},
     "LTX23\\ltx-2.3-22b-distilled-lora-384-1.1.safetensors": {"repo": "DeepBeepMeep/LTX-2", "file": "ltx-2.3-22b-distilled-lora-384-1.1.safetensors", "folder": "loras"},
     "LTX23\\ltx-2.3-22b-ic-lora-ingredients-0.9.safetensors": {"repo": "DeepBeepMeep/LTX-2", "file": "ltx-2.3-22b-ic-lora-ingredients-0.9.safetensors", "folder": "loras"},
@@ -820,7 +825,11 @@ def download_model_worker(target, entry):
         full = model_target_path(entry)
         os.makedirs(os.path.dirname(full), exist_ok=True)
         tmp = full + ".part"
-        req = urllib.request.Request(entry["url"], headers={"User-Agent": "pingpong-dashboard/1.0"})
+        headers = {"User-Agent": "pingpong-dashboard/1.0"}
+        token = CFG.get("hf_token") or os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_HUB_TOKEN")
+        if token:
+            headers["Authorization"] = "Bearer " + str(token).strip()
+        req = urllib.request.Request(entry["url"], headers=headers)
         with urllib.request.urlopen(req, timeout=30) as r, open(tmp, "wb") as f:
             total = int(r.headers.get("Content-Length") or 0)
             done = 0

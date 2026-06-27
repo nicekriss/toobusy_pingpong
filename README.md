@@ -46,6 +46,7 @@ ComfyUI Manager 등으로 설치. **봇을 켜면 사전점검이 "뭐가 없는
 워크플로가 참조하는 파일명·하위폴더 그대로 있어야 합니다.
 대시보드의 **READY CHECK → 모델 설정**에서 빠진 모델은 `다운로드` 버튼으로 받을 수 있습니다.
 다운로드 파일은 기본적으로 Comfy Desktop 공유 폴더의 `models` 아래에 저장됩니다. 다른 위치를 쓰면 `config.json`에 `comfy_models_dir`를 지정하세요.
+ACE Step처럼 Hugging Face에서 권한이 필요한 모델은 `config.json`의 `hf_token` 또는 환경변수 `HF_TOKEN`을 넣어야 다운로드됩니다.
 
 - **ZIT:** `ZIT/zImageTurbo_turbo.safetensors`, `ZIT/zImageTurbo_turbo_txt.safetensors`, `zImageTurboVAE_v10.safetensors`, (LoRA) `ZIT/ZIT_normal_girl01.safetensors`, (업스케일) `4x-ClearRealityV1_Soft.pth`
 - **Flux2 Klein:** `FLUX2/flux-2-klein-9b-kv-fp8.safetensors`, `qwenLayerwiseForKlein9b_fp8FP32.safetensors`, `flux2DevFP8GGUF_flux2DevVAE.safetensors`, `gemma4_e4b_it_fp8_scaled.safetensors`

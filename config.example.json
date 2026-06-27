@@ -4,6 +4,7 @@
   "llm_model": "qwen3.5-35b-a3b-uncensored-hauhaucs-aggressive",
   "comfy_api": "http://127.0.0.1:8188",
   "lmstudio_api": "http://127.0.0.1:1234",
+  "hf_token": "",
   "comfy_output_dir": "",
   "comfy_input_dir": "",
   "comfy_models_dir": "",
