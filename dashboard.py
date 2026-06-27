@@ -1901,7 +1901,9 @@ function toggleModelPanel(){MODELPANEL=!MODELPANEL;loadModelFields()}
 function refreshModes(){var keepPanel=MODELPANEL;MODE_STATUS={};fetch('/api/modes?force=1').then(function(r){return r.json()}).then(function(d){CUSTOMS=d.custom||[];MODE_STATUS=d.status||{};markModeOptions();modeChg();if(keepPanel){MODELPANEL=true;loadModelFields()}})}
 function downloadText(st){if(!st)return'';if(st.state==='done')return'다운로드 완료';if(st.state==='error')return'실패: '+(st.err||'');return'다운로드 '+(st.pct||0)+'%'}
 function startModelDownload(target){MODELPANEL=true;api('/api/download_model',{target:target}).then(function(r){return r.json()}).then(function(j){if(!j.ok){alert(j.err||j.msg||'download failed');return}document.getElementById('upinfo').textContent='model download started: '+target;setTimeout(loadModelFields,700)})}
-function pollModelDownloads(){fetch('/api/model_downloads').then(function(r){return r.json()}).then(function(d){var active=false,done=false;Object.keys(d.downloads||{}).forEach(function(k){var st=d.downloads[k];if(st.state==='downloading')active=true;if(st.state==='done'&&!DOWNLOAD_SEEN[k]){DOWNLOAD_SEEN[k]=1;done=true}});if(active&&MODELPANEL)loadModelFields();if(done)refreshModes()}).catch(function(){})}
+function cssAttr(s){return String(s||'').replace(/\\/g,'\\\\').replace(/"/g,'\\"')}
+function updateDownloadBadges(downloads){Object.keys(downloads||{}).forEach(function(k){document.querySelectorAll('[data-dl-target="'+cssAttr(k)+'"]').forEach(function(b){b.textContent=downloadText(downloads[k])||'download';b.disabled=downloads[k]&&downloads[k].state==='downloading'})})}
+function pollModelDownloads(){fetch('/api/model_downloads').then(function(r){return r.json()}).then(function(d){var done=false,downloads=d.downloads||{};Object.keys(downloads).forEach(function(k){var st=downloads[k];if(st.state==='done'&&!DOWNLOAD_SEEN[k]){DOWNLOAD_SEEN[k]=1;done=true}});updateDownloadBadges(downloads);if(done)refreshModes()}).catch(function(){})}
 function loadModelFields(){var m=document.getElementById('mode').value,box=document.getElementById('modelopts');if(!box)return;box.classList.remove('on');box.innerHTML='';
   fetch('/api/model_fields?mode='+encodeURIComponent(m)).then(function(r){return r.json()}).then(function(d){
     var fields=(d&&d.fields)||[];if(!fields.length){box.classList.remove('on');return}
@@ -1913,7 +1915,7 @@ function loadModelFields(){var m=document.getElementById('mode').value,box=docum
       lab.textContent=(f.class||'Model')+' '+f.field+' ';
       if(!opts.length){
         var msg=document.createElement('span');msg.className='hint bad';msg.textContent='No model list from running ComfyUI. Put required model in a model root and refresh: '+expected+' / roots: '+(roots||f.model_dir||'models');lab.appendChild(msg);
-        if(f.download){var db=document.createElement('button');db.className='modelRefresh';db.textContent=downloadText(f.download_status)||'download';db.onclick=function(){startModelDownload(downloadTarget)};lab.appendChild(db)}
+        if(f.download){var db=document.createElement('button');db.className='modelRefresh';db.setAttribute('data-dl-target',downloadTarget);db.textContent=downloadText(f.download_status)||'download';db.onclick=function(){startModelDownload(downloadTarget)};lab.appendChild(db)}
         box.appendChild(lab);return
       }
       var sel=document.createElement('select'),missingExpected=(!f.expected_installed),hasValidSubstitute=!!f.installed&&!!f.current&&f.current!==expected,needsRequired=missingExpected&&!hasValidSubstitute;
@@ -1926,7 +1928,7 @@ function loadModelFields(){var m=document.getElementById('mode').value,box=docum
       var hint=document.createElement('span');hint.className='hint'+(needsRequired?' bad':(hasValidSubstitute?' warn':''));
       hint.textContent='Default: '+expected+(hasValidSubstitute?' / using substitute: '+f.current:'')+' / model roots: '+(roots||f.model_dir||'models');
       lab.appendChild(hint);
-      if(!f.expected_installed&&f.download){var db=document.createElement('button');db.className='modelRefresh';db.textContent=downloadText(f.download_status)||'download';db.onclick=function(){startModelDownload(downloadTarget)};lab.appendChild(db)}
+      if(!f.expected_installed&&f.download){var db=document.createElement('button');db.className='modelRefresh';db.setAttribute('data-dl-target',downloadTarget);db.textContent=downloadText(f.download_status)||'download';db.onclick=function(){startModelDownload(downloadTarget)};lab.appendChild(db)}
       box.appendChild(lab)
     })
   }).catch(function(){box.classList.remove('on');box.innerHTML=''})
