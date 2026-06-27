@@ -987,9 +987,7 @@ def workflow_missing_models(mode, path, online, limit=12):
         base_installed = comfy_has_model(base_value, opts)
         current_installed = comfy_has_model(current, opts)
         need.append("Model: " + base_value)
-        if current != base_value and not base_installed:
-            missing.append("Model substitute needs review: %s (required: %s)" % (current, base_value))
-        elif not current_installed:
+        if not current_installed:
             missing.append("Model: " + current)
         if len(missing) >= limit:
             missing.append("...more")
@@ -1090,9 +1088,7 @@ def custom_mode_status(name, spec, online):
                 need.append("Model: " + base_value)
                 base_installed = comfy_has_model(base_value, opts)
                 current_installed = comfy_has_model(current, opts)
-                if current != base_value and not base_installed:
-                    missing.append("Model substitute needs review: %s (required: %s)" % (current, base_value))
-                elif not current_installed:
+                if not current_installed:
                     missing.append("Model: " + current)
             if len(missing) >= 8:
                 break
@@ -1223,7 +1219,6 @@ def model_fields_for_mode(mode):
             "current": current,
             "expected_installed": expected_installed,
             "substitute": current != base_value,
-            "substitute_needs_confirm": current != base_value and not expected_installed,
             "installed": bool(installed_value) or comfy_has_model(current, opts),
             "installed_value": installed_value,
             "options": opts,
@@ -1564,9 +1559,6 @@ class H(BaseHTTPRequestHandler):
                         return self._json({"ok": False, "err": "ComfyUI에 설치된 후보 모델이 없어요."}, 400)
                     if not comfy_has_model(value, options):
                         return self._json({"ok": False, "err": "설치된 모델만 선택할 수 있어요: " + value}, 400)
-                    expected = (match or {}).get("expected") or (match or {}).get("original") or ""
-                    if expected and value != expected and not (match or {}).get("expected_installed"):
-                        return self._json({"ok": False, "err": "Required model is still missing: %s" % expected}, 400)
                 cfg = read_config()
                 overrides = cfg.setdefault("model_overrides", {})
                 key = model_override_key(mode, node, field)
@@ -1909,15 +1901,15 @@ function loadModelFields(){var m=document.getElementById('mode').value,box=docum
         if(f.download){var db=document.createElement('button');db.className='modelRefresh';db.textContent=downloadText(f.download_status)||'download';db.onclick=function(){startModelDownload(downloadTarget)};lab.appendChild(db)}
         box.appendChild(lab);return
       }
-      var sel=document.createElement('select'),needsRequired=(!f.expected_installed)||(f.substitute_needs_confirm);
-      if(needsRequired){var miss=document.createElement('option');miss.value='';miss.textContent='MISSING REQUIRED MODEL - download or refresh';miss.disabled=true;miss.selected=true;sel.appendChild(miss);sel.classList.add('warn')}
+      var sel=document.createElement('select'),missingExpected=(!f.expected_installed),hasValidSubstitute=!!f.installed&&!!f.current&&f.current!==expected,needsRequired=missingExpected&&!hasValidSubstitute;
+      if(needsRequired){var miss=document.createElement('option');miss.value='';miss.textContent='MISSING DEFAULT MODEL - choose installed substitute or download';miss.disabled=true;miss.selected=true;sel.appendChild(miss);sel.classList.add('warn')}
       opts.forEach(function(o){var op=document.createElement('option');op.value=o;op.textContent=shortModelName(o);sel.appendChild(op)});
-      if(f.installed&&!needsRequired)sel.value=f.installed_value||f.current;
+      if(f.installed)sel.value=f.installed_value||f.current;
       sel.title='Required: '+expected+'\nCurrent: '+(f.current||'')+'\nModel roots: '+(roots||f.model_dir||'models');
       sel.onchange=function(){if(!sel.value)return;MODELPANEL=true;api('/api/model_override',{mode:m,node:f.node,field:f.field,value:sel.value}).then(function(r){return r.json()}).then(function(j){if(!j.ok){alert(j.err||'model save failed');sel.value='';loadModelFields()}else{refreshModes()}})};
       lab.appendChild(sel);
-      var hint=document.createElement('span');hint.className='hint'+(needsRequired?' bad':'');
-      hint.textContent='Required: '+expected+(f.current&&f.current!==expected?' / selected substitute: '+f.current:'')+' / model roots: '+(roots||f.model_dir||'models');
+      var hint=document.createElement('span');hint.className='hint'+(needsRequired?' bad':(hasValidSubstitute?' warn':''));
+      hint.textContent='Default: '+expected+(hasValidSubstitute?' / using substitute: '+f.current:'')+' / model roots: '+(roots||f.model_dir||'models');
       lab.appendChild(hint);
       if(!f.expected_installed&&f.download){var db=document.createElement('button');db.className='modelRefresh';db.textContent=downloadText(f.download_status)||'download';db.onclick=function(){startModelDownload(downloadTarget)};lab.appendChild(db)}
       box.appendChild(lab)
