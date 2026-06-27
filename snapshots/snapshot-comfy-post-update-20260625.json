@@ -69,24 +69,11 @@
           "enabled": true
         },
         {
-          "id": "websocket_image_save.py",
-          "type": "file",
-          "dirName": "websocket_image_save.py",
-          "enabled": true
-        },
-        {
           "id": "WhatDreamsCost-ComfyUI",
           "type": "cnr",
           "dirName": "WhatDreamsCost-ComfyUI",
           "version": "2.0.2",
           "enabled": true
-        },
-        {
-          "id": "toobusy",
-          "type": "cnr",
-          "dirName": "toobusy@0_3_3",
-          "version": "0.3.3",
-          "enabled": false
         }
       ],
       "pipPackages": {
