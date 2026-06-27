@@ -771,8 +771,31 @@ def comfy_has_model(expected, options):
         return True
     return _norm_model(expected) in [_norm_model(o) for o in options]
 
+def user_model_roots():
+    roots = []
+    cfg_root = CFG.get("comfy_models_dir") or CFG.get("models_dir")
+    if cfg_root:
+        roots.append(os.path.expandvars(os.path.expanduser(str(cfg_root))))
+    settings_path = os.path.join(os.environ.get("APPDATA", ""), "Comfy Desktop", "settings.json")
+    try:
+        data = json.load(open(settings_path, encoding="utf-8"))
+        for root in data.get("modelsDirs", []) or []:
+            if root:
+                roots.append(os.path.expandvars(os.path.expanduser(str(root))))
+    except Exception:
+        pass
+    roots.append(os.path.join(os.path.dirname(INPUTDIR), "models"))
+    out = []
+    seen = set()
+    for root in roots:
+        norm = os.path.normcase(os.path.normpath(root))
+        if norm not in seen:
+            seen.add(norm)
+            out.append(root)
+    return out
+
 def comfy_models_root():
-    return CFG.get("comfy_models_dir") or os.path.join(os.path.dirname(INPUTDIR), "models")
+    return user_model_roots()[0]
 
 def model_folder_hint(cls, field, expected=""):
     low = " ".join([str(cls or ""), str(field or ""), str(expected or "")]).lower()
@@ -934,6 +957,16 @@ def optional_model_ref(mode, cls, field, value):
         return True
     return False
 
+def model_ref_values(mode, node_id, cls, field, value, overrides=None):
+    base_value = value
+    check = BUILTIN_MODE_CHECKS.get(mode) or {}
+    cfg_model = (CFG.get("models") or {}).get(check.get("model_key"), "")
+    if cfg_model and cls == check.get("loader") and field == check.get("field"):
+        base_value = cfg_model
+    key = model_override_key(mode, node_id, field)
+    current = (overrides or {}).get(key, base_value)
+    return key, base_value, current
+
 def workflow_missing_models(mode, path, online, limit=12):
     if not online or not path or not os.path.isfile(path):
         return [], []
@@ -947,21 +980,20 @@ def workflow_missing_models(mode, path, online, limit=12):
     for node_id, cls, field, value in refs:
         if optional_model_ref(mode, cls, field, value):
             continue
-        base_value = value
-        check = BUILTIN_MODE_CHECKS.get(mode) or {}
-        cfg_model = (CFG.get("models") or {}).get(check.get("model_key"), "")
-        if cfg_model and cls == check.get("loader") and field == check.get("field"):
-            base_value = cfg_model
-        current = overrides.get(model_override_key(mode, node_id, field), base_value)
+        _, base_value, current = model_ref_values(mode, node_id, cls, field, value, overrides)
         opts = comfy_input_options(comfy_node_info(cls), field)
         if opts is None:
             continue
-        need.append("모델: " + current)
-        if not comfy_has_model(current, opts):
-            missing.append("모델: " + current)
-            if len(missing) >= limit:
-                missing.append("...더 있음")
-                break
+        base_installed = comfy_has_model(base_value, opts)
+        current_installed = comfy_has_model(current, opts)
+        need.append("Model: " + base_value)
+        if current != base_value and not base_installed:
+            missing.append("Model substitute needs review: %s (required: %s)" % (current, base_value))
+        elif not current_installed:
+            missing.append("Model: " + current)
+        if len(missing) >= limit:
+            missing.append("...more")
+            break
     return sorted(set(need)), missing
 
 BUILTIN_MODE_CHECKS = {
@@ -1051,13 +1083,17 @@ def custom_mode_status(name, spec, online):
         for node_id, cls, field, value in model_refs:
             if optional_model_ref(mode, cls, field, value):
                 continue
-            value = overrides.get(model_override_key(mode, node_id, field), value)
+            _, base_value, current = model_ref_values(mode, node_id, cls, field, value, overrides)
             info = comfy_node_info(cls)
             opts = comfy_input_options(info, field)
             if opts is not None:
-                need.append("모델: " + value)
-                if not comfy_has_model(value, opts):
-                    missing.append("모델: " + value)
+                need.append("Model: " + base_value)
+                base_installed = comfy_has_model(base_value, opts)
+                current_installed = comfy_has_model(current, opts)
+                if current != base_value and not base_installed:
+                    missing.append("Model substitute needs review: %s (required: %s)" % (current, base_value))
+                elif not current_installed:
+                    missing.append("Model: " + current)
             if len(missing) >= 8:
                 break
     if len(missing) >= 8:
@@ -1095,9 +1131,9 @@ def mode_statuses(force=False):
 def mode_generate_error(mode):
     st = mode_status_for(mode)
     missing = (st or {}).get("missing") or []
-    model_missing = [str(x).split(":", 1)[1].strip() for x in missing if "모델:" in str(x)]
+    model_missing = [str(x).split(":", 1)[1].strip() for x in missing if "model" in str(x).lower()]
     if model_missing:
-        return "모델 '%s' 이 ComfyUI에 없어요. models 폴더에 넣고 새로고침하세요." % model_missing[0]
+        return "Required model is not ready: %s" % model_missing[0]
     if missing:
         return "준비되지 않은 기능이에요: " + " · ".join(str(x) for x in missing)
     return ""
@@ -1168,18 +1204,14 @@ def model_fields_for_mode(mode):
     fields = []
     seen = set()
     for node_id, cls, field, value in refs:
-        key = model_override_key(mode, node_id, field)
+        key, base_value, current = model_ref_values(mode, node_id, cls, field, value, overrides)
         if key in seen:
             continue
         seen.add(key)
         opts = comfy_input_options(comfy_node_info(cls), field) or []
-        base_value = value
-        check = BUILTIN_MODE_CHECKS.get(mode) or {}
-        cfg_model = (CFG.get("models") or {}).get(check.get("model_key"), "")
-        if cfg_model and cls == check.get("loader") and field == check.get("field"):
-            base_value = cfg_model
-        current = overrides.get(key, base_value)
+        expected_installed = comfy_has_model(base_value, opts)
         installed_value = next((o for o in opts if _norm_model(o) == _norm_model(current)), "")
+        download_target = base_value if not expected_installed else current
         fields.append({
             "key": key,
             "mode": mode,
@@ -1187,13 +1219,19 @@ def model_fields_for_mode(mode):
             "class": cls,
             "field": field,
             "original": value,
+            "expected": base_value,
             "current": current,
+            "expected_installed": expected_installed,
+            "substitute": current != base_value,
+            "substitute_needs_confirm": current != base_value and not expected_installed,
             "installed": bool(installed_value) or comfy_has_model(current, opts),
             "installed_value": installed_value,
             "options": opts,
-            "model_dir": model_folder_hint(cls, field, current),
-            "download": model_download_entry(current),
-            "download_status": public_download_status().get(current),
+            "model_dir": model_folder_hint(cls, field, base_value),
+            "model_roots": user_model_roots(),
+            "download_target": download_target,
+            "download": model_download_entry(download_target),
+            "download_status": public_download_status().get(download_target),
         })
     return {"ok": True, "fields": fields}
 
@@ -1490,7 +1528,7 @@ class H(BaseHTTPRequestHandler):
         if p == "/api/llm_model":
             model = (body.get("model") or "").strip()
             if not model:
-                return self._json({"ok": False, "err": "모델 이름이 비어 있어요"}, 400)
+                return self._json({"ok": False, "err": "model name is empty"}, 400)
             try:
                 cfg = read_config()
                 cfg["llm_model"] = model
@@ -1526,6 +1564,9 @@ class H(BaseHTTPRequestHandler):
                         return self._json({"ok": False, "err": "ComfyUI에 설치된 후보 모델이 없어요."}, 400)
                     if not comfy_has_model(value, options):
                         return self._json({"ok": False, "err": "설치된 모델만 선택할 수 있어요: " + value}, 400)
+                    expected = (match or {}).get("expected") or (match or {}).get("original") or ""
+                    if expected and value != expected and not (match or {}).get("expected_installed"):
+                        return self._json({"ok": False, "err": "Required model is still missing: %s" % expected}, 400)
                 cfg = read_config()
                 overrides = cfg.setdefault("model_overrides", {})
                 key = model_override_key(mode, node, field)
@@ -1850,32 +1891,35 @@ function saveLlmModel(){var sel=document.getElementById('llm'),model=sel.value;i
 function loadLoras(){fetch('/api/loras').then(function(r){return r.json()}).then(function(d){LORAS=d.loras||[];renderAssets()}).catch(function(){LORAS=[]})}
 function shortModelName(s){s=String(s||'');return s.length>42?'...'+s.slice(-39):s}
 function toggleModelPanel(){MODELPANEL=!MODELPANEL;loadModelFields()}
-function refreshModes(){MODE_STATUS={};fetch('/api/modes?force=1').then(function(r){return r.json()}).then(function(d){CUSTOMS=d.custom||[];MODE_STATUS=d.status||{};markModeOptions();modeChg()})}
+function refreshModes(){var keepPanel=MODELPANEL;MODE_STATUS={};fetch('/api/modes?force=1').then(function(r){return r.json()}).then(function(d){CUSTOMS=d.custom||[];MODE_STATUS=d.status||{};markModeOptions();modeChg();if(keepPanel){MODELPANEL=true;loadModelFields()}})}
 function downloadText(st){if(!st)return'';if(st.state==='done')return'다운로드 완료';if(st.state==='error')return'실패: '+(st.err||'');return'다운로드 '+(st.pct||0)+'%'}
-function startModelDownload(target){api('/api/download_model',{target:target}).then(function(r){return r.json()}).then(function(j){if(!j.ok){alert(j.err||j.msg||'다운로드 실패');return}document.getElementById('upinfo').textContent='모델 다운로드 시작: '+target;setTimeout(loadModelFields,700)})}
+function startModelDownload(target){MODELPANEL=true;api('/api/download_model',{target:target}).then(function(r){return r.json()}).then(function(j){if(!j.ok){alert(j.err||j.msg||'download failed');return}document.getElementById('upinfo').textContent='model download started: '+target;setTimeout(loadModelFields,700)})}
 function pollModelDownloads(){fetch('/api/model_downloads').then(function(r){return r.json()}).then(function(d){var active=false,done=false;Object.keys(d.downloads||{}).forEach(function(k){var st=d.downloads[k];if(st.state==='downloading')active=true;if(st.state==='done'&&!DOWNLOAD_SEEN[k]){DOWNLOAD_SEEN[k]=1;done=true}});if(active&&MODELPANEL)loadModelFields();if(done)refreshModes()}).catch(function(){})}
 function loadModelFields(){var m=document.getElementById('mode').value,box=document.getElementById('modelopts');if(!box)return;box.classList.remove('on');box.innerHTML='';
   fetch('/api/model_fields?mode='+encodeURIComponent(m)).then(function(r){return r.json()}).then(function(d){
     var fields=(d&&d.fields)||[];if(!fields.length){box.classList.remove('on');return}
     if(!MODELPANEL)return;
     box.classList.add('on');
-    box.innerHTML='<span class="ok pix">MODELS</span><button class="modelRefresh" onclick="refreshModes()">새로고침</button>';
+    box.innerHTML='<span class="ok pix">MODELS</span><button class="modelRefresh" onclick="refreshModes()">refresh</button>';
     fields.forEach(function(f){
-      var lab=document.createElement('label'),opts=f.options||[];
+      var lab=document.createElement('label'),opts=f.options||[],expected=f.expected||f.original||f.current||'',roots=(f.model_roots||[]).join(' | '),downloadTarget=f.download_target||expected;
       lab.textContent=(f.class||'Model')+' '+f.field+' ';
       if(!opts.length){
-        var msg=document.createElement('span');msg.className='hint bad';msg.textContent='ComfyUI에 모델 파일을 넣고 새로고침하세요: '+(f.current||f.original||'모델')+' → '+(f.model_dir||'ComfyUI/models');lab.appendChild(msg);
-        if(f.download){var db=document.createElement('button');db.className='modelRefresh';db.textContent=downloadText(f.download_status)||'다운로드';db.onclick=function(){startModelDownload(f.current)};lab.appendChild(db)}
+        var msg=document.createElement('span');msg.className='hint bad';msg.textContent='No model list from running ComfyUI. Put required model in a model root and refresh: '+expected+' / roots: '+(roots||f.model_dir||'models');lab.appendChild(msg);
+        if(f.download){var db=document.createElement('button');db.className='modelRefresh';db.textContent=downloadText(f.download_status)||'download';db.onclick=function(){startModelDownload(downloadTarget)};lab.appendChild(db)}
         box.appendChild(lab);return
       }
-      var sel=document.createElement('select');
-      if(!f.installed){var miss=document.createElement('option');miss.value='';miss.textContent='⚠ 미설치 — 선택 필요';miss.disabled=true;miss.selected=true;sel.appendChild(miss);sel.classList.add('warn')}
+      var sel=document.createElement('select'),needsRequired=(!f.expected_installed)||(f.substitute_needs_confirm);
+      if(needsRequired){var miss=document.createElement('option');miss.value='';miss.textContent='MISSING REQUIRED MODEL - download or refresh';miss.disabled=true;miss.selected=true;sel.appendChild(miss);sel.classList.add('warn')}
       opts.forEach(function(o){var op=document.createElement('option');op.value=o;op.textContent=shortModelName(o);sel.appendChild(op)});
-      if(f.installed)sel.value=f.installed_value||f.current;
-      sel.title='기대 파일: '+(f.current||f.original||'')+'\n폴더: '+(f.model_dir||'ComfyUI/models');
-      sel.onchange=function(){if(!sel.value)return;api('/api/model_override',{mode:m,node:f.node,field:f.field,value:sel.value}).then(function(r){return r.json()}).then(function(j){if(!j.ok)alert(j.err||'model save failed');else refreshModes()})};
-      lab.appendChild(sel);var hint=document.createElement('span');hint.className='hint';hint.textContent='기대: '+(f.current||f.original||'')+' · 폴더: '+(f.model_dir||'ComfyUI/models');lab.appendChild(hint);
-      if(!f.installed&&f.download){var db=document.createElement('button');db.className='modelRefresh';db.textContent=downloadText(f.download_status)||'다운로드';db.onclick=function(){startModelDownload(f.current)};lab.appendChild(db)}
+      if(f.installed&&!needsRequired)sel.value=f.installed_value||f.current;
+      sel.title='Required: '+expected+'\nCurrent: '+(f.current||'')+'\nModel roots: '+(roots||f.model_dir||'models');
+      sel.onchange=function(){if(!sel.value)return;MODELPANEL=true;api('/api/model_override',{mode:m,node:f.node,field:f.field,value:sel.value}).then(function(r){return r.json()}).then(function(j){if(!j.ok){alert(j.err||'model save failed');sel.value='';loadModelFields()}else{refreshModes()}})};
+      lab.appendChild(sel);
+      var hint=document.createElement('span');hint.className='hint'+(needsRequired?' bad':'');
+      hint.textContent='Required: '+expected+(f.current&&f.current!==expected?' / selected substitute: '+f.current:'')+' / model roots: '+(roots||f.model_dir||'models');
+      lab.appendChild(hint);
+      if(!f.expected_installed&&f.download){var db=document.createElement('button');db.className='modelRefresh';db.textContent=downloadText(f.download_status)||'download';db.onclick=function(){startModelDownload(downloadTarget)};lab.appendChild(db)}
       box.appendChild(lab)
     })
   }).catch(function(){box.classList.remove('on');box.innerHTML=''})
