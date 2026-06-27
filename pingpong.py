@@ -338,6 +338,9 @@ PHOTO_KB = {"keyboard": [["🎭 인물합성/편집", "🔀 페이스스왑"],
 def tg_send_file(kind, path, caption=""):
     method = {"photo": "sendPhoto", "video": "sendVideo", "audio": "sendAudio"}[kind]
     field  = kind
+    path = _resolve_existing_media_path(path)
+    if not os.path.isfile(path):
+        raise FileNotFoundError("generated file not found: %s (OUTDIR=%s)" % (path, OUTDIR))
     with open(path, "rb") as f:
         requests.post(f"{TG}/{method}", data={"chat_id": CHAT, "caption": caption[:1000]},
                       files={field: f}, timeout=300)
@@ -671,6 +674,7 @@ def comfy_run(wf, save_node):
             files += _files_from(node_out)
     if not files:
         raise RuntimeError("결과 파일을 찾지 못함")
+    files = [_resolve_existing_media_path(f) for f in files]
     write_comfy_progress("done", 100, "done", pid)
     return files
 
@@ -688,7 +692,13 @@ def _comfy_result_path(item):
     subfolder = str(item.get("subfolder") or "")
     folder_type = str(item.get("type") or item.get("folder_type") or "output").lower()
     if os.path.isabs(filename):
-        return filename
+        if os.path.exists(filename):
+            return filename
+        recovered = _resolve_existing_media_path(filename)
+        if os.path.exists(recovered):
+            return recovered
+        downloaded = _download_comfy_result(item)
+        return downloaded or recovered
     roots = []
     if folder_type == "input":
         roots.append(INPUTDIR)
@@ -713,9 +723,82 @@ def _comfy_result_path(item):
                     return os.path.join(cur, filename)
         except Exception:
             pass
-    return os.path.abspath(os.path.join(roots[0], subfolder, filename))
+    downloaded = _download_comfy_result(item)
+    return downloaded or os.path.abspath(os.path.join(roots[0], subfolder, filename))
 
 # ---------- 워크플로 주입 ----------
+def _resolve_existing_media_path(path):
+    path = os.path.abspath(str(path or ""))
+    if os.path.isfile(path):
+        return path
+    base = os.path.basename(path)
+    if not base:
+        return path
+    normalized = path.replace("\\", "/")
+    candidates = []
+    for marker, root in (("/output/", OUTDIR), ("/input/", INPUTDIR)):
+        idx = normalized.lower().rfind(marker)
+        if idx >= 0:
+            rel = normalized[idx + len(marker):]
+            candidates.append(os.path.join(root, *rel.split("/")))
+    for root in (OUTDIR, INPUTDIR):
+        candidates.append(os.path.join(root, base))
+        candidates.append(os.path.join(root, "pingpong", base))
+    seen = set()
+    for candidate in candidates:
+        candidate = os.path.abspath(candidate)
+        key = os.path.normcase(candidate)
+        if key in seen:
+            continue
+        seen.add(key)
+        if os.path.isfile(candidate):
+            log("media path recovered:", path, "->", candidate)
+            return candidate
+    for root in (OUTDIR, INPUTDIR):
+        try:
+            for cur, _, files in os.walk(root):
+                if base in files:
+                    found = os.path.join(cur, base)
+                    log("media path found by scan:", path, "->", found)
+                    return found
+        except Exception as e:
+            log("media path scan fail:", root, e)
+    return path
+
+def _download_comfy_result(item):
+    filename = str(item.get("filename") or "")
+    base = os.path.basename(filename)
+    if not base:
+        return None
+    subfolder = str(item.get("subfolder") or "")
+    folder_type = str(item.get("type") or item.get("folder_type") or "output").lower()
+    normalized = filename.replace("\\", "/")
+    idx = normalized.lower().rfind("/output/")
+    if idx >= 0:
+        rel = normalized[idx + len("/output/"):]
+        rel_dir = os.path.dirname(rel).replace("\\", "/")
+        if rel_dir and not subfolder:
+            subfolder = rel_dir
+    attempts = [
+        {"filename": base, "subfolder": subfolder, "type": folder_type},
+        {"filename": base, "subfolder": "pingpong", "type": "output"},
+        {"filename": base, "type": "output"},
+    ]
+    for params in attempts:
+        try:
+            r = requests.get(f"{COMFY}/view", params=params, timeout=60)
+            if r.status_code != 200 or not r.content:
+                continue
+            dest = os.path.join(OUTDIR, "pingpong", base)
+            os.makedirs(os.path.dirname(dest), exist_ok=True)
+            with open(dest, "wb") as f:
+                f.write(r.content)
+            log("downloaded comfy result:", params, "->", dest)
+            return dest
+        except Exception as e:
+            log("comfy view fallback fail:", params, e)
+    return None
+
 def load_wf(name):
     return json.load(open(os.path.join(HERE, "workflows", name), encoding="utf-8"))
 
