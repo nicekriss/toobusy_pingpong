@@ -922,6 +922,48 @@ def workflow_classes_and_models(path):
                 model_refs.append((str(node_id), str(cls or ""), str(field), v))
     return sorted(set(classes)), model_refs
 
+def optional_model_ref(mode, cls, field, value):
+    low = " ".join([str(cls or ""), str(field or ""), str(value or "")]).lower()
+    if "filename_prefix" in low:
+        return True
+    if mode == "image" and str(field or "").startswith("lora_") and not CFG.get("zit_lora", False):
+        return True
+    if "krea2_warmpastel" in low:
+        return True
+    if "zit_normal_girl" in low:
+        return True
+    return False
+
+def workflow_missing_models(mode, path, online, limit=12):
+    if not online or not path or not os.path.isfile(path):
+        return [], []
+    overrides = (read_config().get("model_overrides", {}) or {})
+    missing = []
+    need = []
+    try:
+        _, refs = workflow_classes_and_models(path)
+    except Exception:
+        return [], []
+    for node_id, cls, field, value in refs:
+        if optional_model_ref(mode, cls, field, value):
+            continue
+        base_value = value
+        check = BUILTIN_MODE_CHECKS.get(mode) or {}
+        cfg_model = (CFG.get("models") or {}).get(check.get("model_key"), "")
+        if cfg_model and cls == check.get("loader") and field == check.get("field"):
+            base_value = cfg_model
+        current = overrides.get(model_override_key(mode, node_id, field), base_value)
+        opts = comfy_input_options(comfy_node_info(cls), field)
+        if opts is None:
+            continue
+        need.append("모델: " + current)
+        if not comfy_has_model(current, opts):
+            missing.append("모델: " + current)
+            if len(missing) >= limit:
+                missing.append("...더 있음")
+                break
+    return sorted(set(need)), missing
+
 BUILTIN_MODE_CHECKS = {
     "image": {
         "label": "Z-Image Turbo",
@@ -970,24 +1012,10 @@ def builtin_mode_status(mode, online):
         need.append(node)
         if online and not comfy_node_info(node):
             missing.append("커스텀 노드: " + node)
-    expected = (CFG.get("models") or {}).get(check.get("model_key"), "")
-    overrides = (read_config().get("model_overrides", {}) or {})
     path = workflow_path_for_mode(mode)
-    if path and os.path.isfile(path) and check.get("loader") and check.get("field"):
-        try:
-            _, refs = workflow_classes_and_models(path)
-            for node_id, cls, field, value in refs:
-                if cls == check.get("loader") and field == check.get("field"):
-                    expected = overrides.get(model_override_key(mode, node_id, field), expected or value)
-                    break
-        except Exception:
-            pass
-    if expected:
-        need.append("모델: " + expected)
-        if online and check.get("loader") and check.get("field"):
-            opts = comfy_input_options(comfy_node_info(check["loader"]), check["field"])
-            if not comfy_has_model(expected, opts):
-                missing.append("모델: " + expected)
+    model_needs, model_missing = workflow_missing_models(mode, path, online)
+    need.extend(model_needs)
+    missing.extend(model_missing)
     return {
         "label": check.get("label", mode),
         "ready": not missing,
@@ -1021,6 +1049,8 @@ def custom_mode_status(name, spec, online):
                 break
     if len(missing) < 8:
         for node_id, cls, field, value in model_refs:
+            if optional_model_ref(mode, cls, field, value):
+                continue
             value = overrides.get(model_override_key(mode, node_id, field), value)
             info = comfy_node_info(cls)
             opts = comfy_input_options(info, field)
@@ -1143,7 +1173,12 @@ def model_fields_for_mode(mode):
             continue
         seen.add(key)
         opts = comfy_input_options(comfy_node_info(cls), field) or []
-        current = overrides.get(key, value)
+        base_value = value
+        check = BUILTIN_MODE_CHECKS.get(mode) or {}
+        cfg_model = (CFG.get("models") or {}).get(check.get("model_key"), "")
+        if cfg_model and cls == check.get("loader") and field == check.get("field"):
+            base_value = cfg_model
+        current = overrides.get(key, base_value)
         installed_value = next((o for o in opts if _norm_model(o) == _norm_model(current)), "")
         fields.append({
             "key": key,
