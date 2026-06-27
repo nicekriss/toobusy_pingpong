@@ -6,7 +6,7 @@
 - 숨김(복구 가능)/삭제(.trash 이동) 지원
 실행: python dashboard.py  (또는 대시보드.bat)
 """
-import os, sys, json, time, base64, re, mimetypes, threading, webbrowser, struct, zlib, subprocess, socket
+import os, sys, json, time, base64, re, mimetypes, threading, webbrowser, struct, zlib, subprocess, socket, shutil
 import urllib.request
 import urllib.parse
 import urllib.error
@@ -1274,10 +1274,30 @@ def save_dataurl(durl, idx):
         f.write(base64.b64decode(m.group(1)))
     return rel
 
+def copy_gallery_to_input(rel, idx, name="gallery"):
+    src = safe_path(rel)
+    if not src or not os.path.isfile(src):
+        return None
+    ext = os.path.splitext(src)[1] or ".png"
+    ts = time.strftime("%m%d_%H%M%S") + "_%d" % idx
+    safe_name = re.sub(r"[^A-Za-z0-9_.-]+", "_", os.path.splitext(name or "gallery")[0])[:40] or "gallery"
+    out_rel = "toobusy_reference_board/images/dash_%s_%s%s" % (ts, safe_name, ext)
+    dest = os.path.join(INPUTDIR, *out_rel.split("/"))
+    os.makedirs(os.path.dirname(dest), exist_ok=True)
+    shutil.copy2(src, dest)
+    return out_rel
+
+def save_reference_image_asset(meta, idx):
+    if isinstance(meta, dict) and meta.get("gallery_rel"):
+        return copy_gallery_to_input(meta.get("gallery_rel"), idx, meta.get("name") or "gallery")
+    data = meta.get("data") if isinstance(meta, dict) else meta
+    return save_dataurl(data, idx)
+
 def save_reference_assets(assets, imgs):
-    rels = [save_dataurl(d, i) for i, d in enumerate(imgs)]
-    rels = [r for r in rels if r]
     image_assets = [a for a in (assets or []) if isinstance(a, dict) and a.get("kind") == "image"]
+    srcs = image_assets if image_assets else list(imgs or [])
+    rels = [save_reference_image_asset(d, i) for i, d in enumerate(srcs)]
+    rels = [r for r in rels if r]
     out = []
     default_roles = ["character_a", "face_a", "background_a", "pose_a", "style_a", "prop_a"]
     passthrough = (
@@ -1382,8 +1402,12 @@ def save_director_asset(item, idx):
     return out
 
 def safe_path(rel):
-    full = os.path.normpath(os.path.join(GALLERY, rel))
-    if not full.startswith(os.path.normpath(GALLERY)):
+    root = os.path.abspath(GALLERY)
+    full = os.path.abspath(os.path.normpath(os.path.join(root, rel or "")))
+    try:
+        if os.path.commonpath([root, full]) != root:
+            return None
+    except ValueError:
         return None
     return full
 
@@ -1488,7 +1512,8 @@ class H(BaseHTTPRequestHandler):
             if isinstance(mode, str) and mode.startswith("custom:"):
                 spec = CUSTOM.get(mode.split(":", 1)[1], {}) or {}
                 need = len(spec.get("image_nodes", []))
-                if need and len(imgs) < need:
+                asset_images = [a for a in (assets or []) if isinstance(a, dict) and a.get("kind") == "image"]
+                if need and (len(imgs) + len(asset_images)) < need:
                     return self._json({"ok": False, "err": f"이 기능은 사진 {need}장이 필요해요"}, 400)
             ready_err = mode_generate_error(mode)
             if ready_err:
@@ -1513,8 +1538,10 @@ class H(BaseHTTPRequestHandler):
                 if mode == "video" and assets:
                     saved_assets = [save_director_asset(a, i) for i, a in enumerate(assets)]
                     job["director_assets"] = [a for a in saved_assets if a]
-                if isinstance(mode, str) and mode.startswith("custom:") and imgs:
-                    rels = [save_dataurl(d, i) for i, d in enumerate(imgs)]
+                if isinstance(mode, str) and mode.startswith("custom:") and (imgs or assets):
+                    asset_images = [a for a in (assets or []) if isinstance(a, dict) and a.get("kind") == "image"]
+                    srcs = asset_images if asset_images else list(imgs or [])
+                    rels = [save_reference_image_asset(d, i) for i, d in enumerate(srcs)]
                     job["image_refs"] = [r for r in rels if r]
                 enqueue(job)
             event(f"queued {mode}: {text[:80]}")
@@ -2270,7 +2297,8 @@ function gen(){var m=document.getElementById('mode').value,p=document.getElement
   if(m==='klein'&&imageData.length<1){alert('사진 1장을 첨부하세요');return}
   if(m==='faceswap'&&imageData.length<2){alert('사진 2장(몸→얼굴)을 첨부하세요');return}
   var custom=CUSTOMS.find(function(x){return x.mode===m});
-  if(custom&&custom.image_inputs&&imageData.length<custom.image_inputs){alert('이미지 '+custom.image_inputs+'장을 첨부하세요');return}
+  var assetImageCount=picked.filter(function(a){return a&&a.kind==='image'&&a.enabled!==false}).length;
+  if(custom&&custom.image_inputs&&(imageData.length+assetImageCount)<custom.image_inputs){alert('image ' + custom.image_inputs + ' required');return}
   saveGenOptions();
   api('/api/generate',{mode:m,text:t,images:imageData,assets:picked,settings:gatherSettings()}).then(function(r){return r.json()}).then(function(j){
     if(!j.ok){alert(j.err||'실패');return}
@@ -2283,7 +2311,7 @@ var boardDrop=document.getElementById('rphoto');
 if(boardDrop){
   boardDrop.addEventListener('dragover',function(e){var m=document.getElementById('mode').value,c=CUSTOMS.find(function(x){return x.mode===m});if(!needsReferenceBoard(m,c))return;e.preventDefault();boardDrop.classList.add('drag')});
   boardDrop.addEventListener('dragleave',function(){boardDrop.classList.remove('drag')});
-  boardDrop.addEventListener('drop',function(e){var m=document.getElementById('mode').value,c=CUSTOMS.find(function(x){return x.mode===m});if(!needsReferenceBoard(m,c))return;e.preventDefault();boardDrop.classList.remove('drag');addPickedFiles(Array.prototype.filter.call(e.dataTransfer.files||[],function(f){return f.type.indexOf('image/')===0||f.type.indexOf('audio/')===0}), '')});
+  boardDrop.addEventListener('drop',function(e){var m=document.getElementById('mode').value,c=CUSTOMS.find(function(x){return x.mode===m});if(!needsReferenceBoard(m,c))return;e.preventDefault();boardDrop.classList.remove('drag');var raw=e.dataTransfer.getData('application/x-pingpong-gallery');if(raw){var it;try{it=JSON.parse(raw)}catch(_){it=null}if(it&&it.kind==='image'){picked.push({kind:'image',name:it.name||'gallery image',data:it.url,gallery_rel:it.rel});renderAssets();return}if(it&&it.kind==='audio'){picked.push({kind:'audio',name:it.name||'audio',data:it.url,gallery_rel:it.rel});renderAssets();return}}addPickedFiles(Array.prototype.filter.call(e.dataTransfer.files||[],function(f){return f.type.indexOf('image/')===0||f.type.indexOf('audio/')===0}), '')});
 }
 ['track-main','track-audio'].forEach(function(id){var t=document.getElementById(id);if(!t)return;t.addEventListener('dragover',function(e){directorDragOver(t,e)});t.addEventListener('dragleave',function(){t.classList.remove('drop')});t.addEventListener('drop',function(e){directorDropAsset(t,e)})});
 
