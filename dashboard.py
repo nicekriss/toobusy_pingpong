@@ -9,6 +9,7 @@
 import os, sys, json, time, base64, re, mimetypes, threading, webbrowser, struct, zlib, subprocess, socket
 import urllib.request
 import urllib.parse
+import urllib.error
 import html as html_lib
 import xml.etree.ElementTree as ET
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -48,6 +49,7 @@ LORA_CACHE = {"t": 0, "data": []}
 MODE_STATUS_CACHE = {"t": 0, "data": {}}
 AUDIO_LYRICS_CACHE = {}
 MODEL_DOWNLOADS = {}
+DOWNLOAD_LOCK = threading.Lock()
 HIDDEN_SUBPROCESS_FLAGS = 0
 if os.name == "nt" and hasattr(subprocess, "CREATE_NO_WINDOW"):
     HIDDEN_SUBPROCESS_FLAGS = subprocess.CREATE_NO_WINDOW
@@ -110,6 +112,31 @@ def write_config(data):
     CUSTOM = CFG.get("custom_workflows", {}) or {}
     LMAPI = CFG.get("lmstudio_api", "http://127.0.0.1:1234").rstrip("/")
     MODE_STATUS_CACHE["t"] = 0
+
+def dashboard_key():
+    cfg = read_config()
+    key = (cfg.get("dashboard_key") or "").strip()
+    if key:
+        return key
+    key = base64.urlsafe_b64encode(os.urandom(18)).decode("ascii").rstrip("=")
+    cfg["dashboard_key"] = key
+    try:
+        write_config(cfg)
+    except Exception:
+        pass
+    return key
+
+def dashboard_public():
+    return BIND_HOST in ("0.0.0.0", "::", "")
+
+def needs_dashboard_key(path):
+    return dashboard_public() and path in {
+        "/api/delete",
+        "/api/model_override",
+        "/api/restart_dashboard",
+        "/api/interrupt",
+        "/api/download_model",
+    }
 
 def _add_model(out, seen, model_id, label=None, source=""):
     model_id = (model_id or "").strip()
@@ -775,7 +802,7 @@ DEFAULT_MODEL_DOWNLOADS = {
     "qwen3vl_8b_fp8_scaled.safetensors": {"repo": "Comfy-Org/Boogu-Image", "file": "text_encoders/qwen3vl_8b_fp8_scaled.safetensors", "folder": "text_encoders"},
     "ae.safetensors": {"repo": "Comfy-Org/z_image_turbo", "file": "split_files/vae/ae.safetensors", "folder": "vae"},
     "FLUX2\\flux-2-klein-9b-kv-fp8.safetensors": {"repo": "black-forest-labs/FLUX.2-klein-9b-kv-fp8", "file": "flux-2-klein-9b-kv-fp8.safetensors", "folder": "diffusion_models"},
-    "qwenLayerwiseForKlein9b_fp8FP32.safetensors": {"repo": "Comfy-Org/flux2-dev", "file": "split_files/text_encoders/mistral_3_small_flux2_fp8.safetensors", "folder": "text_encoders"},
+    "qwenLayerwiseForKlein9b_fp8FP32.safetensors": {"repo": "Comfy-Org/vae-text-encorder-for-flux-klein-9b", "file": "split_files/text_encoders/qwen_3_8b_fp8mixed.safetensors", "folder": "text_encoders"},
     "flux2DevFP8GGUF_flux2DevVAE.safetensors": {"repo": "Comfy-Org/flux2-dev", "file": "split_files/vae/flux2-vae.safetensors", "folder": "vae"},
     "gemma4_e4b_it_fp8_scaled.safetensors": {"repo": "Comfy-Org/gemma-4", "file": "text_encoders/gemma4_e4b_it_fp8_scaled.safetensors", "folder": "text_encoders"},
     "aceStepAudioGen_v15XLTurbo.safetensors": {"repo": "Comfy-Org/ACE-Step-v1-5", "file": "split_files/diffusion_models/aceStepAudioGen_v15XLTurbo.safetensors", "folder": "diffusion_models", "gated": True},
@@ -803,8 +830,6 @@ def model_download_entry(expected):
     downloads.update(CFG.get("model_downloads", {}) or {})
     direct = downloads.get(expected)
     if not direct:
-        direct = downloads.get(os.path.basename(str(expected).replace("\\", "/")))
-    if not direct:
         return None
     entry = dict(direct)
     entry["target"] = expected
@@ -819,14 +844,19 @@ def model_target_path(entry):
 def public_download_status():
     return {k: {kk: vv for kk, vv in v.items() if kk not in ("thread",)} for k, v in MODEL_DOWNLOADS.items()}
 
+def hf_token():
+    return CFG.get("hf_token") or os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_HUB_TOKEN")
+
 def download_model_worker(target, entry):
     task = MODEL_DOWNLOADS[target]
     try:
         full = model_target_path(entry)
         os.makedirs(os.path.dirname(full), exist_ok=True)
         tmp = full + ".part"
+        if os.path.exists(tmp):
+            os.remove(tmp)
         headers = {"User-Agent": "pingpong-dashboard/1.0"}
-        token = CFG.get("hf_token") or os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_HUB_TOKEN")
+        token = hf_token()
         if token:
             headers["Authorization"] = "Bearer " + str(token).strip()
         req = urllib.request.Request(entry["url"], headers=headers)
@@ -844,21 +874,27 @@ def download_model_worker(target, entry):
         task.update({"state": "done", "pct": 100, "path": full})
         MODE_STATUS_CACHE["t"] = 0
         LORA_CACHE["t"] = 0
+    except urllib.error.HTTPError as e:
+        if e.code in (401, 403):
+            task.update({"state": "error", "err": "HF 토큰이 필요한 모델이에요. config.json의 hf_token을 채우고 다시 받아주세요."})
+        else:
+            task.update({"state": "error", "err": "HTTP %d: %s" % (e.code, e.reason)})
     except Exception as e:
         task.update({"state": "error", "err": str(e)[:300]})
 
 def start_model_download(target):
-    entry = model_download_entry(target)
-    if not entry:
-        return False, "다운로드 링크가 등록되지 않은 모델이에요."
-    current = MODEL_DOWNLOADS.get(target)
-    if current and current.get("state") in ("downloading", "queued"):
-        return True, "이미 다운로드 중이에요."
-    task = {"state": "downloading", "target": target, "url": entry["url"], "done": 0, "total": 0, "pct": 0}
-    MODEL_DOWNLOADS[target] = task
-    th = threading.Thread(target=download_model_worker, args=(target, entry), daemon=True)
-    task["thread"] = th
-    th.start()
+    with DOWNLOAD_LOCK:
+        entry = model_download_entry(target)
+        if not entry:
+            return False, "다운로드 링크가 등록되지 않은 모델이에요."
+        current = MODEL_DOWNLOADS.get(target)
+        if current and current.get("state") in ("downloading", "queued"):
+            return True, "이미 다운로드 중이에요."
+        task = {"state": "downloading", "target": target, "url": entry["url"], "done": 0, "total": 0, "pct": 0}
+        MODEL_DOWNLOADS[target] = task
+        th = threading.Thread(target=download_model_worker, args=(target, entry), daemon=True)
+        task["thread"] = th
+        th.start()
     return True, "다운로드 시작"
 
 def workflow_classes_and_models(path):
@@ -1304,7 +1340,8 @@ class H(BaseHTTPRequestHandler):
         parsed = urllib.parse.urlparse(self.path)
         p = parsed.path
         if p == "/" or p == "/index.html":
-            b = PAGE.encode("utf-8")
+            page = PAGE.replace("__PP_KEY__", json.dumps(dashboard_key()))
+            b = page.encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.send_header("Content-Length", str(len(b)))
@@ -1350,6 +1387,11 @@ class H(BaseHTTPRequestHandler):
 
     def do_POST(self):
         p = urllib.parse.urlparse(self.path).path
+        if needs_dashboard_key(p):
+            parsed = urllib.parse.urlparse(self.path)
+            supplied = self.headers.get("X-PP-Key", "") or urllib.parse.parse_qs(parsed.query).get("k", [""])[0]
+            if supplied != dashboard_key():
+                return self._json({"ok": False, "err": "대시보드 보안 키가 필요해요. 페이지를 새로고침하세요."}, 403)
         try:
             body = self._body()
         except Exception:
@@ -1729,8 +1771,9 @@ body{margin:0;background:#0a0814;color:var(--ink);font-family:'VT323',monospace;
 </aside></div></div>
 <div class="lb" id="lb"><div class="lbtools"><button onclick="lbHide()">👁</button><button onclick="lbDel()">🗑</button><button onclick="closeLb()">✕</button></div><button class="nav prev" onclick="step(-1)">‹</button><img id="lbimg" onclick="toggleZoom()"><button class="nav next" onclick="step(1)">›</button><div class="lbcap" id="lbcap"></div></div>
 <script>
+var PP_KEY=__PP_KEY__;
 var IMGS=[],VIDS=[],AUDS=[],CUSTOMS=[],LORAS=[],BOARD_PRESETS=[],AUDDUR={},MODE_STATUS={},DOWNLOAD_SEEN={},SHUFFLE=false,MODELPANEL=false,DTDRAG=null,DTEDIT=-1,ai=0,cur=0,curAudioRel='',IMGKEY='',VIDKEY='',AUDKEY='',DURATION_FRAMES=120,IMGPAGE=1,IMGPAGES=1,IMGTOTAL=0,IMGPER=48;
-function api(p,b){return fetch(p,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b)})}
+function api(p,b){return fetch(p,{method:'POST',headers:{'Content-Type':'application/json','X-PP-Key':PP_KEY},body:JSON.stringify(b)})}
 function el(t,c){var e=document.createElement(t);if(c)e.className=c;return e}
 function esc(s){return String(s||'').replace(/[&<>"']/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]})}
 function openGallery(){api('/api/open_gallery',{}).then(function(r){return r.json()}).then(function(j){if(!j.ok)alert(j.err||'폴더를 열 수 없어요')})}
