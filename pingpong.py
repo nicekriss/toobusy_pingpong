@@ -853,6 +853,17 @@ def inject_custom(spec, prompt, image_refs=None, settings=None, mode_name=None):
     tag = tag_now()
     for node, field in spec.get("prompt_nodes", []):
         wf[str(node)]["inputs"][field] = prompt
+    for node, field in spec.get("timeline_prompt_nodes", []):
+        raw = wf[str(node)]["inputs"].get(field, "{}")
+        try:
+            data = json.loads(raw) if isinstance(raw, str) else dict(raw or {})
+        except Exception:
+            data = {}
+        data["global_prompt"] = prompt
+        wf[str(node)]["inputs"][field] = json.dumps(data, ensure_ascii=False)
+    negative_prompt = spec.get("negative_prompt", "")
+    for node, field in spec.get("negative_nodes", []):
+        wf[str(node)]["inputs"][field] = negative_prompt
     image_refs = image_refs or []
     for i, pair in enumerate(spec.get("image_nodes", [])):
         if i >= len(image_refs):
