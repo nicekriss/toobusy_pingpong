@@ -977,6 +977,11 @@ def model_ref_values(mode, node_id, cls, field, value, overrides=None):
     current = (overrides or {}).get(key, base_value)
     return key, base_value, current
 
+def model_need_label(base_value, current):
+    if current and current != base_value:
+        return "Model: %s (default: %s)" % (current, base_value)
+    return "Model: " + str(base_value)
+
 def workflow_missing_models(mode, path, online, limit=12):
     if not online or not path or not os.path.isfile(path):
         return [], []
@@ -996,7 +1001,7 @@ def workflow_missing_models(mode, path, online, limit=12):
             continue
         base_installed = comfy_has_model(base_value, opts)
         current_installed = comfy_has_model(current, opts)
-        need.append("Model: " + base_value)
+        need.append(model_need_label(base_value, current))
         if not current_installed:
             missing.append("Model: " + current)
         if len(missing) >= limit:
@@ -1095,7 +1100,7 @@ def custom_mode_status(name, spec, online):
             info = comfy_node_info(cls)
             opts = comfy_input_options(info, field)
             if opts is not None:
-                need.append("Model: " + base_value)
+                need.append(model_need_label(base_value, current))
                 base_installed = comfy_has_model(base_value, opts)
                 current_installed = comfy_has_model(current, opts)
                 if not current_installed:
