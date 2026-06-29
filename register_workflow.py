@@ -482,10 +482,13 @@ def main():
 
     WORKFLOWS.mkdir(exist_ok=True)
     dest = WORKFLOWS / src_path.name
-    if src_path.resolve() != dest.resolve():
+    copied = src_path.resolve() != dest.resolve()
+    if copied:
         if dest.exists() and not yes_no(f"이미 같은 이름의 파일이 있어요 ({dest.name}). 덮어쓸까요?", False):
             raise SystemExit("취소했어요.")
         shutil.copy2(src_path, dest)
+        print(f"📁 워크플로 파일을 'workflows' 폴더로 복사했어요 → {dest.name}")
+        print("   (앞으로 핑퐁은 이 폴더 안의 복사본을 사용해요)")
 
     default_name = safe_key(src_path.stem.replace("_API", "").replace("image_", ""))
     print("\n[1/3] 기본 정보  (모르면 엔터)")
@@ -604,6 +607,15 @@ def main():
     print("👉 대시보드를 새로고침(Ctrl+Shift+R)하면")
     print("   '⚔️ 모델비교' 목록과 봇 메뉴에 바로 떠요.")
     print("=" * 58)
+
+    if copied and src_path.exists():
+        print()
+        if yes_no("원본 파일(바깥에 있던 거)을 지울까요? — workflows 폴더에 이미 복사돼서 안 지워도 돼요", False):
+            try:
+                src_path.unlink()
+                print("🗑️  원본을 지웠어요.")
+            except Exception as e:
+                print(f"   (원본 삭제 실패: {e})")
 
 
 if __name__ == "__main__":

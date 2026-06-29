@@ -147,6 +147,7 @@ def needs_dashboard_key(path):
         "/api/interrupt",
         "/api/download_model",
         "/api/compare",
+        "/api/compare_score",
     }
 
 def _add_model(out, seen, model_id, label=None, source=""):
@@ -468,9 +469,10 @@ def media_meta(path):
             "generated": _clean_prompt(meta.get("generated", "")),
             "mode": meta.get("mode", ""),
             "note": str(meta.get("note", "") or "").strip(),
+            "orig": str(meta.get("orig", "") or "").strip(),
         }
     except Exception:
-        return {"request": "", "generated": "", "mode": "", "note": ""}
+        return {"request": "", "generated": "", "mode": "", "note": "", "orig": ""}
 
 def _decode_audio_text(enc, data):
     if not data:
@@ -748,18 +750,19 @@ def custom_modes():
     return out
 
 def compare_workflows():
-    """모델 대결에 쓸 수 있는 이미지 워크플로 목록(내장 ZIT + 등록된 이미지 커스텀, 입력사진 불필요한 것만)."""
-    out = [{"id": "zit", "label": "Z-Image Turbo", "builtin": True, "ratio": True}]
+    """모델 대결에 쓸 수 있는 이미지 워크플로 목록(내장 ZIT + 등록된 이미지 커스텀).
+    image_inputs>0 이면 편집형(입력 사진 필요) — 프론트에서 같은 종류끼리만 붙임."""
+    out = [{"id": "zit", "label": "Z-Image Turbo", "builtin": True, "ratio": True, "image_inputs": 0},
+           {"id": "klein", "label": "Flux2 Klein", "builtin": True, "ratio": False, "image_inputs": 1}]
     for name, spec in CUSTOM.items():
         if spec.get("type") != "image":
             continue
-        if spec.get("image_nodes"):
-            continue  # 입력 사진이 필요한 편집형은 대결에 부적합
         out.append({
             "id": "custom:" + name,
             "label": name,
             "builtin": False,
             "ratio": bool(spec.get("ratio_node") or spec.get("width_nodes")),
+            "image_inputs": len(spec.get("image_nodes", [])),
         })
     return out
 
@@ -817,6 +820,7 @@ def compare_history():
                         b_label = lab or b_label
         out.append({"tag": tag, "a_label": a_label or "A", "b_label": b_label or "B",
                     "count": len(cells), "images": images, "mtime": latest,
+                    "scored": os.path.isfile(os.path.join(SCORES_DIR, f"{tag}.json")),
                     "when": time.strftime("%m/%d %H:%M", time.localtime(latest)) if latest else tag})
     out.sort(key=lambda x: x["mtime"], reverse=True)
     return out
@@ -849,6 +853,36 @@ def compare_results(tag):
                 row["note"] = meta.get("note")
         rows.append(row)
     return {"ok": True, "tag": tag, "a_label": a_label or "A", "b_label": b_label or "B", "rows": rows}
+
+SCORES_DIR = os.path.join(HERE, "compare_scores")
+
+def compare_score_payload(tag):
+    """채점용: tag의 각 컷에서 A·B 둘 다 있는 것만 (절대경로+프롬프트+관전포인트)."""
+    cells = _compare_index().get(tag, {})
+    a_label = b_label = ""
+    items = []
+    for idx in sorted(cells.keys()):
+        sides = cells[idx]
+        fa, fb = sides.get("A"), sides.get("B")
+        if not (fa and fb):
+            continue
+        full_a, full_b = os.path.join(GALLERY, fa), os.path.join(GALLERY, fb)
+        ma = media_meta(full_a)
+        a_label = a_label or _compare_label_from_meta(ma)
+        b_label = b_label or _compare_label_from_meta(media_meta(full_b))
+        orig_rel = ma.get("orig", "")
+        orig_path = os.path.join(INPUTDIR, *orig_rel.split("/")) if orig_rel else ""
+        items.append({"i": idx, "a_path": full_a, "b_path": full_b,
+                      "prompt": ma.get("generated", ""), "note": ma.get("note", ""),
+                      "orig_path": orig_path if (orig_path and os.path.isfile(orig_path)) else ""})
+    return items, a_label or "A", b_label or "B"
+
+def read_compare_scores(tag):
+    path = os.path.join(SCORES_DIR, f"{tag}.json")
+    try:
+        return json.load(open(path, encoding="utf-8"))
+    except Exception:
+        return None
 
 def _norm_model(name):
     return str(name or "").replace("\\", "/").lower()
@@ -1575,6 +1609,10 @@ class H(BaseHTTPRequestHandler):
         elif p == "/api/compare_results":
             qs = urllib.parse.parse_qs(parsed.query)
             self._json(compare_results(qs.get("tag", [""])[0]))
+        elif p == "/api/compare_scores":
+            qs = urllib.parse.parse_qs(parsed.query)
+            sc = read_compare_scores(qs.get("tag", [""])[0])
+            self._json({"ok": True, "pending": sc is None, "scores": sc})
         elif p == "/api/list":
             qs = urllib.parse.parse_qs(parsed.query)
             self._json(scan(qs.get("page", ["1"])[0], qs.get("per", ["48"])[0]))
@@ -1672,9 +1710,20 @@ class H(BaseHTTPRequestHandler):
             b = (body.get("b") or "").strip()
             prompts = body.get("prompts") or ""
             settings = body.get("settings", {}) if isinstance(body.get("settings", {}), dict) else {}
-            valid = {w["id"] for w in compare_workflows()}
-            if a not in valid or b not in valid:
+            wfmap = {w["id"]: w for w in compare_workflows()}
+            if a not in wfmap or b not in wfmap:
                 return self._json({"ok": False, "err": "A/B 워크플로를 둘 다 골라주세요."}, 400)
+            need_a, need_b = wfmap[a].get("image_inputs", 0), wfmap[b].get("image_inputs", 0)
+            if (need_a > 0) != (need_b > 0):
+                return self._json({"ok": False, "err": "편집(사진입력) 워크플로끼리, 또는 t2i끼리만 대결할 수 있어요."}, 400)
+            need_img = max(need_a, need_b)
+            image_refs = []
+            if need_img:
+                imgs = body.get("images") or []
+                rels = [save_reference_image_asset(d, i) for i, d in enumerate(imgs)]
+                image_refs = [r for r in rels if r]
+                if len(image_refs) < need_img:
+                    return self._json({"ok": False, "err": f"이 편집 대결은 사진 {need_img}장이 필요해요."}, 400)
             random_mode = bool(body.get("random"))
             lines = [ln.strip() for ln in str(prompts).splitlines() if ln.strip()][:20]
             if random_mode:
@@ -1697,9 +1746,23 @@ class H(BaseHTTPRequestHandler):
             theme = str(body.get("theme") or "").strip()[:200]
             enqueue({"mode": "compare", "a": a, "b": b, "prompts": lines, "count": count,
                      "seed": seed, "tag": tag, "settings": settings,
-                     "enhance": enhance, "random": random_mode, "theme": theme})
-            event(f"queued compare: {a} vs {b} ({count}x, enhance={enhance}, random={random_mode}, theme={theme!r})")
+                     "enhance": enhance, "random": random_mode, "theme": theme,
+                     "image_refs": image_refs})
+            event(f"queued compare: {a} vs {b} ({count}x, edit={bool(image_refs)}, random={random_mode})")
             return self._json({"ok": True, "tag": tag, "count": count, "seed": seed})
+        if p == "/api/compare_score":
+            tag = (body.get("tag") or "").strip()
+            items, a_label, b_label = compare_score_payload(tag)
+            if not items:
+                return self._json({"ok": False, "err": "채점할 이미지(A·B 둘 다 있는 컷)가 없어요."}, 400)
+            # 새 채점을 위해 이전 결과 삭제
+            try:
+                os.remove(os.path.join(SCORES_DIR, f"{tag}.json"))
+            except OSError:
+                pass
+            enqueue({"mode": "score", "tag": tag, "items": items, "a_label": a_label, "b_label": b_label})
+            event(f"queued score: {tag} ({len(items)} cuts)")
+            return self._json({"ok": True, "tag": tag, "count": len(items)})
         if p == "/api/open_gallery":
             try:
                 os.makedirs(GALLERY, exist_ok=True)
@@ -1880,6 +1943,7 @@ body:before{content:"";position:fixed;inset:0;pointer-events:none;z-index:0;opac
 .histrow .hvs{flex:1;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-size:17px}
 .histrow .hvs .ca{color:var(--cyan)}.histrow .hvs .cb{color:var(--pink)}
 .histrow .hc{color:var(--mut);font-size:14px;white-space:nowrap}
+.histrow .hscored{color:var(--amb);font-size:13px;white-space:nowrap;border:1px solid rgba(255,209,102,.4);border-radius:5px;padding:1px 6px}
 .panel h3{margin:0 0 11px;font-size:11px;color:var(--pur)}
 textarea{width:100%;min-height:176px;background:#0a0814;border:1px solid var(--ln);color:var(--ink);border-radius:9px;font-family:'VT323';font-size:18px;line-height:1.4;padding:11px;resize:vertical}
 textarea:focus{outline:none;border-color:var(--cyan);box-shadow:0 0 0 2px rgba(86,225,255,.15)}
@@ -1903,6 +1967,9 @@ textarea:focus{outline:none;border-color:var(--cyan);box-shadow:0 0 0 2px rgba(8
 .rndb:hover:not(:disabled){background:rgba(255,209,102,.14)}.rndb:disabled{opacity:.4;cursor:default;filter:saturate(.3)}
 .err{display:none;margin-top:10px;color:var(--pink);font-size:16px}.err.on{display:block}
 .same{display:none;margin-top:8px;color:var(--amb);font-size:15px}.same.on{display:block}
+.editup{display:none;align-items:center;gap:10px;margin-bottom:11px;padding:9px 11px;border:1px solid var(--amb);border-radius:9px;background:rgba(255,209,102,.06);font-size:15px;color:var(--mut);flex-wrap:wrap}
+.editup.on{display:flex}
+.editprev img{height:46px;border-radius:6px;border:1px solid var(--ln);vertical-align:middle}
 .board{display:none;margin-top:20px}.board.on{display:block}
 .btool{position:sticky;top:0;z-index:5;display:flex;align-items:center;gap:14px;flex-wrap:wrap;
   padding:11px 13px;margin-bottom:6px;background:rgba(10,8,20,.94);border:1px solid var(--ln);border-radius:11px;backdrop-filter:blur(4px)}
@@ -1912,6 +1979,16 @@ textarea:focus{outline:none;border-color:var(--cyan);box-shadow:0 0 0 2px rgba(8
 .vtoggle{display:flex;gap:0;border:1px solid var(--ln);border-radius:8px;overflow:hidden}
 .vt{background:#0a0814;border:none;color:var(--mut);height:32px;padding:0 12px;font-family:'VT323';font-size:16px;cursor:pointer}
 .vt.on{background:var(--b2);color:var(--cyan)}
+.scoreb{background:var(--b2);border:1px solid var(--amb);color:var(--amb);border-radius:8px;height:32px;padding:0 12px;font-family:'VT323';font-size:16px;cursor:pointer}
+.scoreb:hover:not(:disabled){background:rgba(255,209,102,.14)}.scoreb:disabled{opacity:.5;cursor:default}
+.scorebar{display:none;margin:8px 0 0;padding:10px 12px;border:1px solid var(--amb);border-radius:10px;background:rgba(255,209,102,.07);text-align:center;font-family:'Press Start 2P';font-size:12px;line-height:1.6}
+.scorebar.on{display:block}
+.scorebar .ca{color:var(--cyan)}.scorebar .cb{color:var(--pink)}.scorebar .champ{color:var(--amb)}
+.verdict{display:none;margin:8px 0 0;padding:11px 14px;border:1px solid var(--pur);border-radius:10px;background:rgba(157,123,255,.08);color:var(--ink);font-size:16px;line-height:1.5}
+.verdict.on{display:block}
+.verdict b{color:var(--pur);font-family:'Press Start 2P';font-size:10px;display:block;margin-bottom:6px}
+.vcapscore{font-family:'VT323';font-size:18px;color:var(--ink);margin:6px 0}
+.vcapscore .ca{color:var(--cyan)}.vcapscore .cb{color:var(--pink)}
 .viewer{display:flex;align-items:center;gap:10px;margin-top:8px}
 .navarrow{flex:none;width:50px;height:90px;background:var(--b2);border:1px solid var(--ln);color:var(--amb);border-radius:10px;font-size:24px;cursor:pointer;font-family:'VT323'}
 .navarrow:hover{border-color:var(--amb);background:rgba(255,209,102,.1)}
@@ -1924,6 +2001,8 @@ textarea:focus{outline:none;border-color:var(--cyan);box-shadow:0 0 0 2px rgba(8
 .stage .partial,.stage .shim{max-width:560px;width:100%}
 .stage .partial img{max-height:calc(100vh - 250px);width:100%;object-fit:contain}
 .vcap{text-align:center;margin-top:12px;padding:0 8px}
+.vcapvs{font-family:'Press Start 2P';font-size:12px;margin-bottom:8px}
+.vcapvs .ca{color:var(--cyan)}.vcapvs .cb{color:var(--pink)}
 .vcaphead{font-family:'Press Start 2P';font-size:11px;color:var(--amb)}
 .vcaphead .vint{color:var(--amb)}
 .vcappr{color:var(--mut);font-size:16px;margin-top:8px;line-height:1.35;max-width:900px;margin-left:auto;margin-right:auto}
@@ -1986,6 +2065,11 @@ textarea:focus{outline:none;border-color:var(--cyan);box-shadow:0 0 0 2px rgba(8
 </div>
 <div class="panel">
   <h3>⚙ 대결 설정</h3>
+  <div class="editup" id="editup">📷 편집할 원본(얼굴) 이미지 →
+    <button class="minib" onclick="document.getElementById('editfile').click()">사진 선택</button>
+    <input type="file" id="editfile" accept="image/*" style="display:none" onchange="pickEditImg(event)">
+    <span id="editprev" class="editprev"></span>
+  </div>
   <textarea id="prompts" placeholder="프롬프트를 한 줄에 하나씩 (줄 수 = 생성 장수). 예:&#10;a neon-lit cyberpunk alley at night, rain&#10;a cozy cabin in a snowy pine forest, golden hour&#10;a majestic dragon perched on a cliff, epic"></textarea>
   <div class="row">
     <span class="cnt" id="cnt">0줄 · 양쪽 0장</span>
@@ -2015,7 +2099,10 @@ textarea:focus{outline:none;border-color:var(--cyan);box-shadow:0 0 0 2px rgba(8
       <button class="vt on" id="vtSlider" onclick="setView('slider')">🔀 슬라이더</button>
       <button class="vt" id="vtSbs" onclick="setView('sbs')">⬌ 나란히</button>
     </div>
+    <button class="scoreb" id="scoreb" onclick="scoreBattle()">🏆 채점</button>
   </div>
+  <div class="scorebar" id="scorebar"></div>
+  <div class="verdict" id="verdict"></div>
   <div class="viewer">
     <button class="navarrow" onclick="nav(-1)" aria-label="이전">◁</button>
     <div class="stage" id="stage"></div>
@@ -2028,7 +2115,7 @@ textarea:focus{outline:none;border-color:var(--cyan);box-shadow:0 0 0 2px rgba(8
 <div class="lb" id="lb"><button class="lbclose" onclick="closeFS()">✕</button><div id="fsbody"></div><div class="lbhint">마우스를 좌우로 움직여 와이프 비교 · ESC 닫기</div></div>
 <script>
 var PPKEY=__PP_KEY__;
-var WFS=[],selA='',selB='',TAG='',PROMPTS=[],LA='A',LB='B',poller=null,VIEW='slider',R={},SIG={},CUR=1;
+var WFS=[],selA='',selB='',TAG='',PROMPTS=[],LA='A',LB='B',poller=null,VIEW='slider',R={},SIG={},CUR=1,SCORES={},scorePoller=null,EDITIMG=[];
 function H(s){return String(s==null?'':s).replace(/[&<>"]/g,function(c){return{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]})}
 function A(s){return String(s==null?'':s).replace(/'/g,"\\'").replace(/"/g,'&quot;')}
 function api(p,o){o=o||{};o.headers=Object.assign({'Content-Type':'application/json','X-PP-Key':PPKEY},o.headers||{});return fetch(p,o).then(function(r){return r.json()})}
@@ -2043,11 +2130,15 @@ function renderWf(elid,side){
   var box=document.getElementById(elid),sel=side==='A'?selA:selB;
   box.innerHTML=WFS.map(function(w){
     var on=w.id===sel?' sel':'';
+    var em=(w.image_inputs>0)?'<span class="tag" style="color:var(--amb)">📷편집</span>':'';
     return '<div class="wfopt'+on+'" data-id="'+H(w.id)+'" onclick="pick(\''+side+'\',this.getAttribute(\'data-id\'))">'+
-      '<span class="pickmark">'+(side==='A'?'🅰':'🅱')+'</span>'+H(w.label)+
+      '<span class="pickmark">'+(side==='A'?'🅰':'🅱')+'</span>'+H(w.label)+em+
       '<span class="tag">'+(w.builtin?'BUILT-IN':'CUSTOM')+'</span></div>'
   }).join('')
 }
+function wfImgInputs(id){var w=WFS.filter(function(x){return x.id===id})[0];return w?(w.image_inputs||0):0}
+function editModeOn(){return selA&&selB&&wfImgInputs(selA)>0&&wfImgInputs(selB)>0}
+function needImgs(){return Math.max(wfImgInputs(selA),wfImgInputs(selB))}
 function pick(side,id){
   if(side==='A')selA=id;else selB=id;
   renderWf('wfA','A');renderWf('wfB','B');
@@ -2055,16 +2146,29 @@ function pick(side,id){
   document.getElementById('selBname').textContent=selB?'· '+labelOf(selB):'';
   document.getElementById('sideA').classList.toggle('has',!!selA);
   document.getElementById('sideB').classList.toggle('has',!!selB);
-  document.getElementById('same').classList.toggle('on',!!selA&&selA===selB);
   refresh();
+}
+function pickEditImg(e){
+  var f=e.target.files&&e.target.files[0];if(!f)return;
+  var rd=new FileReader();
+  rd.onload=function(){EDITIMG=[rd.result];document.getElementById('editprev').innerHTML='<img src="'+rd.result+'"> 준비됨';refresh()};
+  rd.readAsDataURL(f);
 }
 function lines(){return document.getElementById('prompts').value.split(/\r?\n/).map(function(s){return s.trim()}).filter(Boolean).slice(0,20)}
 function refresh(){
   var n=lines().length;
   var enh=document.getElementById('enhance')&&document.getElementById('enhance').checked;
-  document.getElementById('cnt').textContent=(enh?('키워드 '+n+'개 (LLM 확장)'):(n+'줄'))+' · 양쪽 '+(n*2)+'장';
-  document.getElementById('startb').disabled=!(selA&&selB&&n>0);
-  var rb=document.getElementById('rndb');if(rb)rb.disabled=!(selA&&selB);
+  var em=editModeOn();
+  var mixed=selA&&selB&&((wfImgInputs(selA)>0)!=(wfImgInputs(selB)>0));
+  document.getElementById('editup').classList.toggle('on',em);
+  var sameEl=document.getElementById('same');
+  if(mixed){sameEl.textContent='⚠ 편집(📷)·t2i 는 서로 못 붙여요. 같은 종류끼리 골라주세요.';sameEl.classList.add('on');}
+  else if(selA&&selA===selB){sameEl.textContent='⚠ 같은 워크플로끼리 골랐어요 — 시드/설정 테스트용으로는 괜찮아요.';sameEl.classList.add('on');}
+  else sameEl.classList.remove('on');
+  document.getElementById('cnt').textContent=(em?'편집 ':'')+(enh?('키워드 '+n+'개 (LLM 확장)'):(n+'줄'))+' · 양쪽 '+(n*2)+'장';
+  var imgOk=!em||EDITIMG.length>=needImgs();
+  document.getElementById('startb').disabled=!(selA&&selB&&n>0&&!mixed&&imgOk);
+  var rb=document.getElementById('rndb');if(rb)rb.disabled=!(selA&&selB&&!mixed&&imgOk);
 }
 function randSeed(){document.getElementById('seed').value=Math.floor(Math.random()*1e9)}
 function labelOf(id){var w=WFS.filter(function(x){return x.id===id})[0];return w?w.label:id}
@@ -2076,10 +2180,11 @@ function start(){
     enhance:document.getElementById('enhance').checked,
     settings:{image_ratio:document.getElementById('ratio').value,image_megapixels:parseFloat(document.getElementById('mp').value)||1,
       zit_upscale:document.getElementById('zup').checked}};
+  if(editModeOn())body.images=EDITIMG;
   document.getElementById('startb').disabled=true;
   api('/api/compare',{method:'POST',body:JSON.stringify(body)}).then(function(d){
     if(!d.ok){showErr(d.err||'요청 실패');document.getElementById('startb').disabled=false;return}
-    TAG=d.tag;PROMPTS=P;LA=labelOf(selA);LB=labelOf(selB);R={};SIG={};
+    TAG=d.tag;PROMPTS=P;LA=labelOf(selA);LB=labelOf(selB);R={};SIG={};resetScores();
     buildBoard(P.length);document.getElementById('board').classList.add('on');
     document.getElementById('board').scrollIntoView({behavior:'smooth',block:'start'});
     refresh();if(poller)clearInterval(poller);poller=setInterval(poll,3000);poll();
@@ -2092,11 +2197,12 @@ function startRandom(){
   var body={a:selA,b:selB,random:true,count:cnt,theme:document.getElementById('rtheme').value||'',seed:parseInt(document.getElementById('seed').value)||42,
     settings:{image_ratio:document.getElementById('ratio').value,image_megapixels:parseFloat(document.getElementById('mp').value)||1,
       zit_upscale:document.getElementById('zup').checked}};
+  if(editModeOn())body.images=EDITIMG;
   document.getElementById('rndb').disabled=true;
   api('/api/compare',{method:'POST',body:JSON.stringify(body)}).then(function(d){
     if(!d.ok){showErr(d.err||'요청 실패');refresh();return}
     TAG=d.tag;PROMPTS=[];for(var i=0;i<d.count;i++)PROMPTS.push('');
-    LA=labelOf(selA);LB=labelOf(selB);R={};SIG={};
+    LA=labelOf(selA);LB=labelOf(selB);R={};SIG={};resetScores();
     buildBoard(d.count);document.getElementById('board').classList.add('on');
     document.getElementById('board').scrollIntoView({behavior:'smooth',block:'start'});
     refresh();if(poller)clearInterval(poller);poller=setInterval(poll,3000);poll();
@@ -2133,7 +2239,15 @@ function renderViewer(){
     stage.innerHTML='<div class="shim">생성 대기중…</div>';
   }
   var pr=PROMPTS[CUR-1]||r.prompt||'',note=r.note||'';
-  document.getElementById('vcap').innerHTML='<div class="vcaphead">#'+CUR+' / '+n+(note?'  ·  <span class="vint">👁 '+H(note)+'</span>':'')+'</div>'+
+  var sc=SCORES[CUR],scHtml='';
+  if(sc){
+    var w=sc.winner==='A'?'🏆🅰':sc.winner==='B'?'🏆🅱':'🤝 무승부';
+    scHtml='<div class="vcapscore">🅰 <span class="ca">'+sc.a+'</span> : <span class="cb">'+sc.b+'</span> 🅱  ·  '+w+(sc.reason?'  ·  '+H(sc.reason):'')+'</div>';
+  }
+  document.getElementById('vcap').innerHTML=
+    '<div class="vcapvs"><span class="ca">🅰 '+H(LA||'A')+'</span>  vs  <span class="cb">🅱 '+H(LB||'B')+'</span></div>'+
+    '<div class="vcaphead">#'+CUR+' / '+n+(note?'  ·  <span class="vint">👁 '+H(note)+'</span>':'')+'</div>'+
+    scHtml+
     (pr?'<div class="vcappr">'+H(pr)+'</div>':'');
   var ts=document.querySelectorAll('.thumb');for(var k=0;k<ts.length;k++)ts[k].classList.toggle('on',k+1===CUR);
 }
@@ -2196,6 +2310,42 @@ function fsCmp(i){var r=R[i]||{};if(!r.a||!r.b)return;
 function fsImg(u){document.getElementById('fsbody').innerHTML='<img src="'+H(u)+'" style="max-width:96vw;max-height:86vh;border-radius:8px;border:2px solid var(--pink)">';
   document.getElementById('lb').classList.add('on')}
 function closeFS(){document.getElementById('lb').classList.remove('on');document.getElementById('fsbody').innerHTML=''}
+function resetScores(){
+  SCORES={};if(scorePoller){clearInterval(scorePoller);scorePoller=null}
+  var sb=document.getElementById('scorebar');if(sb)sb.classList.remove('on');
+  var vd=document.getElementById('verdict');if(vd){vd.classList.remove('on');vd.innerHTML=''}
+  var btn=document.getElementById('scoreb');if(btn){btn.disabled=false;btn.textContent='🏆 채점'}
+}
+function scoreBattle(){
+  if(!TAG)return;
+  var btn=document.getElementById('scoreb');btn.disabled=true;btn.textContent='🏆 채점 중...';
+  var sb=document.getElementById('scorebar');sb.classList.add('on');sb.innerHTML='심판 모델(gemma)이 평가 중... 잠깐 걸려요';
+  api('/api/compare_score',{method:'POST',body:JSON.stringify({tag:TAG})}).then(function(d){
+    if(!d.ok){showErr(d.err||'채점 실패');btn.disabled=false;btn.textContent='🏆 채점';sb.classList.remove('on');return}
+    if(scorePoller)clearInterval(scorePoller);
+    var myTag=TAG;scorePoller=setInterval(function(){pollScores(myTag)},3000);pollScores(myTag);
+  })
+}
+function pollScores(tag){
+  api('/api/compare_scores?tag='+encodeURIComponent(tag)).then(function(d){
+    if(tag!==TAG){if(scorePoller){clearInterval(scorePoller);scorePoller=null}return}
+    if(d.pending||!d.scores)return;
+    if(scorePoller){clearInterval(scorePoller);scorePoller=null}
+    applyScores(d.scores);
+  })
+}
+function applyScores(sc){
+  SCORES={};var rs=sc.results||{};for(var k in rs)SCORES[parseInt(k,10)]=rs[k];
+  var btn=document.getElementById('scoreb');btn.disabled=false;btn.textContent='🏆 재채점';
+  var champ=sc.overall==='A'?('🅰 '+H(sc.a_label)):sc.overall==='B'?('🅱 '+H(sc.b_label)):'무승부';
+  document.getElementById('scorebar').innerHTML=
+    '🏆 최종  <span class="ca">🅰 '+sc.a_wins+'승</span> : <span class="cb">'+sc.b_wins+'승 🅱</span>'+(sc.ties?'  (무 '+sc.ties+')':'')+
+    '  ·  평균 <span class="ca">'+sc.a_avg+'</span> : <span class="cb">'+sc.b_avg+'</span>  ·  <span class="champ">'+champ+'</span>';
+  var vd=document.getElementById('verdict');
+  if(sc.verdict){vd.innerHTML='<b>🎙️ 심판 총평</b>'+H(sc.verdict);vd.classList.add('on')}
+  else vd.classList.remove('on');
+  renderViewer();
+}
 function loadHistoryList(){
   var el=document.getElementById('histlist');
   api('/api/compare_history').then(function(d){
@@ -2205,6 +2355,7 @@ function loadHistoryList(){
       return '<div class="histrow" onclick="openHistory(\''+H(x.tag)+'\')">'+
         '<span class="ht">'+H(x.when)+'</span>'+
         '<span class="hvs"><span class="ca">🅰 '+H(x.a_label)+'</span> vs <span class="cb">🅱 '+H(x.b_label)+'</span></span>'+
+        (x.scored?'<span class="hscored">🏆 채점됨</span>':'')+
         '<span class="hc">'+x.count+'컷 · '+x.images+'장</span></div>'
     }).join('')
   })
@@ -2214,7 +2365,7 @@ function openHistory(tag){
   api('/api/compare_results?tag='+encodeURIComponent(tag)).then(function(d){
     if(!d.ok){showErr(d.err||'불러오기 실패');return}
     if(poller){clearInterval(poller);poller=null}
-    TAG=tag;LA=d.a_label||'A';LB=d.b_label||'B';R={};SIG={};PROMPTS=[];
+    TAG=tag;LA=d.a_label||'A';LB=d.b_label||'B';R={};SIG={};PROMPTS=[];resetScores();
     var rows=d.rows||[];
     rows.forEach(function(r,idx){var i=idx+1;R[i]={a:r.a,b:r.b,prompt:r.prompt,note:r.note};PROMPTS.push(r.prompt||'')});
     CUR=1;renderThumbs();renderViewer();
@@ -2222,6 +2373,7 @@ function openHistory(tag){
     document.getElementById('prog').style.width='100%';
     document.getElementById('progtxt').textContent='📜 불러옴 · '+(rows.length*2)+'장';
     window.scrollTo({top:0,behavior:'smooth'});
+    api('/api/compare_scores?tag='+encodeURIComponent(tag)).then(function(s){if(s&&s.scores&&tag===TAG)applyScores(s.scores)});
   })
 }
 document.getElementById('lb').addEventListener('click',function(e){if(e.target===this)closeFS()});

@@ -175,6 +175,8 @@ def run_job(job):
         do_image_direct(txt, job.get("request") or txt, settings)
     elif m == "compare":
         do_compare(job)
+    elif m == "score":
+        do_score(job)
     elif m in ("image", "video", "song"):
         do_text(m, txt or "a creative, beautiful scene", job.get("director_assets") or [], settings)
     elif m == "klein_board":
@@ -554,13 +556,18 @@ def _parse_prompt_intent(out):
             items.append({"prompt": p, "intent": it})
     return items
 
-def llm_compare_prompts(model_id, keywords):
-    """키워드 리스트 → [{'prompt','intent'}] (같은 길이/순서, 1:1 매핑)."""
+def llm_compare_prompts(model_id, keywords, edit=False):
+    """키워드 리스트 → [{'prompt','intent'}] (같은 길이/순서, 1:1 매핑). edit=True면 편집 지시로 확장."""
     n = len(keywords)
     numbered = "\n".join(f"{i + 1}. {k}" for i, k in enumerate(keywords))
-    out = _chat(model_id, COMPARE_PROMPT_SYS,
-                f"Expand these {n} keywords into exactly {n} objects as a JSON array, same order:\n{numbered}",
-                max_tokens=2800, temp=0.85)
+    if edit:
+        out = _chat(model_id, EDIT_SYS,
+                    f"Convert these {n} keywords into exactly {n} EDIT instructions as a JSON array, same order:\n{numbered}",
+                    max_tokens=2800, temp=0.85)
+    else:
+        out = _chat(model_id, COMPARE_PROMPT_SYS,
+                    f"Expand these {n} keywords into exactly {n} objects as a JSON array, same order:\n{numbered}",
+                    max_tokens=2800, temp=0.85)
     items = _parse_prompt_intent(out)
     if len(items) == n:
         return items
@@ -573,10 +580,33 @@ def llm_compare_prompts(model_id, keywords):
             fixed.append({"prompt": k, "intent": k})
     return fixed
 
-def llm_random_prompts(model_id, count, theme=""):
-    """입력 없이 다양한 무작위 프롬프트 count개 생성. theme이 있으면 그 주제 안에서 다양하게."""
+EDIT_SYS = (
+    "You write EDIT instructions to apply to ONE existing portrait/subject (for testing image-edit models). "
+    "Each instruction changes ONE aspect while KEEPING THE SAME PERSON'S identity and face. "
+    "Useful aspects: outfit/clothing, art style, camera angle & shot type, pose/action, lighting, "
+    "background/scene, facial expression, season/time of day, hairstyle, age. "
+    'Return ONLY a JSON array of objects: {"prompt": <one concise English edit instruction, imperative, same person>, '
+    '"intent": <짧은 한국어 — 무엇을 바꾸는 테스트인지, 예: "의상 변경 시 얼굴 유지", "로우앵글에서 정체성 유지">}. '
+    "No markdown, no extra text."
+)
+
+def llm_random_prompts(model_id, count, theme="", edit=False):
+    """무작위 프롬프트 count개 생성. edit=True면 '같은 사람 유지 + 한 가지만 바꾸는' 편집 지시로."""
     count = max(1, min(20, int(count or 10)))
     theme = (theme or "").strip()
+    if edit:
+        if theme:
+            user = (f'Generate exactly {count} diverse EDIT instructions as a JSON array, themed around "{theme}", '
+                    f'changing a different aspect each time while keeping the same person.')
+        else:
+            user = (f"Generate exactly {count} diverse EDIT instructions as a JSON array, each changing a DIFFERENT aspect "
+                    f"(outfit, art style, camera angle, pose, lighting, background, expression, season, hairstyle), same person.")
+        out = _chat(model_id, EDIT_SYS, user, max_tokens=2800, temp=1.0)
+        items = _parse_prompt_intent(out)[:count]
+        while len(items) < count:
+            items.append({"prompt": (f"change the {theme}" if theme else "change the outfit and background") + ", keep the same person and face",
+                          "intent": (theme or "편집") + " 변경 시 얼굴 유지"})
+        return items[:count]
     if theme:
         user = (f'Generate exactly {count} image prompts as a JSON array, ALL on the theme: "{theme}". '
                 f'Keep every prompt clearly about "{theme}", but vary the angle, setting, mood, lighting, '
@@ -610,12 +640,13 @@ def fanout_image_jobs(body, count, settings=None):
         enqueue_job({"mode": "image_direct", "text": prompt, "request": body, "settings": settings or {}, "source": "fanout", "idx": i, "total": count})
     tg_send("📦▸ 독립 이미지 큐 " + str(len(prompts)) + "개 추가 완료\n" + "\n".join(f"{i}. {p[:80]}" for i, p in enumerate(prompts, 1)))
 
-def write_generation_meta(files, mode, request_text="", generated_prompt="", note=""):
+def write_generation_meta(files, mode, request_text="", generated_prompt="", note="", orig=""):
     meta = {
         "mode": mode,
         "request": request_text or "",
         "generated": generated_prompt or "",
         "note": note or "",
+        "orig": orig or "",
         "time": time.strftime("%Y-%m-%d %H:%M:%S"),
     }
     for path in files or []:
@@ -1052,6 +1083,8 @@ def compare_kb():
 def _compare_label(wf_id):
     if wf_id == "zit":
         return "Z-Image Turbo"
+    if wf_id == "klein":
+        return "Flux2 Klein"
     name = wf_id.split(":", 1)[1] if wf_id.startswith("custom:") else wf_id
     try:
         name, _ = resolve_custom_workflow(name)
@@ -1059,8 +1092,9 @@ def _compare_label(wf_id):
         pass
     return name
 
-def _compare_build(wf_id, prompt, seed, settings, prefix):
-    """A/B 양쪽 워크플로를 같은 시드/해상도로 주입. 등록된 이미지 워크플로 + 내장 ZIT 지원."""
+def _compare_build(wf_id, prompt, seed, settings, prefix, image_refs=None):
+    """A/B 양쪽 워크플로를 같은 시드/해상도로 주입. 등록된 이미지 워크플로 + 내장 ZIT 지원.
+    image_refs가 있으면 편집 대결(같은 입력 사진을 양쪽에 주입)."""
     if wf_id == "zit":
         wf, out = inject_zit(prompt, settings)
         for n in ("1", "4"):
@@ -1071,13 +1105,24 @@ def _compare_build(wf_id, prompt, seed, settings, prefix):
         if "5" in wf:
             wf["5"]["inputs"]["filename_prefix"] = prefix + "_UPS"
         return wf, out
+    if wf_id == "klein":
+        if not (image_refs or []):
+            raise RuntimeError("Flux2 Klein 은 입력 사진(얼굴)이 필요해요")
+        wf, out = inject_klein(image_refs[0], prompt)
+        for n in ("2", "3"):
+            if n in wf and isinstance(wf[n].get("inputs"), dict) and "seed" in wf[n]["inputs"]:
+                wf[n]["inputs"]["seed"] = seed
+        if "4" in wf:
+            wf["4"]["inputs"]["filename_prefix"] = prefix
+        return wf, str(out)
     name = wf_id.split(":", 1)[1] if wf_id.startswith("custom:") else wf_id
     name, spec = resolve_custom_workflow(name)
     if spec.get("type") != "image":
         raise RuntimeError(f"{name} 은(는) 이미지 워크플로가 아니라 비교에 쓸 수 없어요")
-    if spec.get("image_nodes"):
-        raise RuntimeError(f"{name} 은(는) 입력 사진이 필요한 워크플로라 비교 대결엔 안 맞아요")
-    wf, out = inject_custom(spec, prompt, None, settings, "custom:" + name)
+    need_img = len(spec.get("image_nodes", []))
+    if need_img and len(image_refs or []) < need_img:
+        raise RuntimeError(f"{name} 은(는) 입력 사진 {need_img}장이 필요해요")
+    wf, out = inject_custom(spec, prompt, image_refs or None, settings, "custom:" + name)
     # 같은 시드 고정(inject_custom은 매번 랜덤 시드를 넣으므로 덮어씀)
     for node, field in spec.get("seed_nodes", []):
         wf[str(node)]["inputs"][field] = seed
@@ -1094,6 +1139,8 @@ def do_compare(job):
         seed = int(job.get("seed"))
     except (TypeError, ValueError):
         seed = rseed()
+    image_refs = job.get("image_refs") or []
+    is_edit = bool(image_refs)
     raw = job.get("prompts")
     lines = raw.splitlines() if isinstance(raw, str) else list(raw or [])
     prompts = [p.strip() for p in lines if p and p.strip()][:20]
@@ -1104,11 +1151,12 @@ def do_compare(job):
     if is_random:
         count = max(1, min(20, int(job.get("count") or 10)))
         theme = (job.get("theme") or "").strip()
-        tg_send(f"🎲▸ {'[' + theme + '] ' if theme else ''}무작위 프롬프트 {count}개 생성 중...")
+        kind_msg = "편집 지시" if is_edit else "프롬프트"
+        tg_send(f"🎲▸ {'[' + theme + '] ' if theme else ''}무작위 {kind_msg} {count}개 생성 중...")
         comfy_free()
         mid = llm_up()
         try:
-            items = llm_random_prompts(mid, count, theme)
+            items = llm_random_prompts(mid, count, theme, edit=is_edit)
             prompts = [it["prompt"] for it in items]
             intents = [it["intent"] for it in items]
         except Exception as e:
@@ -1127,7 +1175,7 @@ def do_compare(job):
         comfy_free()
         mid = llm_up()
         try:
-            items = llm_compare_prompts(mid, prompts)
+            items = llm_compare_prompts(mid, prompts, edit=is_edit)
             prompts = [it["prompt"] for it in items]
             intents = [it["intent"] for it in items]
         except Exception as e:
@@ -1137,8 +1185,10 @@ def do_compare(job):
             llm_down()
         tg_send("✅ 확장 완료:\n" + "\n".join(
             f"{i}. {p[:80]}" + (f"  · 👁 {intents[i-1]}" if i - 1 < len(intents) and intents[i-1] else "") for i, p in enumerate(prompts, 1)))
+    orig_rel = image_refs[0] if image_refs else ""
     la, lb = _compare_label(a), _compare_label(b)
-    tg_send(f"⚔️ 모델 대결 시작!\nA ▸ {la}\nB ▸ {lb}\n"
+    edit_tag = " (편집 대결)" if image_refs else ""
+    tg_send(f"⚔️ 모델 대결 시작!{edit_tag}\nA ▸ {la}\nB ▸ {lb}\n"
             f"프롬프트 {len(prompts)}줄 · 같은 시드 {seed} · 한 줄당 1장 (총 {len(prompts) * 2}장)")
     try:
         for side, wf_id, label in (("A", a, la), ("B", b, lb)):
@@ -1147,9 +1197,9 @@ def do_compare(job):
             for i, prompt in enumerate(prompts, 1):
                 note = intents[i - 1] if i - 1 < len(intents) else ""
                 prefix = f"pingpong/cmp_{tag}_{side}{i:02d}"
-                wf, out = _compare_build(wf_id, prompt, seed, settings, prefix)
+                wf, out = _compare_build(wf_id, prompt, seed, settings, prefix, image_refs)
                 files = comfy_run(wf, out)  # 줄 사이엔 언로드 없이 연속 제출
-                write_generation_meta(files, f"compare:{side}:{label}", f"[{side}] {label} · #{i}", prompt, note=note)
+                write_generation_meta(files, f"compare:{side}:{label}", f"[{side}] {label} · #{i}", prompt, note=note, orig=orig_rel)
                 if job.get("send_files") and files:
                     try:
                         cap = f"[{side}] {label} #{i}"
@@ -1165,6 +1215,165 @@ def do_compare(job):
         log("compare error:", traceback.format_exc())
     finally:
         comfy_free()
+
+# ---------- 모델 대결 채점 (VLM 심판) ----------
+SCORE_SYS = (
+    "You are a strict but fair judge for an A/B image-model comparison. "
+    "You are shown TWO images generated from the SAME prompt (the first is A, the second is B), "
+    "plus a '관전포인트(focus)' to evaluate. "
+    "Score each image 0-10 on how well it achieves the focus point AND matches the prompt. "
+    'Return ONLY JSON: {"a": <0-10 number>, "b": <0-10 number>, "winner": "A" | "B" | "tie", "reason": "<짧은 한국어 한 줄 이유>"}. '
+    "No markdown, no extra text."
+)
+
+VERDICT_SYS = (
+    "너는 흥 넘치는 AI 그림 모델 대결 해설가야. "
+    "두 모델의 컷별 점수와 한줄평을 받아서, 누가 왜 이겼는지 2~4문장으로 재치있고 재미있게 '총평'을 써줘. "
+    "스포츠 중계처럼 살짝 오버해도 좋지만 근거는 주어진 점수/평가에 기반해. "
+    "한국어로, 마크다운·머리말·따옴표 없이 총평 문장만 출력해."
+)
+
+def llm_battle_verdict(model_id, la, lb, results, a_wins, b_wins, ties):
+    rows = []
+    for k in sorted(results, key=lambda x: int(x)):
+        r = results[k]
+        rows.append(f"#{k}: A {r['a']} vs B {r['b']} → {r['winner']} ({r.get('reason', '')})")
+    user = (f"A 모델 = '{la}'\nB 모델 = '{lb}'\n전적: A {a_wins}승 / B {b_wins}승 / 무 {ties}\n"
+            "컷별 점수와 평:\n" + "\n".join(rows) + "\n\n위를 바탕으로 재미있는 총평을 써줘. /no_think")
+    out = _chat(model_id, VERDICT_SYS, user, max_tokens=1200, temp=0.9, no_think=True)
+    out = re.sub(r"```[a-z]*|```", "", out or "").strip().strip('"').strip()
+    return out[:600]
+
+def _data_url_any(path):
+    mime = mimetypes.guess_type(path)[0] or "image/png"
+    with open(path, "rb") as f:
+        return f"data:{mime};base64," + base64.b64encode(f.read()).decode("ascii")
+
+SCORE_SYS_FACE = (
+    "You are a strict judge for an A/B IMAGE-EDIT comparison focused on IDENTITY/FACE CONSISTENCY. "
+    "The FIRST image is the ORIGINAL subject. The SECOND is edit A, the THIRD is edit B "
+    "(both edited from the original with the same instruction). "
+    "Score each edit 0-10 on how well it PRESERVES the original person's identity and facial features "
+    "(이목구비, 인상, 머리/피부 등) while applying the requested edit. "
+    'Return ONLY JSON: {"a": <0-10>, "b": <0-10>, "winner": "A" | "B" | "tie", "reason": "<짧은 한국어 한 줄>"}. '
+    "No markdown."
+)
+
+def llm_score_pair(model_id, a_path, b_path, prompt, focus, orig_path=None):
+    if orig_path and os.path.isfile(orig_path):
+        sys_p = SCORE_SYS_FACE
+        content = [
+            {"type": "text", "text": f"[편집 지시] {prompt or ''}\n[관전포인트] {focus or '얼굴 일관성'}\n"
+                                     "첫 번째=원본, 두 번째=A 편집본, 세 번째=B 편집본. 위 JSON 형식으로만 채점. /no_think"},
+            {"type": "image_url", "image_url": {"url": _data_url_any(orig_path)}},
+            {"type": "image_url", "image_url": {"url": _data_url_any(a_path)}},
+            {"type": "image_url", "image_url": {"url": _data_url_any(b_path)}},
+        ]
+    else:
+        sys_p = SCORE_SYS
+        content = [
+            {"type": "text", "text": f"[관전포인트] {focus or '전반적인 품질'}\n[프롬프트] {prompt or ''}\n"
+                                     "첫 번째 이미지가 A, 두 번째가 B예요. 위 JSON 형식으로만 채점해줘. /no_think"},
+            {"type": "image_url", "image_url": {"url": _data_url_any(a_path)}},
+            {"type": "image_url", "image_url": {"url": _data_url_any(b_path)}},
+        ]
+    # 추론(thinking) 모델이 생각하다 토큰을 다 쓰지 않도록 넉넉히
+    body = {"model": model_id,
+            "messages": [{"role": "system", "content": sys_p},
+                         {"role": "user", "content": content}],
+            "temperature": 0.2, "max_tokens": 1200}
+    r = requests.post(f"{LMAPI}/v1/chat/completions", json=body, timeout=300)
+    r.raise_for_status()
+    msg = r.json()["choices"][0]["message"]
+    out = (msg.get("content") or "").strip() or (msg.get("reasoning_content") or "").strip()
+    if "</think>" in out:
+        out = out.split("</think>")[-1].strip()
+    try:
+        d = json.loads(out)
+    except Exception:
+        mt = re.search(r"\{[\s\S]*\}", out)
+        d = json.loads(mt.group(0)) if mt else {}
+    def num(x):
+        try:
+            return max(0, min(10, round(float(x), 1)))
+        except Exception:
+            return 0
+    a, b = num(d.get("a")), num(d.get("b"))
+    win = str(d.get("winner") or "").strip().upper()
+    if win not in ("A", "B", "TIE"):
+        win = "A" if a > b else "B" if b > a else "TIE"
+    return {"a": a, "b": b, "winner": "tie" if win == "TIE" else win, "reason": str(d.get("reason") or "").strip()[:120]}
+
+def _scores_path(tag):
+    d = os.path.join(HERE, "compare_scores")
+    os.makedirs(d, exist_ok=True)
+    return os.path.join(d, f"{tag}.json")
+
+def _write_scores(tag, payload):
+    try:
+        json.dump(payload, open(_scores_path(tag), "w", encoding="utf-8"), ensure_ascii=False, indent=2)
+    except Exception as e:
+        log("scores write fail:", e)
+
+def do_score(job):
+    tag = job.get("tag")
+    items = job.get("items") or []
+    la = job.get("a_label") or "A"
+    lb = job.get("b_label") or "B"
+    if not tag or not items:
+        tg_send("⚠️ 채점할 대결을 찾지 못했어요."); return
+    tg_send(f"🏆 채점 시작! {len(items)}컷을 심판 모델이 평가해요... (gemma)")
+    comfy_free()
+    mid = llm_up()
+    results = {}
+    a_wins = b_wins = ties = 0
+    a_sum = b_sum = 0.0
+    failed = 0
+    verdict = ""
+    try:
+        for it in items:
+            i = it.get("i")
+            try:
+                s = llm_score_pair(mid, it["a_path"], it["b_path"], it.get("prompt", ""), it.get("note", ""), it.get("orig_path"))
+            except Exception as e:
+                failed += 1
+                log("score fail", i, traceback.format_exc())
+                if failed == 1:
+                    tg_send(f"⚠️ 심판 모델이 이미지를 못 보는 것 같아요 ({e}). gemma-4-e4b가 비전모델이 아니면 전용 VLM이 필요해요.")
+                continue
+            results[str(i)] = s
+            a_sum += s["a"]; b_sum += s["b"]
+            if s["winner"] == "A":
+                a_wins += 1
+            elif s["winner"] == "B":
+                b_wins += 1
+            else:
+                ties += 1
+        if results:
+            tg_send("🎙️ 총평 작성 중...")
+            try:
+                verdict = llm_battle_verdict(mid, la, lb, results, a_wins, b_wins, ties)
+            except Exception as e:
+                log("verdict fail:", e)
+    finally:
+        llm_down()
+    overall = "A" if a_wins > b_wins else "B" if b_wins > a_wins else "tie"
+    payload = {"tag": tag, "done": True, "results": results,
+               "a_label": la, "b_label": lb,
+               "a_wins": a_wins, "b_wins": b_wins, "ties": ties,
+               "a_avg": round(a_sum / len(results), 1) if results else 0,
+               "b_avg": round(b_sum / len(results), 1) if results else 0,
+               "overall": overall, "verdict": verdict}
+    _write_scores(tag, payload)
+    if not results:
+        tg_send("⚠️ 채점 실패 — 점수를 못 냈어요. (비전모델 확인 필요)")
+        return
+    champ = f"🅰 {la}" if overall == "A" else f"🅱 {lb}" if overall == "B" else "무승부"
+    msg = (f"🏆 채점 완료!\n🅰 {la} {a_wins}승 (평균 {payload['a_avg']})\n"
+           f"🅱 {lb} {b_wins}승 (평균 {payload['b_avg']})\n무 {ties}\n최종 승자: {champ}")
+    if verdict:
+        msg += f"\n\n🎙️ 총평\n{verdict}"
+    tg_send(msg)
 
 def _apply_ltx_director_assets(td, assets, duration_frames):
     assets = assets or []
