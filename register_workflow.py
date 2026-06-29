@@ -12,6 +12,12 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 
+try:  # 콘솔에서 한글이 깨지지 않도록
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stdin.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
+
 
 HERE = Path(__file__).resolve().parent
 WORKFLOWS = HERE / "workflows"
@@ -184,21 +190,18 @@ def find_prompt_candidates(wf):
 def display_candidates(title, rows, limit=10):
     print("\n" + title)
     if not rows:
-        print("  - none")
+        print("  (후보가 없어요)")
         return
     for i, row in enumerate(rows[:limit], 1):
-        preview = re.sub(r"\s+", " ", str(row["value"]))[:100]
-        print(
-            f"  {i}. node {row['node']}.{row['field']}  "
-            f"{row['class']}  score={row['score']}  :: {preview}"
-        )
+        preview = re.sub(r"\s+", " ", str(row["value"]))[:90]
+        print(f"  [{i}] {preview}")
 
 
 def choose_nodes(title, rows, default="1", limit=10):
     display_candidates(title, rows, limit)
     if not rows:
         return []
-    raw = ask("Use candidate numbers, comma separated. Empty keeps default", default)
+    raw = ask("👉 몇 번을 쓸까요? (그냥 엔터=1번 추천, 여러 개면 쉼표로 예: 1,2)", default)
     chosen = []
     for part in re.split(r"\s*,\s*", raw):
         if not part:
@@ -380,13 +383,13 @@ def find_dimension_nodes(wf):
 
 
 def choose_dimension_nodes(rows, default="1"):
-    print("\nResolution (width/height) candidates:")
+    print("\n크기(가로·세로)를 정하는 칸 후보:")
     if not rows:
-        print("  - none")
+        print("  (후보가 없어요)")
         return [], []
     for i, r in enumerate(rows[:10], 1):
-        print(f"  {i}. node {r['node']}  {r['class']}  {r['width']}x{r['height']}  score={r['score']}")
-    raw = ask("Numbers to control (empty = top one, '-' = none)", default)
+        print(f"  [{i}] {r['class']}  ({r['width']}x{r['height']})")
+    raw = ask("👉 어떤 걸 쓸까요? (그냥 엔터=1번 추천, 안 쓰려면 - 입력)", default)
     if raw.strip() == "-":
         return [], []
     if not raw.strip():
@@ -404,42 +407,110 @@ def choose_dimension_nodes(rows, default="1"):
     return wn, hn
 
 
-def main():
-    src = sys.argv[1] if len(sys.argv) > 1 else ask("Workflow API JSON path")
-    src_path = Path(src.strip('"')).expanduser().resolve()
-    if not src_path.exists():
-        raise SystemExit(f"File not found: {src_path}")
+ENHANCER_WORDS = (
+    "textgenerate", "llm", "ollama", "groq", "openai", "gpt", "deepseek", "qwen", "gemini",
+    "florence", "joycaption", "vlm", "enhanc", "chatglm", "promptgen", "describe", "caption",
+)
 
-    wf = json.loads(src_path.read_text(encoding="utf-8"))
-    if not isinstance(wf, dict):
-        raise SystemExit("This does not look like a ComfyUI API-format JSON object.")
+def _branch_has_enhancer(wf, start_id, depth=0, seen=None):
+    """스위치 한쪽 가지가 LLM/증강기 노드를 거쳐가는지 (위로 추적)."""
+    if seen is None:
+        seen = set()
+    sid = str(start_id)
+    if depth > 5 or sid in seen:
+        return False
+    seen.add(sid)
+    if any(w in class_type(wf, sid).lower() for w in ENHANCER_WORDS):
+        return True
+    for _f, v in node_inputs(wf.get(sid, {})).items():
+        if is_link(v) and _branch_has_enhancer(wf, source_id(v), depth + 1, seen):
+            return True
+    return False
+
+def find_prompt_switches(wf, prompt_node_ids):
+    """프롬프트 '원본 vs 자동증강' 을 고르는 불리언 스위치를 찾아 바이패스 값 결정.
+    반환: [{'bool_node','value','found_enhancer'}]  (value = 증강기 끄는 불리언 값)"""
+    pset = {str(x) for x in prompt_node_ids}
+    out = []
+    for nid, node in wf.items():
+        inp = node_inputs(node)
+        if "switch" not in class_type(wf, nid).lower():
+            continue
+        if not all(k in inp for k in ("switch", "on_true", "on_false")):
+            continue
+        if not is_link(inp["switch"]):
+            continue
+        bool_id = source_id(inp["switch"])
+        if "boolean" not in class_type(wf, bool_id).lower():
+            continue
+        if "value" not in node_inputs(wf.get(bool_id, {})):
+            continue
+        t_src = source_id(inp["on_true"]) if is_link(inp["on_true"]) else ""
+        f_src = source_id(inp["on_false"]) if is_link(inp["on_false"]) else ""
+        t_enh, f_enh = _branch_has_enhancer(wf, t_src), _branch_has_enhancer(wf, f_src)
+        bypass = None
+        # 원본 프롬프트가 직접 연결된 가지를 고르도록 불리언 값 결정
+        if f_src in pset and t_src not in pset:
+            bypass = False
+        elif t_src in pset and f_src not in pset:
+            bypass = True
+        elif f_enh and not t_enh:
+            bypass = False  # on_true 가 원본
+        elif t_enh and not f_enh:
+            bypass = True   # on_false 가 원본
+        if bypass is not None and (t_enh or f_enh):
+            out.append({"bool_node": str(bool_id), "value": bypass})
+    return out
+
+def main():
+    print("=" * 58)
+    print(" 🦗 핑퐁 워크플로 등록기")
+    print(" ComfyUI 워크플로를 모델비교/봇에서 쓸 수 있게 등록해요.")
+    print(" 잘 모르겠으면 그냥 [엔터]만 치면 추천값으로 진행돼요.")
+    print("=" * 58)
+
+    src = sys.argv[1] if len(sys.argv) > 1 else ask("📂 등록할 워크플로 JSON 경로 (ComfyUI에서 'API 형식으로 저장'한 파일)")
+    src_path = Path(src.strip().strip('"')).expanduser().resolve()
+    if not src_path.exists():
+        raise SystemExit(f"❌ 파일을 못 찾았어요: {src_path}")
+    try:
+        wf = json.loads(src_path.read_text(encoding="utf-8"))
+        assert isinstance(wf, dict)
+    except Exception:
+        raise SystemExit("❌ ComfyUI 'API 형식' JSON이 아닌 것 같아요.\n"
+                         "   ComfyUI에서 워크플로를 'API 형식으로 저장(Save API Format)'으로 다시 저장해서 넣어주세요.")
 
     WORKFLOWS.mkdir(exist_ok=True)
     dest = WORKFLOWS / src_path.name
     if src_path.resolve() != dest.resolve():
-        if dest.exists() and not yes_no(f"{dest.name} already exists. Overwrite?", False):
-            raise SystemExit("Cancelled.")
+        if dest.exists() and not yes_no(f"이미 같은 이름의 파일이 있어요 ({dest.name}). 덮어쓸까요?", False):
+            raise SystemExit("취소했어요.")
         shutil.copy2(src_path, dest)
 
     default_name = safe_key(src_path.stem.replace("_API", "").replace("image_", ""))
-    name = ask("Dashboard/custom workflow name", default_name)
-    trigger = ask("Telegram command trigger", "/" + name)
-    wtype = ask("Output type (image/video/audio)", infer_type(wf)).lower()
+    print("\n[1/3] 기본 정보  (모르면 엔터)")
+    name = ask("  이 워크플로를 부를 이름 (예: 크레아2)", default_name)
+    trigger = ask("  텔레그램에서 부를 명령어", "/" + name)
+    wtype = ask("  만드는 종류 — image=이미지 / video=영상 / audio=음악", infer_type(wf)).lower()
     if wtype not in ("image", "video", "audio"):
         wtype = "image"
-    llm = ask("Prompt generation (image/video/none)", "video" if wtype == "video" else "image").lower()
+    llm = ask("  프롬프트를 AI가 자동으로 다듬을까요 — image / video / none(안 다듬음)",
+              "video" if wtype == "video" else "image").lower()
     if llm not in ("image", "video", "none"):
         llm = "image"
 
+    print("\n[2/3] '그림 설명(프롬프트)'이 들어갈 칸 고르기")
+    print("  아래 후보 중 '실제 그림 묘사'처럼 보이는 번호를 고르세요.")
+    print("  예) 영어/한글 장면 설명 = 맞음   /   'You are...'·중국어 지시문 = 보통 아님")
     positives, negatives, all_rows = find_prompt_candidates(wf)
     if not positives and all_rows:
         positives = all_rows
-    selected_prompt_nodes = choose_nodes("Positive prompt candidates", positives, "1")
+    selected_prompt_nodes = choose_nodes("프롬프트 칸 후보:", positives, "1")
     prompt_nodes = [x for x in selected_prompt_nodes if x[1] != "timeline_data"]
     timeline_prompt_nodes = [x for x in selected_prompt_nodes if x[1] == "timeline_data"]
     if not prompt_nodes and not timeline_prompt_nodes:
-        raise SystemExit("No positive prompt node selected; registration cancelled.")
-    negative_nodes = choose_nodes("Negative prompt candidates (optional)", negatives, "") if negatives else []
+        raise SystemExit("❌ 프롬프트 칸을 안 골라서 등록을 취소했어요.")
+    negative_nodes = choose_nodes("빼고 싶은 것(네거티브) 칸 후보 — 없으면 그냥 엔터:", negatives, "") if negatives else []
 
     seed_nodes = find_seed_nodes(wf)
     image_nodes = find_image_nodes(wf)
@@ -449,19 +520,20 @@ def main():
     megapixels_nodes = find_megapixels_nodes(wf)
     dim_rows = find_dimension_nodes(wf)
 
-    print("\nAuto-detected:")
-    print("  seed_nodes:", seed_nodes or "-")
-    print("  image_nodes:", image_nodes or "-")
-    print("  prefix_node:", prefix_node or "-")
-    print("  output_node:", output_node or "-")
-    print("  ratio_node:", ratio_node or "-")
-    if ratio_node and ratio_map:
-        live = ratio_map is not RATIO_MAP
-        print("  ratio_map :", "(컴피 실제 옵션 기반 ✓)" if live else "(기본표 — 컴피 미연결, 라벨 다르면 수정 필요 ⚠)")
-        for k, v in ratio_map.items():
-            print(f"      {k} -> {v}")
-    print("  megapixels:", megapixels_nodes or "-")
-    print("  width/height:", [f"{r['node']}={r['width']}x{r['height']}" for r in dim_rows] or "-")
+    def _yn(x):
+        return "✓ 찾음" if x else "✗ 없음"
+    print("\n🔎 자동으로 찾은 것:")
+    print("   시드(랜덤 숫자) 칸 :", _yn(seed_nodes))
+    print("   결과 저장 칸       :", _yn(output_node))
+    if ratio_node:
+        note = "(컴피 실제 옵션 기반)" if ratio_map is not RATIO_MAP else "(컴피가 꺼져있어 라벨이 다를 수 있어요 ⚠)"
+        print("   비율 선택 칸       : ✓ 있음", note)
+    elif dim_rows:
+        print("   해상도 조절        : ✓ 가로·세로 칸 있음")
+    else:
+        print("   해상도/비율 제어   : ✗ 없음 (크기 고정)")
+    if image_nodes:
+        print("   사진 입력 칸       : ✓ 있음 (사진 넣는 워크플로 같아요)")
 
     spec = {
         "file": "workflows/" + dest.name,
@@ -476,12 +548,12 @@ def main():
     }
     if timeline_prompt_nodes:
         spec["timeline_prompt_nodes"] = timeline_prompt_nodes
-    if negative_nodes and yes_no("Register negative prompt nodes too?", True):
+    if negative_nodes and yes_no("네거티브(빼고 싶은 것) 칸도 등록할까요?", True):
         spec["negative_nodes"] = negative_nodes
-        spec["negative_prompt"] = ask("Negative prompt text", "low quality, blurry, distorted, watermark")
-    if image_nodes and yes_no("Register image input nodes?", False):
+        spec["negative_prompt"] = ask("기본으로 넣을 네거티브 문구", "low quality, blurry, distorted, watermark")
+    if image_nodes and yes_no("사진을 넣어서 쓰는 워크플로인가요? (인물합성·편집 등)", False):
         spec["image_nodes"] = image_nodes
-    if ratio_node and yes_no("Expose ratio option on dashboard?", True):
+    if ratio_node and yes_no("대시보드에 '비율 선택' 칸을 보여줄까요?", True):
         spec["ratio_node"] = ratio_node
         if ratio_map:
             spec["ratio_map"] = ratio_map
@@ -489,37 +561,53 @@ def main():
     if megapixels_nodes:
         spec["megapixels_nodes"] = megapixels_nodes
 
-    if wtype == "image" and not spec.get("ratio_node"):
-        if dim_rows:
-            print("\nNo ratio_preset/aspect_ratio node found, but width/height inputs exist.")
-            print("Registering them lets the dashboard set exact resolution from the ratio + MP you pick,")
-            print("so 모델비교(A/B)에서 양쪽 해상도가 정확히 맞아요.")
-            if yes_no("Control resolution via width/height?", True):
-                wn, hn = choose_dimension_nodes(dim_rows, "1")
-                if wn:
-                    spec["width_nodes"] = wn
-                if hn:
-                    spec["height_nodes"] = hn
+    if wtype == "image":
+        print("\n[3/3] 해상도 맞추기")
+        if not spec.get("ratio_node"):
+            if dim_rows:
+                print("  '비율 선택' 칸은 없지만 '가로·세로' 칸이 있어요.")
+                print("  등록해두면 대시보드에서 고른 비율로 크기를 자동으로 맞춰줘서,")
+                print("  모델비교 때 양쪽 그림 크기가 똑같아져요. (강력 추천)")
+                if yes_no("가로·세로로 크기를 제어할까요?", True):
+                    wn, hn = choose_dimension_nodes(dim_rows, "1")
+                    if wn:
+                        spec["width_nodes"] = wn
+                    if hn:
+                        spec["height_nodes"] = hn
+            else:
+                print("  조절 가능한 크기 칸을 못 찾았어요.")
+        else:
+            print("  비율 선택 칸으로 크기가 맞춰져요. ✓")
+        if not spec.get("ratio_node") and not spec.get("width_nodes"):
+            print("\n  ⚠ 주의: 이 워크플로는 크기/비율을 바꿀 수 없어요(고정).")
+            print("     모델비교에서 상대 워크플로와 그림 크기가 다를 수 있어요.")
 
-    if wtype == "image" and not spec.get("ratio_node") and not spec.get("width_nodes"):
-        print("\n[!] 경고: 이 워크플로에 해상도/비율 제어가 등록되지 않았어요.")
-        print("    JSON에 박힌 고정 해상도로만 나가서, 모델비교 시 A/B 크기가 다를 수 있어요.")
-        print("    가능하면 EmptyLatentImage 같은 width/height 노드를 등록하거나,")
-        print("    ratio_preset/aspect_ratio 노드가 있는 워크플로를 쓰는 걸 권장해요.")
+    switches = find_prompt_switches(wf, [n for n, _ in prompt_nodes])
+    if switches:
+        print("\n💡 이 워크플로에 '프롬프트 자동 증강기'(내장 AI가 프롬프트를 다시 써주는 스위치)가 있어요.")
+        print("   핑퐁이 프롬프트를 직접 만들어 주니까, 끄는 걸 추천해요 (공정 비교 + 내 프롬프트 그대로).")
+        if yes_no("자동 증강기를 끌까요?", True):
+            sets = spec.get("set_nodes", [])
+            for s in switches:
+                sets.append([s["bool_node"], "value", s["value"]])
+            spec["set_nodes"] = sets
+            print("   → 껐어요. 내가 넣는 프롬프트가 그대로 들어가요. ✓")
 
     cfg = json.loads(CONFIG.read_text(encoding="utf-8"))
     cfg.setdefault("custom_workflows", {})[name] = spec
     CONFIG.write_text(json.dumps(cfg, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
-    print("\nRegistered.")
-    print(f"  name: {name}")
-    print(f"  file: workflows/{dest.name}")
-    print(f"  trigger: {trigger}")
-    print("Restart or refresh the dashboard to use it.")
+    print("\n" + "=" * 58)
+    print("✅ 등록 완료!")
+    print(f"   이름   : {name}")
+    print(f"   명령어 : {trigger}")
+    print("👉 대시보드를 새로고침(Ctrl+Shift+R)하면")
+    print("   '⚔️ 모델비교' 목록과 봇 메뉴에 바로 떠요.")
+    print("=" * 58)
 
 
 if __name__ == "__main__":
     try:
         main()
     except KeyboardInterrupt:
-        print("\nCancelled.")
+        print("\n취소했어요.")
