@@ -8,6 +8,8 @@ import json
 import re
 import shutil
 import sys
+import urllib.parse
+import urllib.request
 from pathlib import Path
 
 
@@ -289,14 +291,117 @@ def infer_type(wf):
     return "image"
 
 
+def _comfy_api():
+    try:
+        return json.loads(CONFIG.read_text(encoding="utf-8")).get("comfy_api", "http://127.0.0.1:8188").rstrip("/")
+    except Exception:
+        return "http://127.0.0.1:8188"
+
+
+def comfy_combo_options(class_type, field):
+    """컴피 object_info에서 해당 노드 필드의 실제 콤보 옵션 목록을 가져옴(없으면 None)."""
+    try:
+        url = _comfy_api() + "/object_info/" + urllib.parse.quote(str(class_type), safe="")
+        data = json.loads(urllib.request.urlopen(url, timeout=5).read().decode("utf-8"))
+        info = data.get(class_type, {})
+        for sect in ("required", "optional"):
+            f = info.get("input", {}).get(sect, {}).get(field)
+            if not isinstance(f, list) or not f:
+                continue
+            if isinstance(f[0], list):
+                return f[0]
+            if len(f) > 1 and isinstance(f[1], dict) and isinstance(f[1].get("options"), list):
+                return f[1]["options"]
+    except Exception:
+        return None
+    return None
+
+
+def build_ratio_map(options):
+    """노드의 실제 옵션 문자열에서 표준 비율('3:4') → 옵션('3:4 (Portrait Standard)') 매핑 생성."""
+    if not options:
+        return None
+    out = {}
+    for key in ("1:1", "3:4", "4:3", "2:3", "3:2", "9:16", "16:9", "21:9"):
+        for opt in options:
+            s = str(opt).strip()
+            if s == key or s.startswith(key + " ") or s.startswith(key + "("):
+                out[key] = s
+                break
+    return out or None
+
+
 def find_ratio_node(wf):
     for nid, node in wf.items():
         inputs = node_inputs(node)
         if "ratio_preset" in inputs:
             return [str(nid), "ratio_preset"], None
         if "aspect_ratio" in inputs:
-            return [str(nid), "aspect_ratio"], RATIO_MAP
+            # 컴피에서 실제 옵션을 읽어 매핑 생성(라벨 변경에도 안전), 실패 시 기본표로 폴백
+            live = build_ratio_map(comfy_combo_options(class_type(wf, nid), "aspect_ratio"))
+            return [str(nid), "aspect_ratio"], (live or RATIO_MAP)
     return None, None
+
+
+def find_megapixels_nodes(wf):
+    out = []
+    for nid, node in wf.items():
+        for field, value in node_inputs(node).items():
+            fl = field.lower()
+            if (fl == "megapixels" or fl.endswith(".megapixels")) and isinstance(value, (int, float)) and not isinstance(value, bool):
+                out.append([str(nid), field])
+    return out
+
+
+def find_dimension_nodes(wf):
+    """width/height 정수 입력을 동시에 가진 노드(EmptyLatentImage 등)를 점수순으로 반환."""
+    rows = []
+    for nid, node in wf.items():
+        inputs = node_inputs(node)
+        w, h = inputs.get("width"), inputs.get("height")
+        if isinstance(w, bool) or isinstance(h, bool):
+            continue
+        if not (isinstance(w, (int, float)) and isinstance(h, (int, float))):
+            continue
+        ct = class_type(wf, nid).lower()
+        score = 20
+        if "emptylatent" in ct or "emptysd3" in ct or "latentimage" in ct:
+            score += 60
+        elif "resolution" in ct or "imagesize" in ct or "emptyimage" in ct:
+            score += 40
+        elif "latent" in ct:
+            score += 30
+        if "upscale" in ct or "scale" in ct:
+            score -= 25
+        rows.append({"score": score, "node": str(nid), "class": class_type(wf, nid),
+                     "width": int(w), "height": int(h)})
+    rows.sort(key=lambda r: r["score"], reverse=True)
+    return rows
+
+
+def choose_dimension_nodes(rows, default="1"):
+    print("\nResolution (width/height) candidates:")
+    if not rows:
+        print("  - none")
+        return [], []
+    for i, r in enumerate(rows[:10], 1):
+        print(f"  {i}. node {r['node']}  {r['class']}  {r['width']}x{r['height']}  score={r['score']}")
+    raw = ask("Numbers to control (empty = top one, '-' = none)", default)
+    if raw.strip() == "-":
+        return [], []
+    if not raw.strip():
+        raw = default
+    wn, hn = [], []
+    for part in re.split(r"\s*,\s*", raw):
+        try:
+            idx = int(part) - 1
+        except ValueError:
+            continue
+        if 0 <= idx < min(10, len(rows)):
+            r = rows[idx]
+            wn.append([r["node"], "width"])
+            hn.append([r["node"], "height"])
+    return wn, hn
 
 
 def main():
@@ -341,6 +446,8 @@ def main():
     prefix_node = find_prefix_node(wf)
     output_node = find_output_node(wf)
     ratio_node, ratio_map = find_ratio_node(wf)
+    megapixels_nodes = find_megapixels_nodes(wf)
+    dim_rows = find_dimension_nodes(wf)
 
     print("\nAuto-detected:")
     print("  seed_nodes:", seed_nodes or "-")
@@ -348,6 +455,13 @@ def main():
     print("  prefix_node:", prefix_node or "-")
     print("  output_node:", output_node or "-")
     print("  ratio_node:", ratio_node or "-")
+    if ratio_node and ratio_map:
+        live = ratio_map is not RATIO_MAP
+        print("  ratio_map :", "(컴피 실제 옵션 기반 ✓)" if live else "(기본표 — 컴피 미연결, 라벨 다르면 수정 필요 ⚠)")
+        for k, v in ratio_map.items():
+            print(f"      {k} -> {v}")
+    print("  megapixels:", megapixels_nodes or "-")
+    print("  width/height:", [f"{r['node']}={r['width']}x{r['height']}" for r in dim_rows] or "-")
 
     spec = {
         "file": "workflows/" + dest.name,
@@ -371,6 +485,27 @@ def main():
         spec["ratio_node"] = ratio_node
         if ratio_map:
             spec["ratio_map"] = ratio_map
+
+    if megapixels_nodes:
+        spec["megapixels_nodes"] = megapixels_nodes
+
+    if wtype == "image" and not spec.get("ratio_node"):
+        if dim_rows:
+            print("\nNo ratio_preset/aspect_ratio node found, but width/height inputs exist.")
+            print("Registering them lets the dashboard set exact resolution from the ratio + MP you pick,")
+            print("so 모델비교(A/B)에서 양쪽 해상도가 정확히 맞아요.")
+            if yes_no("Control resolution via width/height?", True):
+                wn, hn = choose_dimension_nodes(dim_rows, "1")
+                if wn:
+                    spec["width_nodes"] = wn
+                if hn:
+                    spec["height_nodes"] = hn
+
+    if wtype == "image" and not spec.get("ratio_node") and not spec.get("width_nodes"):
+        print("\n[!] 경고: 이 워크플로에 해상도/비율 제어가 등록되지 않았어요.")
+        print("    JSON에 박힌 고정 해상도로만 나가서, 모델비교 시 A/B 크기가 다를 수 있어요.")
+        print("    가능하면 EmptyLatentImage 같은 width/height 노드를 등록하거나,")
+        print("    ratio_preset/aspect_ratio 노드가 있는 워크플로를 쓰는 걸 권장해요.")
 
     cfg = json.loads(CONFIG.read_text(encoding="utf-8"))
     cfg.setdefault("custom_workflows", {})[name] = spec

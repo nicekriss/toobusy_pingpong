@@ -146,6 +146,7 @@ def needs_dashboard_key(path):
         "/api/restart_dashboard",
         "/api/interrupt",
         "/api/download_model",
+        "/api/compare",
     }
 
 def _add_model(out, seen, model_id, label=None, source=""):
@@ -466,9 +467,10 @@ def media_meta(path):
             "request": _clean_prompt(meta.get("request", "")),
             "generated": _clean_prompt(meta.get("generated", "")),
             "mode": meta.get("mode", ""),
+            "note": str(meta.get("note", "") or "").strip(),
         }
     except Exception:
-        return {"request": "", "generated": "", "mode": ""}
+        return {"request": "", "generated": "", "mode": "", "note": ""}
 
 def _decode_audio_text(enc, data):
     if not data:
@@ -691,6 +693,7 @@ def scan(page=1, per=48):
         item["request"] = meta["request"]
         item["prompt"] = meta["generated"] or image_prompt(full)
         item["mode"] = meta["mode"]
+        item["note"] = meta.get("note", "")
         out["images"].append(item)
     for k in ("videos", "audios"):
         out[k].sort(key=lambda x: x["mtime"], reverse=True)
@@ -740,9 +743,112 @@ def custom_modes():
             "type": spec.get("type", "image"),
             "llm": spec.get("llm", "none"),
             "image_inputs": len(spec.get("image_nodes", [])),
-            "ratio": bool(spec.get("ratio_node")),
+            "ratio": bool(spec.get("ratio_node") or spec.get("width_nodes")),
         })
     return out
+
+def compare_workflows():
+    """모델 대결에 쓸 수 있는 이미지 워크플로 목록(내장 ZIT + 등록된 이미지 커스텀, 입력사진 불필요한 것만)."""
+    out = [{"id": "zit", "label": "Z-Image Turbo", "builtin": True, "ratio": True}]
+    for name, spec in CUSTOM.items():
+        if spec.get("type") != "image":
+            continue
+        if spec.get("image_nodes"):
+            continue  # 입력 사진이 필요한 편집형은 대결에 부적합
+        out.append({
+            "id": "custom:" + name,
+            "label": name,
+            "builtin": False,
+            "ratio": bool(spec.get("ratio_node") or spec.get("width_nodes")),
+        })
+    return out
+
+CMP_RE = re.compile(r"^cmp_(\d{4}_\d{6})_([AB])(\d+)_")
+
+def _compare_label_from_meta(meta):
+    mode = meta.get("mode", "") if isinstance(meta, dict) else ""
+    if mode.startswith("compare:"):
+        parts = mode.split(":", 2)
+        if len(parts) == 3:
+            return parts[2]
+    return ""
+
+def _compare_index():
+    """갤러리의 cmp_ 이미지들을 {tag: {idx: {side: filename}}} 로 묶음."""
+    groups = {}
+    hidden = load_hidden()
+    try:
+        names = os.listdir(GALLERY)
+    except FileNotFoundError:
+        return groups
+    for fn in names:
+        m = CMP_RE.match(fn)
+        if not m:
+            continue
+        if os.path.splitext(fn)[1].lower() not in IMG_EXT:
+            continue
+        if fn in hidden or "_UPS" in fn:
+            continue
+        tag, side, idx = m.group(1), m.group(2), int(m.group(3))
+        cell = groups.setdefault(tag, {}).setdefault(idx, {})
+        cell.setdefault(side, fn)
+    return groups
+
+def compare_history():
+    groups = _compare_index()
+    out = []
+    for tag, cells in groups.items():
+        a_label = b_label = ""
+        latest = 0
+        images = 0
+        for idx, sides in cells.items():
+            for side, fn in sides.items():
+                images += 1
+                full = os.path.join(GALLERY, fn)
+                try:
+                    latest = max(latest, os.path.getmtime(full))
+                except OSError:
+                    pass
+                if (side == "A" and not a_label) or (side == "B" and not b_label):
+                    lab = _compare_label_from_meta(media_meta(full))
+                    if side == "A":
+                        a_label = lab or a_label
+                    else:
+                        b_label = lab or b_label
+        out.append({"tag": tag, "a_label": a_label or "A", "b_label": b_label or "B",
+                    "count": len(cells), "images": images, "mtime": latest,
+                    "when": time.strftime("%m/%d %H:%M", time.localtime(latest)) if latest else tag})
+    out.sort(key=lambda x: x["mtime"], reverse=True)
+    return out
+
+def compare_results(tag):
+    cells = _compare_index().get(tag, {})
+    if not cells:
+        return {"ok": False, "err": "기록을 찾을 수 없어요."}
+    a_label = b_label = ""
+    rows = []
+    for idx in sorted(cells.keys()):
+        sides = cells[idx]
+        row = {"i": idx, "a": "", "b": "", "prompt": "", "note": ""}
+        for side in ("A", "B"):
+            fn = sides.get(side)
+            if not fn:
+                continue
+            full = os.path.join(GALLERY, fn)
+            meta = media_meta(full)
+            url = "/media/" + urllib.parse.quote(fn)
+            if side == "A":
+                row["a"] = url
+                a_label = a_label or _compare_label_from_meta(meta)
+            else:
+                row["b"] = url
+                b_label = b_label or _compare_label_from_meta(meta)
+            if meta.get("generated") and (side == "A" or not row["prompt"]):
+                row["prompt"] = meta.get("generated")
+            if meta.get("note") and (side == "A" or not row["note"]):
+                row["note"] = meta.get("note")
+        rows.append(row)
+    return {"ok": True, "tag": tag, "a_label": a_label or "A", "b_label": b_label or "B", "rows": rows}
 
 def _norm_model(name):
     return str(name or "").replace("\\", "/").lower()
@@ -1454,6 +1560,21 @@ class H(BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(len(b)))
             self.end_headers()
             self.wfile.write(b)
+        elif p == "/compare":
+            page = COMPARE_PAGE.replace("__PP_KEY__", json.dumps(dashboard_key()))
+            b = page.encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(b)))
+            self.end_headers()
+            self.wfile.write(b)
+        elif p == "/api/compare_workflows":
+            self._json({"workflows": compare_workflows()})
+        elif p == "/api/compare_history":
+            self._json({"history": compare_history()})
+        elif p == "/api/compare_results":
+            qs = urllib.parse.parse_qs(parsed.query)
+            self._json(compare_results(qs.get("tag", [""])[0]))
         elif p == "/api/list":
             qs = urllib.parse.parse_qs(parsed.query)
             self._json(scan(qs.get("page", ["1"])[0], qs.get("per", ["48"])[0]))
@@ -1546,6 +1667,39 @@ class H(BaseHTTPRequestHandler):
                 enqueue(job)
             event(f"queued {mode}: {text[:80]}")
             return self._json({"ok": True})
+        if p == "/api/compare":
+            a = (body.get("a") or "").strip()
+            b = (body.get("b") or "").strip()
+            prompts = body.get("prompts") or ""
+            settings = body.get("settings", {}) if isinstance(body.get("settings", {}), dict) else {}
+            valid = {w["id"] for w in compare_workflows()}
+            if a not in valid or b not in valid:
+                return self._json({"ok": False, "err": "A/B 워크플로를 둘 다 골라주세요."}, 400)
+            random_mode = bool(body.get("random"))
+            lines = [ln.strip() for ln in str(prompts).splitlines() if ln.strip()][:20]
+            if random_mode:
+                try:
+                    count = int(body.get("count") or 10)
+                except (TypeError, ValueError):
+                    count = 10
+                count = max(1, min(20, count))
+                lines = []  # 봇이 LLM으로 생성
+            else:
+                if not lines:
+                    return self._json({"ok": False, "err": "프롬프트를 한 줄 이상 적어주세요."}, 400)
+                count = len(lines)
+            try:
+                seed = int(body.get("seed"))
+            except (TypeError, ValueError):
+                seed = int.from_bytes(os.urandom(5), "big")
+            tag = time.strftime("%m%d_%H%M%S")
+            enhance = bool(body.get("enhance"))
+            theme = str(body.get("theme") or "").strip()[:200]
+            enqueue({"mode": "compare", "a": a, "b": b, "prompts": lines, "count": count,
+                     "seed": seed, "tag": tag, "settings": settings,
+                     "enhance": enhance, "random": random_mode, "theme": theme})
+            event(f"queued compare: {a} vs {b} ({count}x, enhance={enhance}, random={random_mode}, theme={theme!r})")
+            return self._json({"ok": True, "tag": tag, "count": count, "seed": seed})
         if p == "/api/open_gallery":
             try:
                 os.makedirs(GALLERY, exist_ok=True)
@@ -1683,6 +1837,403 @@ class H(BaseHTTPRequestHandler):
                 remain -= len(chunk)
 
 
+COMPARE_PAGE = r'''<!doctype html><html lang="ko"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>모델 대결 · 핑퐁</title>
+<link href="https://fonts.googleapis.com/css2?family=Press+Start+2P&family=VT323&display=swap" rel="stylesheet">
+<style>
+:root{--ink:#ece9ff;--mut:#a79fd6;--pink:#ff5d8f;--cyan:#56e1ff;--pur:#9d7bff;--grn:#8dffb0;--amb:#ffd166;--b1:#171228;--b2:#241b3e;--ln:rgba(255,255,255,.12)}
+*{box-sizing:border-box}
+body{margin:0;color:var(--ink);font-family:'VT323',monospace;font-size:18px;padding:18px;
+  background:radial-gradient(circle at 18% -6%,rgba(86,225,255,.10),transparent 38%),radial-gradient(circle at 82% -6%,rgba(255,93,143,.10),transparent 38%),#0a0814}
+body:before{content:"";position:fixed;inset:0;pointer-events:none;z-index:0;opacity:.4;
+  background:repeating-linear-gradient(0deg,rgba(255,255,255,.025) 0 1px,transparent 1px 3px)}
+.pix{font-family:'Press Start 2P',monospace}
+.wrap{max-width:1340px;margin:0 auto;position:relative;z-index:1}
+.bar{display:flex;align-items:center;justify-content:space-between;margin-bottom:18px}
+.brand{font-size:16px;color:var(--cyan);text-shadow:0 0 12px rgba(86,225,255,.35)}.brand b{color:var(--pink)}
+.brand small{display:block;font-size:9px;color:var(--mut);margin-top:7px;text-shadow:none}
+.back{background:var(--b2);border:1px solid var(--ln);color:var(--ink);border-radius:7px;height:34px;padding:0 12px;font-family:'VT323';font-size:16px;cursor:pointer;text-decoration:none;display:inline-flex;align-items:center}
+.back:hover{border-color:var(--cyan);color:var(--cyan)}
+.vs{display:grid;grid-template-columns:1fr 78px 1fr;gap:12px;align-items:stretch;margin-bottom:16px}
+.side{border:2px solid var(--ln);border-radius:14px;background:linear-gradient(180deg,rgba(23,18,40,.96),rgba(10,8,20,.92));padding:13px;transition:box-shadow .2s,border-color .2s}
+.side.a{border-color:rgba(86,225,255,.5)}.side.b{border-color:rgba(255,93,143,.5)}
+.side.a.has{box-shadow:0 0 26px rgba(86,225,255,.22)}.side.b.has{box-shadow:0 0 26px rgba(255,93,143,.22)}
+.side h3{margin:0 0 11px;font-size:11px;display:flex;align-items:center;gap:8px}.side.a h3{color:var(--cyan)}.side.b h3{color:var(--pink)}
+.vsmid{display:flex;align-items:center;justify-content:center;font-family:'Press Start 2P';font-size:22px;color:var(--amb);
+  text-shadow:0 0 18px rgba(255,209,102,.55);animation:vspulse 1.4s ease-in-out infinite}
+@keyframes vspulse{0%,100%{transform:scale(1);opacity:.9}50%{transform:scale(1.14);opacity:1}}
+.wf{display:flex;flex-direction:column;gap:7px}
+.wfopt{display:flex;align-items:center;gap:9px;border:1px solid var(--ln);border-radius:9px;background:#0a0814;padding:10px 12px;cursor:pointer;font-size:17px;transition:.12s}
+.wfopt:hover{border-color:var(--pur);transform:translateX(2px)}
+.side.a .wfopt.sel{border-color:var(--cyan);background:rgba(86,225,255,.12);color:var(--cyan);box-shadow:inset 0 0 12px rgba(86,225,255,.14)}
+.side.b .wfopt.sel{border-color:var(--pink);background:rgba(255,93,143,.12);color:var(--pink);box-shadow:inset 0 0 12px rgba(255,93,143,.14)}
+.wfopt .tag{font-size:9px;color:var(--mut);margin-left:auto;font-family:'Press Start 2P'}
+.wfopt .pickmark{font-size:9px;font-family:'Press Start 2P';opacity:0}.wfopt.sel .pickmark{opacity:1}
+.panel{border:1px solid var(--pur);border-radius:14px;background:linear-gradient(180deg,rgba(23,18,40,.96),rgba(10,8,20,.92));padding:15px;margin-bottom:16px}
+.hist{border-color:rgba(255,209,102,.4)}
+.histhead{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:11px}
+.histlist{display:flex;flex-direction:column;gap:7px;max-height:240px;overflow:auto}
+.histrow{display:flex;align-items:center;gap:11px;border:1px solid var(--ln);border-radius:9px;background:#0a0814;padding:9px 11px;cursor:pointer}
+.histrow:hover{border-color:var(--amb);background:rgba(255,209,102,.07)}
+.histrow .ht{color:var(--amb);font-family:'Press Start 2P';font-size:9px;min-width:92px}
+.histrow .hvs{flex:1;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-size:17px}
+.histrow .hvs .ca{color:var(--cyan)}.histrow .hvs .cb{color:var(--pink)}
+.histrow .hc{color:var(--mut);font-size:14px;white-space:nowrap}
+.panel h3{margin:0 0 11px;font-size:11px;color:var(--pur)}
+textarea{width:100%;min-height:176px;background:#0a0814;border:1px solid var(--ln);color:var(--ink);border-radius:9px;font-family:'VT323';font-size:18px;line-height:1.4;padding:11px;resize:vertical}
+textarea:focus{outline:none;border-color:var(--cyan);box-shadow:0 0 0 2px rgba(86,225,255,.15)}
+.row{display:flex;align-items:center;gap:14px;flex-wrap:wrap;margin-top:13px}
+.row label{display:flex;align-items:center;gap:7px;font-size:16px;color:var(--mut)}
+.row select,.row input{background:#0a0814;border:1px solid var(--ln);color:var(--ink);border-radius:7px;height:34px;font-family:'VT323';font-size:17px;padding:0 9px}
+.row select:focus,.row input:focus{outline:none;border-color:var(--cyan)}
+.row input[type=number]{width:130px}
+.row input[type=checkbox]{accent-color:var(--pink);height:auto}
+.minib{background:var(--b2);border:1px solid var(--ln);color:var(--ink);border-radius:6px;height:34px;padding:0 10px;font-family:'VT323';font-size:15px;cursor:pointer}.minib:hover{border-color:var(--cyan);color:var(--cyan)}
+.cnt{color:var(--amb);font-size:16px;font-family:'Press Start 2P';font-size:10px}
+.startb{background:linear-gradient(90deg,var(--cyan),var(--pink));border:none;color:#160611;font-family:'Press Start 2P';font-size:13px;border-radius:10px;padding:0 20px;height:50px;cursor:pointer;margin-top:15px;width:100%;letter-spacing:1px;box-shadow:0 8px 24px rgba(255,93,143,.22)}
+.startb:hover:not(:disabled){filter:brightness(1.08)}.startb:disabled{opacity:.38;cursor:default;filter:saturate(.25)}
+.note{color:var(--mut);font-size:15px;margin-top:10px;line-height:1.4}.note b{color:var(--amb)}
+.rnd{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-top:12px;padding-top:12px;border-top:1px dashed var(--ln)}
+.rndlbl{color:var(--mut);font-size:15px}
+.rnd label{color:var(--mut);font-size:15px;display:flex;align-items:center;gap:6px}
+.rnd input{background:#0a0814;border:1px solid var(--ln);color:var(--ink);border-radius:7px;height:34px;width:80px;font-family:'VT323';font-size:17px;padding:0 9px}
+.rnd input.rtheme{width:230px}.rnd input:focus{outline:none;border-color:var(--amb)}
+.rndb{background:var(--b2);border:1px solid var(--amb);color:var(--amb);border-radius:8px;height:38px;padding:0 16px;font-family:'VT323';font-size:17px;cursor:pointer}
+.rndb:hover:not(:disabled){background:rgba(255,209,102,.14)}.rndb:disabled{opacity:.4;cursor:default;filter:saturate(.3)}
+.err{display:none;margin-top:10px;color:var(--pink);font-size:16px}.err.on{display:block}
+.same{display:none;margin-top:8px;color:var(--amb);font-size:15px}.same.on{display:block}
+.board{display:none;margin-top:20px}.board.on{display:block}
+.btool{position:sticky;top:0;z-index:5;display:flex;align-items:center;gap:14px;flex-wrap:wrap;
+  padding:11px 13px;margin-bottom:6px;background:rgba(10,8,20,.94);border:1px solid var(--ln);border-radius:11px;backdrop-filter:blur(4px)}
+.bprog{flex:1;min-width:160px;height:12px;background:#0a0814;border:1px solid var(--ln);border-radius:9px;overflow:hidden}
+.bprogf{height:100%;width:0;background:linear-gradient(90deg,var(--cyan),var(--pink));transition:width .4s;box-shadow:0 0 12px rgba(255,93,143,.4)}
+.progtxt{font-family:'Press Start 2P';font-size:10px;color:var(--amb);white-space:nowrap}
+.vtoggle{display:flex;gap:0;border:1px solid var(--ln);border-radius:8px;overflow:hidden}
+.vt{background:#0a0814;border:none;color:var(--mut);height:32px;padding:0 12px;font-family:'VT323';font-size:16px;cursor:pointer}
+.vt.on{background:var(--b2);color:var(--cyan)}
+.viewer{display:flex;align-items:center;gap:10px;margin-top:8px}
+.navarrow{flex:none;width:50px;height:90px;background:var(--b2);border:1px solid var(--ln);color:var(--amb);border-radius:10px;font-size:24px;cursor:pointer;font-family:'VT323'}
+.navarrow:hover{border-color:var(--amb);background:rgba(255,209,102,.1)}
+.stage{flex:1;min-width:0;display:flex;justify-content:center;align-items:center;min-height:200px}
+.stage .cmp{display:inline-block;width:auto;max-width:100%}
+.stage .cmp .base{display:block;width:auto;max-width:100%;max-height:calc(100vh - 250px)}
+.stage .sbs{display:flex;gap:10px;max-width:100%}
+.stage .sbs .sbcell{flex:1;min-width:0}
+.stage .sbs .sbcell img{width:100%;max-height:calc(100vh - 250px);object-fit:contain}
+.stage .partial,.stage .shim{max-width:560px;width:100%}
+.stage .partial img{max-height:calc(100vh - 250px);width:100%;object-fit:contain}
+.vcap{text-align:center;margin-top:12px;padding:0 8px}
+.vcaphead{font-family:'Press Start 2P';font-size:11px;color:var(--amb)}
+.vcaphead .vint{color:var(--amb)}
+.vcappr{color:var(--mut);font-size:16px;margin-top:8px;line-height:1.35;max-width:900px;margin-left:auto;margin-right:auto}
+.thumbs{display:flex;gap:6px;justify-content:center;flex-wrap:wrap;margin-top:12px}
+.thumb{width:48px;height:48px;border-radius:7px;border:1px solid var(--ln);overflow:hidden;cursor:pointer;background:#0a0814;display:flex;align-items:center;justify-content:center;flex:none}
+.thumb:hover{border-color:var(--cyan)}
+.thumb.on{border-color:var(--amb);box-shadow:0 0 10px rgba(255,209,102,.4)}
+.thumb img{width:100%;height:100%;object-fit:cover}
+.thumb .tn{color:var(--mut);font-family:'VT323';font-size:16px}
+.brow{border-top:1px solid var(--ln);padding:14px 0;display:grid;grid-template-columns:62px 1fr;gap:12px;align-items:start}
+.bidx{font-family:'Press Start 2P';font-size:11px;color:var(--amb)}
+.bidx .intent{display:block;font-family:'VT323';font-size:15px;color:var(--amb);margin-top:9px;line-height:1.3;font-weight:normal}
+.bidx .pr{display:block;font-family:'VT323';font-size:13px;color:var(--mut);margin-top:6px;line-height:1.3;font-weight:normal}
+/* before/after wipe slider */
+.cmp{position:relative;width:100%;border-radius:10px;overflow:hidden;cursor:ew-resize;background:#0a0814;border:1px solid var(--ln);user-select:none;line-height:0}
+.cmp .base{display:block;width:100%;height:auto}
+.cmp .over{position:absolute;top:0;left:0;width:100%;height:100%;object-fit:cover;clip-path:inset(0 50% 0 0)}
+.cmpDiv{position:absolute;top:0;bottom:0;left:50%;width:2px;margin-left:-1px;background:rgba(255,255,255,.92);box-shadow:0 0 10px rgba(255,255,255,.55);z-index:3}
+.cmpKnob{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);width:34px;height:34px;border-radius:50%;
+  background:rgba(10,8,20,.85);border:2px solid #fff;color:#fff;display:flex;align-items:center;justify-content:center;font-size:15px}
+.cmpLab{position:absolute;top:9px;font-family:'Press Start 2P';font-size:9px;padding:5px 8px;border-radius:6px;z-index:4;line-height:1.2;max-width:46%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.cmpLab.la{left:9px;background:rgba(86,225,255,.92);color:#04222b}
+.cmpLab.lb{right:9px;background:rgba(255,93,143,.92);color:#2a0713}
+.cmpExp{position:absolute;bottom:9px;right:9px;z-index:4;background:rgba(10,8,20,.8);border:1px solid var(--ln);color:#fff;border-radius:7px;width:34px;height:34px;cursor:pointer;font-size:15px}
+.cmpExp:hover{border-color:var(--cyan);color:var(--cyan)}
+/* side-by-side */
+.sbs{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+.sbcell{position:relative;border-radius:10px;overflow:hidden;border:1px solid var(--ln);background:#0a0814;line-height:0}
+.sbcell img{width:100%;display:block;cursor:zoom-in}
+.sbcell .cmpLab{cursor:default}
+/* partial / waiting */
+.partial{position:relative;border-radius:10px;overflow:hidden;border:1px solid var(--ln);background:#0a0814;line-height:0}
+.partial img{width:100%;display:block}
+.pbadge{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;font-family:'VT323';font-size:16px;
+  color:var(--amb);background:rgba(10,8,20,.55);line-height:1.3;text-align:center;padding:10px}
+.shim{height:150px;border-radius:10px;border:1px solid var(--ln);display:flex;align-items:center;justify-content:center;color:var(--mut);font-size:15px;
+  background:linear-gradient(100deg,#0a0814 30%,#1b1533 50%,#0a0814 70%);background-size:240% 100%;animation:shim 1.3s linear infinite}
+@keyframes shim{to{background-position:-240% 0}}
+.lb{display:none;position:fixed;inset:0;background:rgba(6,5,14,.96);z-index:50;align-items:center;justify-content:center;padding:30px;flex-direction:column;gap:12px}.lb.on{display:flex}
+.lb .cmp{display:inline-block;width:auto;max-width:96vw;cursor:ew-resize}
+.lb .cmp .base{display:block;max-height:84vh;width:auto;max-width:96vw}
+.lb .lbclose{position:fixed;top:18px;right:22px;background:rgba(13,11,22,.8);border:1px solid var(--ln);color:#fff;border-radius:8px;width:40px;height:40px;font-size:17px;cursor:pointer}
+.lb .lbclose:hover{border-color:var(--pink);color:var(--pink)}
+.lb .lbhint{color:var(--mut);font-size:15px}
+.fsintent{color:var(--amb);font-size:18px;margin-bottom:10px;text-align:center;font-family:'VT323'}
+@media (max-width:820px){.vs{grid-template-columns:1fr;gap:10px}.vsmid{padding:4px 0}.sbs{grid-template-columns:1fr}}
+</style></head><body><div class="wrap">
+<div class="bar">
+  <div class="brand pix">⚔️ 모델 대결 <b>VERSUS</b><small>같은 프롬프트 · 같은 시드 · 같은 해상도로 A vs B 정면 비교</small></div>
+  <a class="back" href="/" target="_self">← 대시보드</a>
+</div>
+<div class="panel hist">
+  <div class="histhead"><h3 style="margin:0">📜 지난 대결 <span style="font-family:'VT323';font-size:14px;color:var(--mut)">— 클릭하면 생성 없이 바로 비교</span></h3><button class="minib" onclick="loadHistoryList()">🔄 새로고침</button></div>
+  <div id="histlist" class="histlist"><div class="note">불러오는 중...</div></div>
+</div>
+<div class="vs">
+  <div class="side a" id="sideA"><h3>🅰 A 코너 <span id="selAname" style="font-family:'VT323';font-size:15px;opacity:.85"></span></h3><div class="wf" id="wfA"></div></div>
+  <div class="vsmid">VS</div>
+  <div class="side b" id="sideB"><h3>🅱 B 코너 <span id="selBname" style="font-family:'VT323';font-size:15px;opacity:.85"></span></h3><div class="wf" id="wfB"></div></div>
+</div>
+<div class="panel">
+  <h3>⚙ 대결 설정</h3>
+  <textarea id="prompts" placeholder="프롬프트를 한 줄에 하나씩 (줄 수 = 생성 장수). 예:&#10;a neon-lit cyberpunk alley at night, rain&#10;a cozy cabin in a snowy pine forest, golden hour&#10;a majestic dragon perched on a cliff, epic"></textarea>
+  <div class="row">
+    <span class="cnt" id="cnt">0줄 · 양쪽 0장</span>
+    <label>비율 <select id="ratio"><option>1:1</option><option selected>3:4</option><option>4:3</option><option>2:3</option><option>3:2</option><option>9:16</option><option>16:9</option><option>21:9</option></select></label>
+    <label>해상도(MP) <input type="number" id="mp" value="1" step="0.25" min="0.25" max="2"></label>
+    <label>시드 <input type="number" id="seed" value="42"></label>
+    <button class="minib" onclick="randSeed()">🎲 랜덤</button>
+    <label title="ZIT 워크플로의 하이레스 업스케일. 끄면 A/B 해상도가 더 맞아요"><input type="checkbox" id="zup"> ZIT 업스케일</label>
+    <label title="켜면 위 입력을 '키워드'로 보고 LLM이 줄마다 화려한 프롬프트로 확장해요"><input type="checkbox" id="enhance" onchange="refresh()"> ✨ 키워드→LLM 확장</label>
+  </div>
+  <div class="same" id="same">⚠ 같은 워크플로끼리 골랐어요 — 시드/설정 테스트용으로는 괜찮아요.</div>
+  <button class="startb pix" id="startb" onclick="start()" disabled>대결 시작 ▸</button>
+  <div class="err" id="err"></div>
+  <div class="rnd">
+    <span class="rndlbl">키워드 쓰기 싫은 날 👉</span>
+    <input type="text" id="rtheme" class="rtheme" placeholder="주제 (선택) 예: 고양이, 사이버펑크">
+    <label>장수 <input type="number" id="rcount" value="10" min="1" max="20"></label>
+    <button class="rndb" id="rndb" onclick="startRandom()" disabled>🎲 무작위 프롬프트로 대결</button>
+  </div>
+  <div class="note">한 줄당 1장씩, A를 먼저 전부 → 그다음 B를 전부 생성해요. 라운드 사이에만 모델을 교체해서 빠릅니다. 결과는 <b>슬라이더(마우스로 와이프 비교)</b>로 보고, 메인 갤러리엔 <b>cmp_</b> 접두어로 저장돼요.</div>
+</div>
+<div class="board" id="board">
+  <div class="btool">
+    <div class="bprog"><div class="bprogf" id="prog"></div></div>
+    <span class="progtxt" id="progtxt">0 / 0</span>
+    <div class="vtoggle">
+      <button class="vt on" id="vtSlider" onclick="setView('slider')">🔀 슬라이더</button>
+      <button class="vt" id="vtSbs" onclick="setView('sbs')">⬌ 나란히</button>
+    </div>
+  </div>
+  <div class="viewer">
+    <button class="navarrow" onclick="nav(-1)" aria-label="이전">◁</button>
+    <div class="stage" id="stage"></div>
+    <button class="navarrow" onclick="nav(1)" aria-label="다음">▷</button>
+  </div>
+  <div class="vcap" id="vcap"></div>
+  <div class="thumbs" id="thumbs"></div>
+</div>
+</div>
+<div class="lb" id="lb"><button class="lbclose" onclick="closeFS()">✕</button><div id="fsbody"></div><div class="lbhint">마우스를 좌우로 움직여 와이프 비교 · ESC 닫기</div></div>
+<script>
+var PPKEY=__PP_KEY__;
+var WFS=[],selA='',selB='',TAG='',PROMPTS=[],LA='A',LB='B',poller=null,VIEW='slider',R={},SIG={},CUR=1;
+function H(s){return String(s==null?'':s).replace(/[&<>"]/g,function(c){return{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]})}
+function A(s){return String(s==null?'':s).replace(/'/g,"\\'").replace(/"/g,'&quot;')}
+function api(p,o){o=o||{};o.headers=Object.assign({'Content-Type':'application/json','X-PP-Key':PPKEY},o.headers||{});return fetch(p,o).then(function(r){return r.json()})}
+function loadWorkflows(){
+  api('/api/compare_workflows').then(function(d){
+    WFS=d.workflows||[];
+    if(!WFS.length){document.getElementById('wfA').innerHTML='<div class="note">등록된 이미지 워크플로가 없어요. 먼저 워크플로우등록.bat 으로 이미지 워크플로를 등록하세요.</div>';return}
+    renderWf('wfA','A');renderWf('wfB','B');
+  })
+}
+function renderWf(elid,side){
+  var box=document.getElementById(elid),sel=side==='A'?selA:selB;
+  box.innerHTML=WFS.map(function(w){
+    var on=w.id===sel?' sel':'';
+    return '<div class="wfopt'+on+'" data-id="'+H(w.id)+'" onclick="pick(\''+side+'\',this.getAttribute(\'data-id\'))">'+
+      '<span class="pickmark">'+(side==='A'?'🅰':'🅱')+'</span>'+H(w.label)+
+      '<span class="tag">'+(w.builtin?'BUILT-IN':'CUSTOM')+'</span></div>'
+  }).join('')
+}
+function pick(side,id){
+  if(side==='A')selA=id;else selB=id;
+  renderWf('wfA','A');renderWf('wfB','B');
+  document.getElementById('selAname').textContent=selA?'· '+labelOf(selA):'';
+  document.getElementById('selBname').textContent=selB?'· '+labelOf(selB):'';
+  document.getElementById('sideA').classList.toggle('has',!!selA);
+  document.getElementById('sideB').classList.toggle('has',!!selB);
+  document.getElementById('same').classList.toggle('on',!!selA&&selA===selB);
+  refresh();
+}
+function lines(){return document.getElementById('prompts').value.split(/\r?\n/).map(function(s){return s.trim()}).filter(Boolean).slice(0,20)}
+function refresh(){
+  var n=lines().length;
+  var enh=document.getElementById('enhance')&&document.getElementById('enhance').checked;
+  document.getElementById('cnt').textContent=(enh?('키워드 '+n+'개 (LLM 확장)'):(n+'줄'))+' · 양쪽 '+(n*2)+'장';
+  document.getElementById('startb').disabled=!(selA&&selB&&n>0);
+  var rb=document.getElementById('rndb');if(rb)rb.disabled=!(selA&&selB);
+}
+function randSeed(){document.getElementById('seed').value=Math.floor(Math.random()*1e9)}
+function labelOf(id){var w=WFS.filter(function(x){return x.id===id})[0];return w?w.label:id}
+function showErr(m){var e=document.getElementById('err');e.textContent='⚠ '+m;e.classList.add('on')}
+function start(){
+  document.getElementById('err').classList.remove('on');
+  var P=lines();if(!selA||!selB||!P.length)return;
+  var body={a:selA,b:selB,prompts:P.join('\n'),seed:parseInt(document.getElementById('seed').value)||42,
+    enhance:document.getElementById('enhance').checked,
+    settings:{image_ratio:document.getElementById('ratio').value,image_megapixels:parseFloat(document.getElementById('mp').value)||1,
+      zit_upscale:document.getElementById('zup').checked}};
+  document.getElementById('startb').disabled=true;
+  api('/api/compare',{method:'POST',body:JSON.stringify(body)}).then(function(d){
+    if(!d.ok){showErr(d.err||'요청 실패');document.getElementById('startb').disabled=false;return}
+    TAG=d.tag;PROMPTS=P;LA=labelOf(selA);LB=labelOf(selB);R={};SIG={};
+    buildBoard(P.length);document.getElementById('board').classList.add('on');
+    document.getElementById('board').scrollIntoView({behavior:'smooth',block:'start'});
+    refresh();if(poller)clearInterval(poller);poller=setInterval(poll,3000);poll();
+  })
+}
+function startRandom(){
+  document.getElementById('err').classList.remove('on');
+  if(!selA||!selB)return;
+  var cnt=Math.max(1,Math.min(20,parseInt(document.getElementById('rcount').value)||10));
+  var body={a:selA,b:selB,random:true,count:cnt,theme:document.getElementById('rtheme').value||'',seed:parseInt(document.getElementById('seed').value)||42,
+    settings:{image_ratio:document.getElementById('ratio').value,image_megapixels:parseFloat(document.getElementById('mp').value)||1,
+      zit_upscale:document.getElementById('zup').checked}};
+  document.getElementById('rndb').disabled=true;
+  api('/api/compare',{method:'POST',body:JSON.stringify(body)}).then(function(d){
+    if(!d.ok){showErr(d.err||'요청 실패');refresh();return}
+    TAG=d.tag;PROMPTS=[];for(var i=0;i<d.count;i++)PROMPTS.push('');
+    LA=labelOf(selA);LB=labelOf(selB);R={};SIG={};
+    buildBoard(d.count);document.getElementById('board').classList.add('on');
+    document.getElementById('board').scrollIntoView({behavior:'smooth',block:'start'});
+    refresh();if(poller)clearInterval(poller);poller=setInterval(poll,3000);poll();
+  })
+}
+function buildBoard(n){
+  CUR=1;renderThumbs();renderViewer();updateProgress();
+}
+function renderThumbs(){
+  var n=PROMPTS.length,h='';
+  for(var i=1;i<=n;i++){
+    var r=R[i]||{},t=r.a||r.b;
+    h+='<div class="thumb'+(i===CUR?' on':'')+'" onclick="jumpTo('+i+')" title="#'+i+'">'+
+       (t?'<img src="'+H(t)+'">':'<span class="tn">'+i+'</span>')+'</div>'
+  }
+  document.getElementById('thumbs').innerHTML=h;
+}
+function renderViewer(){
+  var n=PROMPTS.length;if(CUR<1)CUR=1;if(CUR>n)CUR=n;
+  var r=R[CUR]||{},stage=document.getElementById('stage');
+  if(r.a&&r.b){
+    if(VIEW==='sbs'){
+      stage.innerHTML='<div class="sbs">'+
+        '<div class="sbcell"><img src="'+H(r.a)+'" onclick="fsImg(\''+A(r.a)+'\')"><span class="cmpLab la">🅰 '+H(LA)+'</span></div>'+
+        '<div class="sbcell"><img src="'+H(r.b)+'" onclick="fsImg(\''+A(r.b)+'\')"><span class="cmpLab lb">🅱 '+H(LB)+'</span></div></div>';
+    }else{
+      stage.innerHTML=cmpHTML(r.a,r.b,LA,LB,CUR);
+      attachSlider(stage.querySelector('.cmp'));
+    }
+  }else if(r.a||r.b){
+    var one=r.a||r.b,who=r.a?('🅰 '+LA):('🅱 '+LB),wait=r.a?('🅱 '+LB):('🅰 '+LA);
+    stage.innerHTML='<div class="partial"><img src="'+H(one)+'"><div class="pbadge">'+H(who)+' 준비됨<br>'+H(wait)+' 생성 대기중…</div></div>';
+  }else{
+    stage.innerHTML='<div class="shim">생성 대기중…</div>';
+  }
+  var pr=PROMPTS[CUR-1]||r.prompt||'',note=r.note||'';
+  document.getElementById('vcap').innerHTML='<div class="vcaphead">#'+CUR+' / '+n+(note?'  ·  <span class="vint">👁 '+H(note)+'</span>':'')+'</div>'+
+    (pr?'<div class="vcappr">'+H(pr)+'</div>':'');
+  var ts=document.querySelectorAll('.thumb');for(var k=0;k<ts.length;k++)ts[k].classList.toggle('on',k+1===CUR);
+}
+function nav(d){var n=PROMPTS.length;CUR=Math.max(1,Math.min(n,CUR+d));renderViewer()}
+function jumpTo(i){CUR=i;renderViewer()}
+function cmpHTML(a,b,la,lb,i){
+  return '<div class="cmp" data-i="'+i+'">'+
+    '<img class="base" src="'+H(b)+'" alt="B">'+
+    '<img class="over" src="'+H(a)+'" alt="A">'+
+    '<div class="cmpDiv"><div class="cmpKnob">⇆</div></div>'+
+    '<span class="cmpLab la">🅰 '+H(la)+'</span>'+
+    '<span class="cmpLab lb">🅱 '+H(lb)+'</span>'+
+    '<button class="cmpExp" title="크게 비교" onclick="event.stopPropagation();fsCmp('+i+')">⛶</button></div>';
+}
+function attachSlider(box){
+  if(!box)return;
+  function set(p){p=Math.max(0,Math.min(100,p));var o=box.querySelector('.over'),d=box.querySelector('.cmpDiv');
+    if(o)o.style.clipPath='inset(0 '+(100-p)+'% 0 0)';if(d)d.style.left=p+'%'}
+  function fromX(x){var r=box.getBoundingClientRect();set((x-r.left)/r.width*100)}
+  box.addEventListener('mousemove',function(e){fromX(e.clientX)});
+  box.addEventListener('touchmove',function(e){if(e.touches[0])fromX(e.touches[0].clientX)},{passive:true});
+  set(50);
+}
+function setView(v){
+  VIEW=v;
+  document.getElementById('vtSlider').classList.toggle('on',v==='slider');
+  document.getElementById('vtSbs').classList.toggle('on',v==='sbs');
+  renderViewer();
+}
+function poll(){
+  if(!TAG)return;
+  api('/api/list?per=96&page=1').then(function(d){
+    var imgs=(d.images||[]),re=new RegExp('cmp_'+TAG+'_([AB])(\\d+)'),changed=false;
+    imgs.forEach(function(it){
+      var m=(it.name||'').match(re);if(!m)return;
+      var i=parseInt(m[2],10);R[i]=R[i]||{};
+      var side=m[1]==='A'?'a':'b';
+      if(!R[i][side]){R[i][side]=it.url;changed=true}
+      if(it.prompt&&!R[i].prompt)R[i].prompt=it.prompt;
+      if(it.note&&!R[i].note)R[i].note=it.note;
+    });
+    if(changed){renderThumbs();renderViewer()}
+    updateProgress();
+  })
+}
+function updateProgress(){
+  var done=0,total=PROMPTS.length*2;
+  for(var i=1;i<=PROMPTS.length;i++){var r=R[i]||{};if(r.a)done++;if(r.b)done++}
+  var pct=total?Math.round(done/total*100):0;
+  document.getElementById('prog').style.width=pct+'%';
+  var t=document.getElementById('progtxt');
+  if(done>=total&&total){t.textContent='🏁 완료 '+done+'/'+total;if(poller){clearInterval(poller);poller=null}}
+  else t.textContent='⚔ '+done+' / '+total;
+}
+function fsCmp(i){var r=R[i]||{};if(!r.a||!r.b)return;
+  document.getElementById('fsbody').innerHTML=(r.note?'<div class="fsintent">👁 볼 포인트: '+H(r.note)+'</div>':'')+cmpHTML(r.a,r.b,LA,LB,'fs');
+  var box=document.getElementById('fsbody').querySelector('.cmp');var exp=box.querySelector('.cmpExp');if(exp)exp.remove();
+  attachSlider(box);document.getElementById('lb').classList.add('on');
+}
+function fsImg(u){document.getElementById('fsbody').innerHTML='<img src="'+H(u)+'" style="max-width:96vw;max-height:86vh;border-radius:8px;border:2px solid var(--pink)">';
+  document.getElementById('lb').classList.add('on')}
+function closeFS(){document.getElementById('lb').classList.remove('on');document.getElementById('fsbody').innerHTML=''}
+function loadHistoryList(){
+  var el=document.getElementById('histlist');
+  api('/api/compare_history').then(function(d){
+    var h=d.history||[];
+    if(!h.length){el.innerHTML='<div class="note">아직 저장된 대결이 없어요. 한 판 돌리면 여기 쌓여요.</div>';return}
+    el.innerHTML=h.map(function(x){
+      return '<div class="histrow" onclick="openHistory(\''+H(x.tag)+'\')">'+
+        '<span class="ht">'+H(x.when)+'</span>'+
+        '<span class="hvs"><span class="ca">🅰 '+H(x.a_label)+'</span> vs <span class="cb">🅱 '+H(x.b_label)+'</span></span>'+
+        '<span class="hc">'+x.count+'컷 · '+x.images+'장</span></div>'
+    }).join('')
+  })
+}
+function openHistory(tag){
+  document.getElementById('err').classList.remove('on');
+  api('/api/compare_results?tag='+encodeURIComponent(tag)).then(function(d){
+    if(!d.ok){showErr(d.err||'불러오기 실패');return}
+    if(poller){clearInterval(poller);poller=null}
+    TAG=tag;LA=d.a_label||'A';LB=d.b_label||'B';R={};SIG={};PROMPTS=[];
+    var rows=d.rows||[];
+    rows.forEach(function(r,idx){var i=idx+1;R[i]={a:r.a,b:r.b,prompt:r.prompt,note:r.note};PROMPTS.push(r.prompt||'')});
+    CUR=1;renderThumbs();renderViewer();
+    document.getElementById('board').classList.add('on');
+    document.getElementById('prog').style.width='100%';
+    document.getElementById('progtxt').textContent='📜 불러옴 · '+(rows.length*2)+'장';
+    window.scrollTo({top:0,behavior:'smooth'});
+  })
+}
+document.getElementById('lb').addEventListener('click',function(e){if(e.target===this)closeFS()});
+document.addEventListener('keydown',function(e){
+  if(e.key==='Escape'){closeFS();return}
+  if(!document.getElementById('board').classList.contains('on'))return;
+  if(e.key==='ArrowLeft')nav(-1);else if(e.key==='ArrowRight')nav(1);
+});
+document.getElementById('prompts').addEventListener('input',refresh);
+loadWorkflows();refresh();loadHistoryList();
+</script></body></html>'''
+
 PAGE = r'''<!doctype html><html lang="ko"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>너무바쁜베짱이 · 핑퐁 갤러리</title>
@@ -1792,6 +2343,7 @@ body{margin:0;background:#0a0814;color:var(--ink);font-family:'VT323',monospace;
   <button class="genb pix" id="genbtn" onclick="gen()">생성 ▸</button>
   <button class="folderb" id="stopbtn" onclick="stopComfy()" disabled title="큐가 돌 때 활성화돼요">■ 정지</button>
   <button class="folderb" onclick="openGallery()">📁 폴더</button>
+  <button class="folderb" onclick="window.open('/compare','_blank')" title="A vs B 모델 대결 탭 열기">⚔️ 모델비교</button>
   <button class="lansw" id="lansw" onclick="toggleLan()" title="다른 PC에서 대시보드 접속 허용"><span>LAN</span><span class="knob"></span><span id="lanstate">로컬</span></button>
   <button class="folderb" onclick="restartDash()">↻ 재시작</button>
 </div>
