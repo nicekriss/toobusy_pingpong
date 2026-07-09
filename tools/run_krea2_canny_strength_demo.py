@@ -16,7 +16,9 @@ HUB_ROOT = Path(r"D:\working\KREA2_ControlNet_DemoHub")
 SOURCE_SUBDIR = "krea2_control_top7_landscape"
 BASE_NAME = "control_canny_04_neon_portal_base_16x9.png"
 EDGE_NAME = "control_canny_04_neon_portal_edges_16x9.png"
-BUNDLE = "krea2_canny_nk2e_incontext_strength_neon_portal_0710"
+EDGE_1MP_NAME = "control_canny_04_neon_portal_edges_1mp_1024x576.png"
+EDGE_2K_NAME = "control_canny_04_neon_portal_edges_2k_2048x1152.png"
+BUNDLE = "krea2_canny_nk2e_matched_edge_strength_0710"
 OUT_SUBDIR = f"pingpong/{BUNDLE}"
 
 STAGES = [
@@ -45,7 +47,7 @@ def rel_input(path: Path) -> str:
     return path.relative_to(INPUT_ROOT).as_posix()
 
 
-def make_base_and_edge() -> tuple[Path, Path]:
+def make_base_and_edge() -> tuple[Path, Path, Path]:
     input_dir = INPUT_ROOT / SOURCE_SUBDIR
     hub_dir = HUB_ROOT / "control_sources"
     input_dir.mkdir(parents=True, exist_ok=True)
@@ -103,15 +105,19 @@ def make_base_and_edge() -> tuple[Path, Path]:
     edge_rgb = Image.new("RGB", edges.size, (0, 0, 0))
     edge_rgb.paste((245, 252, 255), mask=edges)
     edge_path = input_dir / EDGE_NAME
+    edge_2k_path = input_dir / EDGE_2K_NAME
+    edge_1mp_path = input_dir / EDGE_1MP_NAME
     edge_rgb.save(edge_path)
+    edge_rgb.save(edge_2k_path)
+    edge_rgb.resize((1024, 576), Image.Resampling.LANCZOS).save(edge_1mp_path)
 
-    for src in (base_path, edge_path):
+    for src in (base_path, edge_path, edge_1mp_path, edge_2k_path):
         dst = hub_dir / src.name
         dst.write_bytes(src.read_bytes())
-    return base_path, edge_path
+    return base_path, edge_1mp_path, edge_2k_path
 
 
-def build_workflow(base_path: Path, stage: str, strength: float, idx: int) -> dict:
+def build_workflow(edge_1mp_path: Path, edge_2k_path: Path, stage: str, strength: float, idx: int) -> dict:
     prompt = (
         "A single handsome Korean male cyberpunk idol performer lunges toward the camera through a huge neon portal tunnel, "
         "low wide-angle music-video shot, glossy black jacket with electric cyan and hot-pink graphic panels, reflective glass runway, "
@@ -122,11 +128,8 @@ def build_workflow(base_path: Path, stage: str, strength: float, idx: int) -> di
     seed = 701000 + idx
     prefix = f"{OUT_SUBDIR}/{BUNDLE}_{stage}"
     workflow = {
-        "1": {"class_type": "LoadImage", "inputs": {"image": rel_input(base_path)}},
-        "2": {
-            "class_type": "CannyEdgePreprocessor",
-            "inputs": {"image": ["1", 0], "low_threshold": 80, "high_threshold": 180, "resolution": 1024},
-        },
+        "1": {"class_type": "LoadImage", "inputs": {"image": rel_input(edge_1mp_path)}},
+        "2": {"class_type": "LoadImage", "inputs": {"image": rel_input(edge_2k_path)}},
         "3": {"class_type": "UNETLoader", "inputs": {"unet_name": "krea2_turbo_fp8_scaled.safetensors", "weight_dtype": "default"}},
         "4": {
             "class_type": "LoraLoaderModelOnly",
@@ -145,7 +148,7 @@ def build_workflow(base_path: Path, stage: str, strength: float, idx: int) -> di
         "9": {"class_type": "EmptyLatentImage", "inputs": {"width": 1024, "height": 576, "batch_size": 1}},
         "10": {
             "class_type": "VAEEncode",
-            "inputs": {"pixels": ["2", 0], "vae": ["8", 0]},
+            "inputs": {"pixels": ["1", 0], "vae": ["8", 0]},
         },
         "11": {"class_type": "NK2EInContextModelNode", "inputs": {"model": ["6", 0]}},
         "12": {"class_type": "CLIPTextEncode", "inputs": {"text": prompt, "clip": ["7", 0]}},
@@ -231,30 +234,37 @@ def output_paths(history: dict) -> list[Path]:
     return paths
 
 
-def write_sidecar(path: Path, edge_path: Path, stage: str, strength: float, idx: int, elapsed: float) -> None:
+def write_sidecar(path: Path, edge_1mp_path: Path, edge_2k_path: Path, stage: str, strength: float, idx: int, elapsed: float) -> None:
+    with Image.open(path) as im:
+        width, height = im.size
     meta = {
         "request": "KREA2 Canny ControlNet strength demo",
         "generated": f"Canny edge ControlNet strength {strength:.2f}: neon portal cyberpunk idol performer, single subject, pop comic music-video style.",
         "mode": "image",
-        "note": f"Canny/Edge control source fixed on left; right image uses strength {strength:.2f}.",
-        "orig": rel_input(edge_path),
+        "note": f"Canny/Edge control source fixed on left; right image uses strength {strength:.2f}. The displayed 2K edge source is the same file used in the hires reference pass.",
+        "orig": rel_input(edge_2k_path),
+        "orig_1mp": rel_input(edge_1mp_path),
         "bundle": BUNDLE,
         "stage": "ControlNet OFF" if strength == 0 else f"Canny strength {strength:.2f}",
         "stage_idx": idx,
         "gen_secs": round(elapsed, 1),
+        "width": width,
+        "height": height,
+        "resolution": f"{width}x{height}",
     }
     path.with_suffix(path.suffix + ".pingpong.json").write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 def main() -> None:
-    base_path, edge_path = make_base_and_edge()
+    base_path, edge_1mp_path, edge_2k_path = make_base_and_edge()
     print(f"base={base_path}")
-    print(f"edge={edge_path}")
+    print(f"edge_1mp={edge_1mp_path}")
+    print(f"edge_2k={edge_2k_path}")
     request_json("/system_stats", timeout=5)
 
     results = []
     for idx, (stage, strength) in enumerate(STAGES, 1):
-        workflow = build_workflow(base_path, stage, strength, idx)
+        workflow = build_workflow(edge_1mp_path, edge_2k_path, stage, strength, idx)
         client_id = str(uuid.uuid4())
         t0 = time.time()
         queued = request_json("/prompt", {"prompt": workflow, "client_id": client_id}, timeout=30)
@@ -266,13 +276,13 @@ def main() -> None:
         if not paths:
             raise RuntimeError(f"No image output for {stage}")
         final = max(paths, key=lambda p: p.stat().st_mtime if p.exists() else 0)
-        write_sidecar(final, edge_path, stage, strength, idx, elapsed)
+        write_sidecar(final, edge_1mp_path, edge_2k_path, stage, strength, idx, elapsed)
         print(f"[{idx}/{len(STAGES)}] done {final} ({elapsed:.1f}s)", flush=True)
         results.append(str(final))
 
     manifest = HUB_ROOT / "rehearsal_results" / f"{BUNDLE}_manifest.json"
     manifest.parent.mkdir(parents=True, exist_ok=True)
-    manifest.write_text(json.dumps({"bundle": BUNDLE, "base": str(base_path), "edge": str(edge_path), "results": results}, ensure_ascii=False, indent=2), encoding="utf-8")
+    manifest.write_text(json.dumps({"bundle": BUNDLE, "base": str(base_path), "edge_1mp": str(edge_1mp_path), "edge_2k": str(edge_2k_path), "results": results}, ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"manifest={manifest}")
 
 

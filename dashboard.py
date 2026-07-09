@@ -485,6 +485,9 @@ def media_meta(path):
             "bundle": str(meta.get("bundle", "") or ""),
             "stage": str(meta.get("stage", "") or ""),
             "stage_idx": int(meta.get("stage_idx", 0) or 0),
+            "width": meta.get("width") or meta.get("w"),
+            "height": meta.get("height") or meta.get("h"),
+            "resolution": str(meta.get("resolution", "") or ""),
         }
     except Exception:
         return {"request": "", "generated": "", "mode": "", "note": "", "orig": "", "gen_secs": 0,
@@ -781,6 +784,9 @@ def scan(page=1, per=48):
         item["bundle"] = meta.get("bundle", "")
         item["stage"] = meta.get("stage", "")
         item["stage_idx"] = meta.get("stage_idx", 0)
+        item["width"] = meta.get("width")
+        item["height"] = meta.get("height")
+        item["resolution"] = meta.get("resolution", "")
         key = item["bundle"] or ("__solo_" + item["rel"])
         if key not in groups:
             groups[key] = []
