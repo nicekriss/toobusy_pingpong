@@ -3416,7 +3416,7 @@ var CMP={items:[],L:0,R:0,orig:null,scale:1,tx:0,ty:0,wipe:50,drag:null};
 function cmpLetter(i){return String.fromCharCode(65+i)}
 function openCmp(key){var ms=BUNDLES[key];if(!ms||ms.length<2)return;
   CMP.items=ms;CMP.L=0;CMP.R=ms.length-1;CMP.orig=null;CMP.scale=1;CMP.tx=0;CMP.ty=0;CMP.wipe=50;
-  for(var oi=0;oi<ms.length;oi++){if(ms[oi].orig_url){CMP.orig={url:ms[oi].orig_url,rel:ms[oi].orig||'',label:'DEPTH SOURCE'};break}}
+  for(var oi=0;oi<ms.length;oi++){if(ms[oi].orig_url){CMP.orig={url:ms[oi].orig_url,rel:ms[oi].orig||'',label:'CONTROL SOURCE'};break}}
   document.getElementById('cfs').classList.add('on');document.body.classList.add('modalopen');
   renderCmpChips();applyCmpImgs();applyCmpView()}
 function closeCmp(){document.getElementById('cfs').classList.remove('on');if(!document.getElementById('lb').classList.contains('open'))document.body.classList.remove('modalopen')}
@@ -3424,7 +3424,7 @@ function renderCmpChips(){
   [['L','cfsL'],['R','cfsR']].forEach(function(p){
     var side=p[0],box=document.getElementById(p[1]),skEl=box.querySelector('.sk'),sk=skEl?skEl.outerHTML:'';
     if(side==='L'&&CMP.orig){
-      box.innerHTML=sk+'<button class="cfschip on" title="'+esc(CMP.orig.rel)+'">DEPTH SOURCE<br>'+esc((CMP.orig.rel||'control image').split('/').pop())+'</button>';
+      box.innerHTML=sk+'<button class="cfschip on" title="'+esc(CMP.orig.rel)+'">CONTROL SOURCE<br>'+esc((CMP.orig.rel||'control image').split('/').pop())+'</button>';
       return;
     }
     var chips=CMP.items.map(function(it,i){
@@ -3445,11 +3445,11 @@ function applyCmpImgs(){
 function cmpDim(img){return img.naturalWidth?(img.naturalWidth+'×'+img.naturalHeight):''}
 function updateCmpLabels(){
   var L=document.getElementById('cfsLimg'),R=document.getElementById('cfsRimg');
-  document.getElementById('cfslabL').innerHTML=(CMP.orig?'DEPTH SOURCE':(cmpLetter(CMP.L)+' '+esc(CMP.items[CMP.L].stage||'')))+(cmpDim(L)?'<span class="dim">'+esc(cmpDim(L))+'</span>':'');
+  document.getElementById('cfslabL').innerHTML=(CMP.orig?'CONTROL SOURCE':(cmpLetter(CMP.L)+' '+esc(CMP.items[CMP.L].stage||'')))+(cmpDim(L)?'<span class="dim">'+esc(cmpDim(L))+'</span>':'');
   document.getElementById('cfslabR').innerHTML=cmpLetter(CMP.R)+' '+esc(CMP.items[CMP.R].stage||'')+(cmpDim(R)?'<span class="dim">'+esc(cmpDim(R))+'</span>':'');
   updateCmpInfo();
 }
-function updateCmpInfo(){document.getElementById('cfsinfo').innerHTML=(CMP.orig?'왼쪽=뎁스 재료 고정 · 오른쪽=강도 선택 · ':'마우스 좌우=와이프 · ')+'휠=줌 <b>'+Math.round(CMP.scale*100)+'%</b> · 드래그=이동 · 더블클릭=리셋 · '+(CMP.orig?'키 1~9=오른쪽':'키 1~9=왼쪽 · Shift+1~9=오른쪽')+' · ESC 닫기'}
+function updateCmpInfo(){document.getElementById('cfsinfo').innerHTML=(CMP.orig?'왼쪽=컨트롤 재료 고정 · 오른쪽=강도 선택 · ':'마우스 좌우=와이프 · ')+'휠=줌 <b>'+Math.round(CMP.scale*100)+'%</b> · 드래그=이동 · 더블클릭=리셋 · '+(CMP.orig?'키 1~9=오른쪽':'키 1~9=왼쪽 · Shift+1~9=오른쪽')+' · ESC 닫기'}
 function applyCmpView(){
   document.getElementById('cfszoom').style.transform='translate('+CMP.tx+'px,'+CMP.ty+'px) scale('+CMP.scale+')';
   applyCmpWipe();updateCmpInfo();
