@@ -16,7 +16,7 @@ HUB_ROOT = Path(r"D:\working\KREA2_ControlNet_DemoHub")
 SOURCE_SUBDIR = "krea2_control_top7_landscape"
 BASE_NAME = "control_canny_04_neon_portal_base_16x9.png"
 EDGE_NAME = "control_canny_04_neon_portal_edges_16x9.png"
-BUNDLE = "krea2_canny_strength_neon_portal_0710"
+BUNDLE = "krea2_canny_nk2e_incontext_strength_neon_portal_0710"
 OUT_SUBDIR = f"pingpong/{BUNDLE}"
 
 STAGES = [
@@ -137,30 +137,20 @@ def build_workflow(base_path: Path, stage: str, strength: float, idx: int) -> di
             "inputs": {"model": ["4", 0], "lora_name": r"KREA2\KREA2_TOP7\06_illustria_anime01_krea2.safetensors", "strength_model": 0.28},
         },
         "6": {
-            "class_type": "Krea2ControlLoRALoader",
-            "inputs": {"model": ["5", 0], "lora_name": r"KREA2_ControlNet\krea2_depth_control_lora.safetensors", "strength": strength},
+            "class_type": "LoraLoaderModelOnly",
+            "inputs": {"model": ["5", 0], "lora_name": r"KREA2_ControlNet\NK2E-canny-v0.1.safetensors", "strength_model": strength},
         },
         "7": {"class_type": "CLIPLoader", "inputs": {"clip_name": "qwen3vl_4b_fp8_scaled.safetensors", "type": "krea2", "device": "default"}},
         "8": {"class_type": "VAELoader", "inputs": {"vae_name": "qwen_image_vae.safetensors"}},
-        "9": {"class_type": "EmptyLatentImage", "inputs": {"width": 1024, "height": 552, "batch_size": 1}},
+        "9": {"class_type": "EmptyLatentImage", "inputs": {"width": 1024, "height": 576, "batch_size": 1}},
         "10": {
-            "class_type": "Krea2ControlImageEncode",
-            "inputs": {
-                "control_image": ["2", 0],
-                "vae": ["8", 0],
-                "resize": "match_latent_size",
-                "upscale_method": "lanczos",
-                "crop": "center",
-                "channel_mode": "grayscale",
-                "normalize": "none",
-                "invert": False,
-                "batch_mode": "independent_images",
-                "latent": ["9", 0],
-            },
+            "class_type": "VAEEncode",
+            "inputs": {"pixels": ["2", 0], "vae": ["8", 0]},
         },
-        "11": {"class_type": "Krea2ControlApply", "inputs": {"model": ["6", 0], "control_latent": ["10", 0]}},
+        "11": {"class_type": "NK2EInContextModelNode", "inputs": {"model": ["6", 0]}},
         "12": {"class_type": "CLIPTextEncode", "inputs": {"text": prompt, "clip": ["7", 0]}},
         "13": {"class_type": "ConditioningZeroOut", "inputs": {"conditioning": ["12", 0]}},
+        "23": {"class_type": "NK2ESetReferenceNode", "inputs": {"conditioning": ["12", 0], "reference": ["10", 0]}},
         "14": {
             "class_type": "KSampler",
             "inputs": {
@@ -171,7 +161,7 @@ def build_workflow(base_path: Path, stage: str, strength: float, idx: int) -> di
                 "scheduler": "simple",
                 "denoise": 1,
                 "model": ["11", 0],
-                "positive": ["12", 0],
+                "positive": ["23", 0],
                 "negative": ["13", 0],
                 "latent_image": ["9", 0],
             },
@@ -190,21 +180,10 @@ def build_workflow(base_path: Path, stage: str, strength: float, idx: int) -> di
             },
         },
         "18": {
-            "class_type": "Krea2ControlImageEncode",
-            "inputs": {
-                "control_image": ["2", 0],
-                "vae": ["8", 0],
-                "resize": "match_latent_size",
-                "upscale_method": "lanczos",
-                "crop": "center",
-                "channel_mode": "grayscale",
-                "normalize": "none",
-                "invert": False,
-                "batch_mode": "independent_images",
-                "latent": ["17", 1],
-            },
+            "class_type": "VAEEncode",
+            "inputs": {"pixels": ["2", 0], "vae": ["8", 0]},
         },
-        "19": {"class_type": "Krea2ControlApply", "inputs": {"model": ["6", 0], "control_latent": ["18", 0]}},
+        "19": {"class_type": "NK2ESetReferenceNode", "inputs": {"conditioning": ["12", 0], "reference": ["18", 0]}},
         "20": {
             "class_type": "KSampler",
             "inputs": {
@@ -214,8 +193,8 @@ def build_workflow(base_path: Path, stage: str, strength: float, idx: int) -> di
                 "sampler_name": "euler",
                 "scheduler": "simple",
                 "denoise": 0.24,
-                "model": ["19", 0],
-                "positive": ["12", 0],
+                "model": ["11", 0],
+                "positive": ["19", 0],
                 "negative": ["13", 0],
                 "latent_image": ["17", 1],
             },
@@ -224,11 +203,11 @@ def build_workflow(base_path: Path, stage: str, strength: float, idx: int) -> di
         "22": {"class_type": "SaveImage", "inputs": {"filename_prefix": prefix, "images": ["21", 0]}},
     }
     if strength <= 0:
-        # OFF means no KREA2 ControlNet path at all. Passing a zero-strength
-        # model through Krea2ControlApply is not equivalent and can fail
-        # validation/runtime checks in comfyui-krea2-controlnet.
+        # OFF means no NK2E in-context path at all.
         workflow["14"]["inputs"]["model"] = ["5", 0]
+        workflow["14"]["inputs"]["positive"] = ["12", 0]
         workflow["20"]["inputs"]["model"] = ["5", 0]
+        workflow["20"]["inputs"]["positive"] = ["12", 0]
     return workflow
 
 
