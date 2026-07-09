@@ -60,6 +60,7 @@ MODE_STATUS_CACHE = {"t": 0, "data": {}}
 AUDIO_LYRICS_CACHE = {}
 MODEL_DOWNLOADS = {}
 DOWNLOAD_LOCK = threading.Lock()
+HIDDEN_LOCK = threading.Lock()
 HIDDEN_SUBPROCESS_FLAGS = 0
 if os.name == "nt" and hasattr(subprocess, "CREATE_NO_WINDOW"):
     HIDDEN_SUBPROCESS_FLAGS = subprocess.CREATE_NO_WINDOW
@@ -123,6 +124,14 @@ def write_config(data):
     LMAPI = CFG.get("lmstudio_api", "http://127.0.0.1:1234").rstrip("/")
     MODE_STATUS_CACHE["t"] = 0
 
+def refresh_runtime_config():
+    global CFG, CUSTOM, LMAPI
+    cfg = read_config()
+    CFG = cfg
+    CUSTOM = cfg.get("custom_workflows", {}) or {}
+    LMAPI = cfg.get("lmstudio_api", "http://127.0.0.1:1234").rstrip("/")
+    return cfg
+
 def dashboard_key():
     cfg = read_config()
     key = (cfg.get("dashboard_key") or "").strip()
@@ -148,6 +157,8 @@ def needs_dashboard_key(path):
         "/api/download_model",
         "/api/compare",
         "/api/compare_score",
+        "/api/compare_hide",
+        "/api/compare_delete",
     }
 
 def _add_model(out, seen, model_id, label=None, source=""):
@@ -470,9 +481,14 @@ def media_meta(path):
             "mode": meta.get("mode", ""),
             "note": str(meta.get("note", "") or "").strip(),
             "orig": str(meta.get("orig", "") or "").strip(),
+            "gen_secs": meta.get("gen_secs", 0) or 0,
+            "bundle": str(meta.get("bundle", "") or ""),
+            "stage": str(meta.get("stage", "") or ""),
+            "stage_idx": int(meta.get("stage_idx", 0) or 0),
         }
     except Exception:
-        return {"request": "", "generated": "", "mode": "", "note": "", "orig": ""}
+        return {"request": "", "generated": "", "mode": "", "note": "", "orig": "", "gen_secs": 0,
+                "bundle": "", "stage": "", "stage_idx": 0}
 
 def _decode_audio_text(enc, data):
     if not data:
@@ -587,15 +603,43 @@ def audio_lyrics(path):
     return text
 
 def load_hidden():
-    try:
-        return set(json.load(open(HIDDEN, encoding="utf-8")))
-    except Exception:
-        return set()
+    with HIDDEN_LOCK:
+        try:
+            with open(HIDDEN, encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, list):
+                return {str(x) for x in data if x}
+            return set()
+        except Exception:
+            pass
+        try:
+            # Older concurrent writes could leave a malformed file such as
+            # ["a.png"] "b.png", "c.png". Salvage quoted paths instead of
+            # treating every hidden item as lost.
+            raw = open(HIDDEN, encoding="utf-8", errors="replace").read()
+            vals = re.findall(r'"([^"\\]*(?:\\.[^"\\]*)*)"', raw)
+            out = set()
+            for v in vals:
+                try:
+                    v = json.loads('"' + v + '"')
+                except Exception:
+                    pass
+                if v and "." in str(v):
+                    out.add(str(v).replace("\\", "/"))
+            return out
+        except Exception:
+            return set()
 def save_hidden(s):
-    try:
-        json.dump(sorted(s), open(HIDDEN, "w", encoding="utf-8"))
-    except Exception:
-        pass
+    with HIDDEN_LOCK:
+        try:
+            tmp = HIDDEN + ".tmp"
+            data = sorted({str(x).replace("\\", "/") for x in s if x})
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+                f.write("\n")
+            os.replace(tmp, HIDDEN)
+        except Exception:
+            pass
 
 def load_reference_presets():
     try:
@@ -647,12 +691,48 @@ def reference_preset_save(name, assets):
     save_reference_presets(data)
     return rows[-1]
 
+try:
+    from PIL import Image as _PILImage
+except ImportError:
+    _PILImage = None
+
+THUMB_DIR = os.path.join(GALLERY, ".thumbs")  # 갤러리 스캔은 .폴더를 무시함
+THUMB_MAX = 512
+
+def thumb_path_for(rel):
+    safe = re.sub(r"[^A-Za-z0-9가-힣_.-]+", "_", rel.replace("/", "__"))
+    return os.path.join(THUMB_DIR, safe + ".jpg")
+
+def ensure_thumb(rel):
+    """원본보다 오래된/없는 썸네일을 (재)생성. 실패하면 None → 원본 서빙 폴백."""
+    if _PILImage is None:
+        return None
+    full = safe_path(rel)
+    if not full or not os.path.isfile(full):
+        return None
+    tp = thumb_path_for(rel)
+    try:
+        if os.path.isfile(tp) and os.path.getmtime(tp) >= os.path.getmtime(full):
+            return tp
+        os.makedirs(THUMB_DIR, exist_ok=True)
+        with _PILImage.open(full) as im:
+            im.thumbnail((THUMB_MAX, THUMB_MAX))
+            if im.mode not in ("RGB", "L"):
+                im = im.convert("RGB")
+            tmp = tp + ".tmp"
+            im.save(tmp, "JPEG", quality=84)
+        os.replace(tmp, tp)
+        return tp
+    except Exception as e:
+        event(f"thumb fail {rel}: {e}")
+        return None
+
 def scan(page=1, per=48):
     hidden = load_hidden()
     page = max(1, int(page or 1))
     per = max(12, min(96, int(per or 48)))
     out = {"images": [], "videos": [], "audios": [], "hiddenCount": 0,
-           "imagePage": page, "imagePer": per, "imageTotal": 0, "imagePages": 1}
+           "imagePage": page, "imagePer": per, "imageTotal": 0, "imageFileTotal": 0, "imagePages": 1}
     if not os.path.isdir(GALLERY):
         return out
     images = []
@@ -674,29 +754,48 @@ def scan(page=1, per=48):
                 mt = os.path.getmtime(full)
             except OSError:
                 continue
+            if time.time() - mt < 1.5:
+                continue  # 아직 쓰는 중일 수 있음(부분 파일 캐시 방지) — 다음 폴링에 표시
             item = {"name": fn, "rel": rel,
-                    "url": "/media/" + urllib.parse.quote(rel), "mtime": mt}
+                    "url": "/media/" + urllib.parse.quote(rel) + "?v=" + str(int(mt * 1000)), "mtime": mt}
             if kind == "images":
                 item["full"] = full
+                item["thumb"] = "/thumb/" + urllib.parse.quote(rel) + "?v=" + str(int(mt * 1000))
                 images.append(item)
             else:
                 if kind == "audios":
                     item["lyrics"] = audio_lyrics(full)
                 out[kind].append(item)
     images.sort(key=lambda x: x["mtime"], reverse=True)
-    out["imageTotal"] = len(images)
-    out["imagePages"] = max(1, (len(images) + per - 1) // per)
-    page = min(page, out["imagePages"])
-    out["imagePage"] = page
-    start = (page - 1) * per
-    for item in images[start:start + per]:
-        full = item.pop("full")
+    groups, group_order = {}, []
+    for item in images:
+        full = item["full"]
         meta = media_meta(full)
         item["request"] = meta["request"]
         item["prompt"] = meta["generated"] or image_prompt(full)
         item["mode"] = meta["mode"]
         item["note"] = meta.get("note", "")
-        out["images"].append(item)
+        item["orig"] = meta.get("orig", "")
+        item["orig_url"] = input_media_url(item["orig"])
+        item["gen_secs"] = meta.get("gen_secs", 0)
+        item["bundle"] = meta.get("bundle", "")
+        item["stage"] = meta.get("stage", "")
+        item["stage_idx"] = meta.get("stage_idx", 0)
+        key = item["bundle"] or ("__solo_" + item["rel"])
+        if key not in groups:
+            groups[key] = []
+            group_order.append(key)
+        groups[key].append(item)
+    out["imageFileTotal"] = len(images)
+    out["imageTotal"] = len(group_order)
+    out["imagePages"] = max(1, (len(group_order) + per - 1) // per)
+    page = min(page, out["imagePages"])
+    out["imagePage"] = page
+    start = (page - 1) * per
+    for key in group_order[start:start + per]:
+        for item in groups[key]:
+            item.pop("full", None)
+            out["images"].append(item)
     for k in ("videos", "audios"):
         out[k].sort(key=lambda x: x["mtime"], reverse=True)
     return out
@@ -734,6 +833,7 @@ def status():
     }
 
 def custom_modes():
+    refresh_runtime_config()
     out = []
     for name, spec in CUSTOM.items():
         trigger = spec.get("trigger") or ("/" + name)
@@ -746,12 +846,22 @@ def custom_modes():
             "llm": spec.get("llm", "none"),
             "image_inputs": len(spec.get("image_nodes", [])),
             "ratio": bool(spec.get("ratio_node") or spec.get("width_nodes")),
+            "enhancer": bool(spec.get("enhancer_node")),
+            "stages": [str(s[1]) if isinstance(s, (list, tuple)) and len(s) > 1 else f"단계{i}"
+                       for i, s in enumerate(spec.get("stage_nodes", []), 1)],
+            "tune": [{"label": (str(d[2]) if len(d) > 2 else f"T{i}"),
+                      "value": (d[3] if len(d) > 3 else None),
+                      "min": (d[4] if len(d) > 4 else 0),
+                      "max": (d[5] if len(d) > 5 else 1),
+                      "step": (d[6] if len(d) > 6 else 0.05)}
+                     for i, d in enumerate(spec.get("tune_nodes") or spec.get("denoise_nodes") or [], 1)],
         })
     return out
 
 def compare_workflows():
     """모델 대결에 쓸 수 있는 이미지 워크플로 목록(내장 ZIT + 등록된 이미지 커스텀).
     image_inputs>0 이면 편집형(입력 사진 필요) — 프론트에서 같은 종류끼리만 붙임."""
+    refresh_runtime_config()
     out = [{"id": "zit", "label": "Z-Image Turbo", "builtin": True, "ratio": True, "image_inputs": 0},
            {"id": "klein", "label": "Flux2 Klein", "builtin": True, "ratio": False, "image_inputs": 1}]
     for name, spec in CUSTOM.items():
@@ -819,6 +929,7 @@ def compare_history():
                     else:
                         b_label = lab or b_label
         out.append({"tag": tag, "a_label": a_label or "A", "b_label": b_label or "B",
+                    "single": not b_label,
                     "count": len(cells), "images": images, "mtime": latest,
                     "scored": os.path.isfile(os.path.join(SCORES_DIR, f"{tag}.json")),
                     "when": time.strftime("%m/%d %H:%M", time.localtime(latest)) if latest else tag})
@@ -831,28 +942,45 @@ def compare_results(tag):
         return {"ok": False, "err": "기록을 찾을 수 없어요."}
     a_label = b_label = ""
     rows = []
+    a_secs_all, b_secs_all = [], []
     for idx in sorted(cells.keys()):
         sides = cells[idx]
-        row = {"i": idx, "a": "", "b": "", "prompt": "", "note": ""}
+        row = {"i": idx, "a": "", "b": "", "prompt": "", "note": "", "a_secs": 0, "b_secs": 0}
         for side in ("A", "B"):
             fn = sides.get(side)
             if not fn:
                 continue
             full = os.path.join(GALLERY, fn)
             meta = media_meta(full)
-            url = "/media/" + urllib.parse.quote(fn)
+            try:
+                ver = "?v=" + str(int(os.path.getmtime(full) * 1000))
+            except OSError:
+                ver = ""
+            url = "/media/" + urllib.parse.quote(fn) + ver
+            secs = round(float(meta.get("gen_secs", 0) or 0), 1)
             if side == "A":
                 row["a"] = url
+                row["a_secs"] = secs
+                if secs:
+                    a_secs_all.append(secs)
                 a_label = a_label or _compare_label_from_meta(meta)
             else:
                 row["b"] = url
+                row["b_secs"] = secs
+                if secs:
+                    b_secs_all.append(secs)
                 b_label = b_label or _compare_label_from_meta(meta)
             if meta.get("generated") and (side == "A" or not row["prompt"]):
                 row["prompt"] = meta.get("generated")
             if meta.get("note") and (side == "A" or not row["note"]):
                 row["note"] = meta.get("note")
         rows.append(row)
-    return {"ok": True, "tag": tag, "a_label": a_label or "A", "b_label": b_label or "B", "rows": rows}
+    # 장당 평균(첫 컷은 모델 로딩 포함이라 2컷 이상이면 제외해서 순수 속도에 가깝게)
+    def _avg(v):
+        v = v[1:] if len(v) > 1 else v
+        return round(sum(v) / len(v), 1) if v else 0
+    return {"ok": True, "tag": tag, "a_label": a_label or "A", "b_label": b_label or "B",
+            "a_avg_secs": _avg(a_secs_all), "b_avg_secs": _avg(b_secs_all), "rows": rows}
 
 SCORES_DIR = os.path.join(HERE, "compare_scores")
 
@@ -884,6 +1012,24 @@ def read_compare_scores(tag):
     except Exception:
         return None
 
+def compare_tag_files(tag, include_meta=False):
+    """한 대결(tag)의 갤러리 파일명들. include_meta면 .pingpong.json 사이드카도 포함."""
+    out = []
+    prefix = "cmp_" + str(tag or "") + "_"
+    if not tag:
+        return out
+    try:
+        for fn in os.listdir(GALLERY):
+            if not fn.startswith(prefix):
+                continue
+            if os.path.splitext(fn)[1].lower() in IMG_EXT:
+                out.append(fn)
+            elif include_meta and fn.endswith(".pingpong.json"):
+                out.append(fn)
+    except FileNotFoundError:
+        pass
+    return out
+
 def _norm_model(name):
     return str(name or "").replace("\\", "/").lower()
 
@@ -909,11 +1055,15 @@ def comfy_input_options(info, field):
         return None
     for section in ("required", "optional"):
         try:
-            opts = info["input"][section][field][0]
-            if isinstance(opts, list):
-                return opts
+            f = info["input"][section][field]
         except Exception:
-            pass
+            continue
+        if not isinstance(f, list) or not f:
+            continue
+        if isinstance(f[0], list):  # 구형: [[옵션...], {...}]
+            return f[0]
+        if len(f) > 1 and isinstance(f[1], dict) and isinstance(f[1].get("options"), list):
+            return f[1]["options"]  # 신형: ["COMBO", {"options": [...]}]
     return None
 
 def comfy_has_model(expected, options):
@@ -1551,6 +1701,29 @@ def safe_path(rel):
         return None
     return full
 
+def safe_input_path(rel):
+    root = os.path.abspath(INPUTDIR)
+    full = os.path.abspath(os.path.normpath(os.path.join(root, rel or "")))
+    try:
+        if os.path.commonpath([root, full]) != root:
+            return None
+    except ValueError:
+        return None
+    return full
+
+def input_media_url(rel):
+    rel = (rel or "").strip().replace("\\", "/")
+    if not rel:
+        return ""
+    full = safe_input_path(rel)
+    if not full or not os.path.isfile(full):
+        return ""
+    try:
+        ver = str(int(os.path.getmtime(full) * 1000))
+    except OSError:
+        ver = str(int(time.time() * 1000))
+    return "/inputmedia/" + urllib.parse.quote(rel) + "?v=" + ver
+
 def restart_self():
     code = (
         "import subprocess,sys,time;"
@@ -1636,7 +1809,12 @@ class H(BaseHTTPRequestHandler):
         elif p == "/api/comfy_log":
             self._json({"lines": comfy_log()})
         elif p == "/api/youtube_latest":
-            self._json(youtube_latest())
+            data = dict(youtube_latest())
+            promo = read_config().get("promo_banner") or {}
+            if isinstance(promo, dict) and promo.get("url"):
+                data["promo"] = {"title": str(promo.get("title") or "내 강의 보러가기"),
+                                 "url": str(promo.get("url"))}
+            self._json(data)
         elif p == "/api/reference_presets":
             self._json(reference_preset_list())
         elif p == "/api/reference_preset":
@@ -1648,6 +1826,15 @@ class H(BaseHTTPRequestHandler):
                 self._json({"ok": True, "preset": preset})
         elif p.startswith("/media/"):
             self.serve_media(urllib.parse.unquote(p[len("/media/"):]))
+        elif p.startswith("/inputmedia/"):
+            self.serve_input_media(urllib.parse.unquote(p[len("/inputmedia/"):]))
+        elif p.startswith("/thumb/"):
+            rel = urllib.parse.unquote(p[len("/thumb/"):])
+            tp = ensure_thumb(rel)
+            if tp:
+                self.serve_file_abs(tp, "image/jpeg")
+            else:
+                self.serve_media(rel)  # 썸네일 실패 시 원본 폴백
         else:
             self.send_error(404)
 
@@ -1711,10 +1898,14 @@ class H(BaseHTTPRequestHandler):
             prompts = body.get("prompts") or ""
             settings = body.get("settings", {}) if isinstance(body.get("settings", {}), dict) else {}
             wfmap = {w["id"]: w for w in compare_workflows()}
-            if a not in wfmap or b not in wfmap:
-                return self._json({"ok": False, "err": "A/B 워크플로를 둘 다 골라주세요."}, 400)
-            need_a, need_b = wfmap[a].get("image_inputs", 0), wfmap[b].get("image_inputs", 0)
-            if (need_a > 0) != (need_b > 0):
+            single = bool(body.get("single"))
+            if single:
+                b = ""  # 단일 모델 생성 (B 없음)
+            if a not in wfmap or (not single and b not in wfmap):
+                return self._json({"ok": False, "err": "워크플로를 골라주세요."}, 400)
+            need_a = wfmap[a].get("image_inputs", 0)
+            need_b = wfmap[b].get("image_inputs", 0) if b else 0
+            if b and (need_a > 0) != (need_b > 0):
                 return self._json({"ok": False, "err": "편집(사진입력) 워크플로끼리, 또는 t2i끼리만 대결할 수 있어요."}, 400)
             need_img = max(need_a, need_b)
             image_refs = []
@@ -1725,13 +1916,13 @@ class H(BaseHTTPRequestHandler):
                 if len(image_refs) < need_img:
                     return self._json({"ok": False, "err": f"이 편집 대결은 사진 {need_img}장이 필요해요."}, 400)
             random_mode = bool(body.get("random"))
-            lines = [ln.strip() for ln in str(prompts).splitlines() if ln.strip()][:20]
+            lines = [ln.strip() for ln in str(prompts).splitlines() if ln.strip()][:50]
             if random_mode:
                 try:
                     count = int(body.get("count") or 10)
                 except (TypeError, ValueError):
                     count = 10
-                count = max(1, min(20, count))
+                count = max(1, min(50, count))
                 lines = []  # 봇이 LLM으로 생성
             else:
                 if not lines:
@@ -1763,6 +1954,42 @@ class H(BaseHTTPRequestHandler):
             enqueue({"mode": "score", "tag": tag, "items": items, "a_label": a_label, "b_label": b_label})
             event(f"queued score: {tag} ({len(items)} cuts)")
             return self._json({"ok": True, "tag": tag, "count": len(items)})
+        if p == "/api/compare_hide":
+            tag = (body.get("tag") or "").strip()
+            fns = compare_tag_files(tag)
+            if not fns:
+                return self._json({"ok": False, "err": "대결을 찾을 수 없어요."}, 400)
+            h = load_hidden()
+            for fn in fns:
+                h.add(fn)
+            save_hidden(h)
+            event(f"compare hidden: {tag} ({len(fns)})")
+            return self._json({"ok": True, "hidden": len(fns)})
+        if p == "/api/compare_delete":
+            tag = (body.get("tag") or "").strip()
+            fns = compare_tag_files(tag, include_meta=True)
+            if not fns:
+                return self._json({"ok": False, "err": "대결을 찾을 수 없어요."}, 400)
+            os.makedirs(TRASH, exist_ok=True)
+            moved = 0
+            for fn in fns:
+                full = os.path.join(GALLERY, fn)
+                if not os.path.isfile(full):
+                    continue
+                dest = os.path.join(TRASH, fn)
+                if os.path.exists(dest):
+                    dest += "_" + str(int(time.time()))
+                try:
+                    os.replace(full, dest)
+                    moved += 1
+                except Exception:
+                    pass
+            try:
+                os.remove(os.path.join(SCORES_DIR, f"{tag}.json"))
+            except OSError:
+                pass
+            event(f"compare deleted: {tag} ({moved} files)")
+            return self._json({"ok": True, "deleted": moved})
         if p == "/api/open_gallery":
             try:
                 os.makedirs(GALLERY, exist_ok=True)
@@ -1860,13 +2087,44 @@ class H(BaseHTTPRequestHandler):
                     os.replace(full, dest)
                     event("deleted " + os.path.basename(full))
                 except Exception as e: return self._json({"ok": False, "err": str(e)}, 500)
+                try:
+                    tp = thumb_path_for(body.get("rel", ""))
+                    if os.path.isfile(tp):
+                        os.remove(tp)
+                except OSError:
+                    pass
             return self._json({"ok": True})
         self.send_error(404)
+
+    def serve_file_abs(self, full, ctype):
+        try:
+            with open(full, "rb") as f:
+                data = f.read()
+        except OSError:
+            return self.send_error(404)
+        self.send_response(200)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "private, max-age=604800")
+        self.end_headers()
+        try:
+            self.wfile.write(data)
+        except (ConnectionAbortedError, BrokenPipeError):
+            pass
 
     def serve_media(self, rel):
         full = safe_path(rel)
         if not full or not os.path.isfile(full):
             return self.send_error(404)
+        self.serve_file_range(full)
+
+    def serve_input_media(self, rel):
+        full = safe_input_path(rel)
+        if not full or not os.path.isfile(full):
+            return self.send_error(404)
+        self.serve_file_range(full)
+
+    def serve_file_range(self, full):
         size = os.path.getsize(full)
         ctype = mimetypes.guess_type(full)[0] or "application/octet-stream"
         rng = self.headers.get("Range")
@@ -1882,6 +2140,8 @@ class H(BaseHTTPRequestHandler):
         self.send_response(206 if rng else 200)
         self.send_header("Content-Type", ctype)
         self.send_header("Accept-Ranges", "bytes")
+        # URL에 ?v=mtime 버전이 붙으므로 캐시 OK — 파일이 바뀌면 URL이 바뀌어 재요청됨
+        self.send_header("Cache-Control", "private, max-age=604800")
         self.send_header("Content-Length", str(length))
         if rng:
             self.send_header("Content-Range", "bytes %d-%d/%d" % (start, end, size))
@@ -1912,13 +2172,18 @@ body{margin:0;color:var(--ink);font-family:'VT323',monospace;font-size:18px;padd
 body:before{content:"";position:fixed;inset:0;pointer-events:none;z-index:0;opacity:.4;
   background:repeating-linear-gradient(0deg,rgba(255,255,255,.025) 0 1px,transparent 1px 3px)}
 .pix{font-family:'Press Start 2P',monospace}
-.wrap{max-width:1340px;margin:0 auto;position:relative;z-index:1}
+.wrap{max-width:min(1760px,calc(100vw - 36px));margin:0 auto;position:relative;z-index:1}
 .bar{display:flex;align-items:center;justify-content:space-between;margin-bottom:18px}
 .brand{font-size:16px;color:var(--cyan);text-shadow:0 0 12px rgba(86,225,255,.35)}.brand b{color:var(--pink)}
 .brand small{display:block;font-size:9px;color:var(--mut);margin-top:7px;text-shadow:none}
 .back{background:var(--b2);border:1px solid var(--ln);color:var(--ink);border-radius:7px;height:34px;padding:0 12px;font-family:'VT323';font-size:16px;cursor:pointer;text-decoration:none;display:inline-flex;align-items:center}
 .back:hover{border-color:var(--cyan);color:var(--cyan)}
+.modetoggle{display:flex;gap:0;border:1px solid var(--ln);border-radius:10px;overflow:hidden;margin-bottom:14px;width:fit-content}
+.mt{background:#0a0814;border:none;color:var(--mut);height:38px;padding:0 16px;font-family:'VT323';font-size:17px;cursor:pointer}
+.mt.on{background:var(--b2);color:var(--amb)}
 .vs{display:grid;grid-template-columns:1fr 78px 1fr;gap:12px;align-items:stretch;margin-bottom:16px}
+.vs.single{grid-template-columns:1fr}.vs.single .vsmid,.vs.single .side.b{display:none}
+.stage .single{display:inline-block;line-height:0}.stage .single img{display:block;width:auto;max-width:100%;max-height:calc(100vh - 250px);cursor:zoom-in}
 .side{border:2px solid var(--ln);border-radius:14px;background:linear-gradient(180deg,rgba(23,18,40,.96),rgba(10,8,20,.92));padding:13px;transition:box-shadow .2s,border-color .2s}
 .side.a{border-color:rgba(86,225,255,.5)}.side.b{border-color:rgba(255,93,143,.5)}
 .side.a.has{box-shadow:0 0 26px rgba(86,225,255,.22)}.side.b.has{box-shadow:0 0 26px rgba(255,93,143,.22)}
@@ -1944,8 +2209,19 @@ body:before{content:"";position:fixed;inset:0;pointer-events:none;z-index:0;opac
 .histrow .hvs .ca{color:var(--cyan)}.histrow .hvs .cb{color:var(--pink)}
 .histrow .hc{color:var(--mut);font-size:14px;white-space:nowrap}
 .histrow .hscored{color:var(--amb);font-size:13px;white-space:nowrap;border:1px solid rgba(255,209,102,.4);border-radius:5px;padding:1px 6px}
+.histrow .hbtn{flex:none;background:rgba(13,11,22,.85);border:1px solid var(--ln);color:var(--mut);border-radius:6px;width:30px;height:28px;cursor:pointer;font-size:14px}
+.histrow .hbtn:hover{border-color:var(--cyan);color:var(--cyan)}
+.histrow .hbtn.del:hover{border-color:var(--amb);color:var(--amb)}
 .panel h3{margin:0 0 11px;font-size:11px;color:var(--pur)}
+.prompthead{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:10px}
+.prompthead h3{margin:0}
+.prompttools{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.prompttoggle{background:var(--b2);border:1px solid var(--ln);color:var(--ink);border-radius:7px;height:32px;padding:0 11px;font-family:'VT323';font-size:16px;cursor:pointer}
+.prompttoggle:hover{border-color:var(--cyan);color:var(--cyan)}
 textarea{width:100%;min-height:176px;background:#0a0814;border:1px solid var(--ln);color:var(--ink);border-radius:9px;font-family:'VT323';font-size:18px;line-height:1.4;padding:11px;resize:vertical}
+#prompts{min-height:320px;font-size:20px;line-height:1.45}
+.promptpanel.expanded{width:calc(100vw - 36px);max-width:none;margin-left:calc((100% - (100vw - 36px))/2)}
+.promptpanel.expanded #prompts{min-height:52vh}
 textarea:focus{outline:none;border-color:var(--cyan);box-shadow:0 0 0 2px rgba(86,225,255,.15)}
 .row{display:flex;align-items:center;gap:14px;flex-wrap:wrap;margin-top:13px}
 .row label{display:flex;align-items:center;gap:7px;font-size:16px;color:var(--mut)}
@@ -1987,6 +2263,7 @@ textarea:focus{outline:none;border-color:var(--cyan);box-shadow:0 0 0 2px rgba(8
 .verdict{display:none;margin:8px 0 0;padding:11px 14px;border:1px solid var(--pur);border-radius:10px;background:rgba(157,123,255,.08);color:var(--ink);font-size:16px;line-height:1.5}
 .verdict.on{display:block}
 .verdict b{color:var(--pur);font-family:'Press Start 2P';font-size:10px;display:block;margin-bottom:6px}
+.vcaptime{font-family:'VT323';font-size:16px;color:var(--mut);margin:5px 0}
 .vcapscore{font-family:'VT323';font-size:18px;color:var(--ink);margin:6px 0}
 .vcapscore .ca{color:var(--cyan)}.vcapscore .cb{color:var(--pink)}
 .viewer{display:flex;align-items:center;gap:10px;margin-top:8px}
@@ -1995,7 +2272,7 @@ textarea:focus{outline:none;border-color:var(--cyan);box-shadow:0 0 0 2px rgba(8
 .stage{flex:1;min-width:0;display:flex;justify-content:center;align-items:center;min-height:200px}
 .stage .cmp{display:inline-block;width:auto;max-width:100%}
 .stage .cmp .base{display:block;width:auto;max-width:100%;max-height:calc(100vh - 250px)}
-.stage .sbs{display:flex;gap:10px;max-width:100%}
+.stage .sbs{display:flex;gap:10px;max-width:100%;position:relative}
 .stage .sbs .sbcell{flex:1;min-width:0}
 .stage .sbs .sbcell img{width:100%;max-height:calc(100vh - 250px);object-fit:contain}
 .stage .partial,.stage .shim{max-width:560px;width:100%}
@@ -2025,9 +2302,11 @@ textarea:focus{outline:none;border-color:var(--cyan);box-shadow:0 0 0 2px rgba(8
   background:rgba(10,8,20,.85);border:2px solid #fff;color:#fff;display:flex;align-items:center;justify-content:center;font-size:15px}
 .cmpLab{position:absolute;top:9px;font-family:'Press Start 2P';font-size:9px;padding:5px 8px;border-radius:6px;z-index:4;line-height:1.2;max-width:46%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .cmpLab.la{left:9px;background:rgba(86,225,255,.92);color:#04222b}
-.cmpLab.lb{right:9px;background:rgba(255,93,143,.92);color:#2a0713}
+.cmpLab.rb{right:9px;background:rgba(255,93,143,.92);color:#2a0713}
+.cmpLab .dim{display:block;margin-top:3px;font-size:8px}.cmpLab.la .dim{color:#04222b}.cmpLab.rb .dim{color:var(--cyan);text-shadow:0 0 8px rgba(86,225,255,.35)}
 .cmpExp{position:absolute;bottom:9px;right:9px;z-index:4;background:rgba(10,8,20,.8);border:1px solid var(--ln);color:#fff;border-radius:7px;width:34px;height:34px;cursor:pointer;font-size:15px}
 .cmpExp:hover{border-color:var(--cyan);color:var(--cyan)}
+.sbsExp{bottom:12px;right:12px}
 /* side-by-side */
 .sbs{display:grid;grid-template-columns:1fr 1fr;gap:10px}
 .sbcell{position:relative;border-radius:10px;overflow:hidden;border:1px solid var(--ln);background:#0a0814;line-height:0}
@@ -2047,6 +2326,19 @@ textarea:focus{outline:none;border-color:var(--cyan);box-shadow:0 0 0 2px rgba(8
 .lb .lbclose{position:fixed;top:18px;right:22px;background:rgba(13,11,22,.8);border:1px solid var(--ln);color:#fff;border-radius:8px;width:40px;height:40px;font-size:17px;cursor:pointer}
 .lb .lbclose:hover{border-color:var(--pink);color:var(--pink)}
 .lb .lbhint{color:var(--mut);font-size:15px}
+.lb.bigcmp{padding:0;gap:0;overflow:hidden}
+.lb.bigcmp .lbclose{z-index:20}
+.lb.bigcmp .lbhint{position:fixed;left:50%;bottom:14px;transform:translateX(-50%);z-index:20;background:rgba(10,8,20,.72);border:1px solid var(--ln);border-radius:8px;padding:6px 10px;color:var(--amb)}
+.lb.bigcmp #fsbody{position:relative;width:100vw;height:100vh;overflow:hidden}
+.fsbigstage{position:absolute;inset:0;overflow:hidden;cursor:crosshair;background:#03020a}
+.fsbigstage.panning{cursor:grabbing}
+.fszoom{position:absolute;inset:0;transform-origin:50% 50%}
+.fsbigstage .cmp{position:absolute;inset:0;width:100%;height:100%;max-width:none;border:none;border-radius:0}
+.fsbigstage .cmp .base,.fsbigstage .cmp .over{width:100%;height:100%;max-width:none;max-height:none;object-fit:contain}
+.fshud{position:absolute;top:14px;left:50%;transform:translateX(-50%);z-index:12;background:rgba(10,8,20,.74);border:1px solid var(--ln);border-radius:8px;padding:6px 10px;color:var(--amb);font-size:16px;pointer-events:none}
+.fsnav{position:absolute;top:50%;transform:translateY(-50%);z-index:14;width:52px;height:92px;border-radius:10px;border:1px solid var(--ln);background:rgba(36,27,62,.78);color:var(--amb);font-family:'VT323';font-size:34px;cursor:pointer}
+.fsnav:hover{border-color:var(--cyan);color:var(--cyan);background:rgba(36,27,62,.94)}
+.fsnav.prev{left:18px}.fsnav.next{right:18px}
 .fsintent{color:var(--amb);font-size:18px;margin-bottom:10px;text-align:center;font-family:'VT323'}
 @media (max-width:820px){.vs{grid-template-columns:1fr;gap:10px}.vsmid{padding:4px 0}.sbs{grid-template-columns:1fr}}
 </style></head><body><div class="wrap">
@@ -2058,17 +2350,25 @@ textarea:focus{outline:none;border-color:var(--cyan);box-shadow:0 0 0 2px rgba(8
   <div class="histhead"><h3 style="margin:0">📜 지난 대결 <span style="font-family:'VT323';font-size:14px;color:var(--mut)">— 클릭하면 생성 없이 바로 비교</span></h3><button class="minib" onclick="loadHistoryList()">🔄 새로고침</button></div>
   <div id="histlist" class="histlist"><div class="note">불러오는 중...</div></div>
 </div>
+<div class="modetoggle">
+  <button class="mt on" id="mtVs" onclick="setMode('vs')">⚔️ 모델 대결 (A vs B)</button>
+  <button class="mt" id="mtSingle" onclick="setMode('single')">🎯 단일 모델 (여러장)</button>
+</div>
 <div class="vs">
   <div class="side a" id="sideA"><h3>🅰 A 코너 <span id="selAname" style="font-family:'VT323';font-size:15px;opacity:.85"></span></h3><div class="wf" id="wfA"></div></div>
   <div class="vsmid">VS</div>
   <div class="side b" id="sideB"><h3>🅱 B 코너 <span id="selBname" style="font-family:'VT323';font-size:15px;opacity:.85"></span></h3><div class="wf" id="wfB"></div></div>
 </div>
-<div class="panel">
+<div class="panel promptpanel" id="promptpanel">
   <h3>⚙ 대결 설정</h3>
   <div class="editup" id="editup">📷 편집할 원본(얼굴) 이미지 →
     <button class="minib" onclick="document.getElementById('editfile').click()">사진 선택</button>
     <input type="file" id="editfile" accept="image/*" style="display:none" onchange="pickEditImg(event)">
     <span id="editprev" class="editprev"></span>
+  </div>
+  <div class="prompthead">
+    <h3>프롬프트</h3>
+    <div class="prompttools"><button class="prompttoggle" type="button" onclick="togglePromptWide()">넓게쓰기</button></div>
   </div>
   <textarea id="prompts" placeholder="프롬프트를 한 줄에 하나씩 (줄 수 = 생성 장수). 예:&#10;a neon-lit cyberpunk alley at night, rain&#10;a cozy cabin in a snowy pine forest, golden hour&#10;a majestic dragon perched on a cliff, epic"></textarea>
   <div class="row">
@@ -2086,7 +2386,7 @@ textarea:focus{outline:none;border-color:var(--cyan);box-shadow:0 0 0 2px rgba(8
   <div class="rnd">
     <span class="rndlbl">키워드 쓰기 싫은 날 👉</span>
     <input type="text" id="rtheme" class="rtheme" placeholder="주제 (선택) 예: 고양이, 사이버펑크">
-    <label>장수 <input type="number" id="rcount" value="10" min="1" max="20"></label>
+    <label>장수 <input type="number" id="rcount" value="10" min="1" max="50"></label>
     <button class="rndb" id="rndb" onclick="startRandom()" disabled>🎲 무작위 프롬프트로 대결</button>
   </div>
   <div class="note">한 줄당 1장씩, A를 먼저 전부 → 그다음 B를 전부 생성해요. 라운드 사이에만 모델을 교체해서 빠릅니다. 결과는 <b>슬라이더(마우스로 와이프 비교)</b>로 보고, 메인 갤러리엔 <b>cmp_</b> 접두어로 저장돼요.</div>
@@ -2115,10 +2415,19 @@ textarea:focus{outline:none;border-color:var(--cyan);box-shadow:0 0 0 2px rgba(8
 <div class="lb" id="lb"><button class="lbclose" onclick="closeFS()">✕</button><div id="fsbody"></div><div class="lbhint">마우스를 좌우로 움직여 와이프 비교 · ESC 닫기</div></div>
 <script>
 var PPKEY=__PP_KEY__;
-var WFS=[],selA='',selB='',TAG='',PROMPTS=[],LA='A',LB='B',poller=null,VIEW='slider',R={},SIG={},CUR=1,SCORES={},scorePoller=null,EDITIMG=[];
+var WFS=[],selA='',selB='',TAG='',PROMPTS=[],LA='A',LB='B',poller=null,VIEW='slider',R={},SIG={},CUR=1,SCORES={},scorePoller=null,EDITIMG=[],MODE='vs',SINGLE=false;
+var PROMPT_STORE_KEY='pingpong.compare.prompts';
 function H(s){return String(s==null?'':s).replace(/[&<>"]/g,function(c){return{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]})}
 function A(s){return String(s==null?'':s).replace(/'/g,"\\'").replace(/"/g,'&quot;')}
 function api(p,o){o=o||{};o.headers=Object.assign({'Content-Type':'application/json','X-PP-Key':PPKEY},o.headers||{});return fetch(p,o).then(function(r){return r.json()})}
+function savePromptDraft(){try{localStorage.setItem(PROMPT_STORE_KEY,document.getElementById('prompts').value||'')}catch(e){}}
+function restorePromptDraft(){try{var v=localStorage.getItem(PROMPT_STORE_KEY);if(v!==null)document.getElementById('prompts').value=v}catch(e){}}
+function togglePromptWide(){
+  var p=document.getElementById('promptpanel');
+  p.classList.toggle('expanded');
+  try{localStorage.setItem('pingpong.compare.promptWide',p.classList.contains('expanded')?'1':'0')}catch(e){}
+}
+function restorePromptWide(){try{if(localStorage.getItem('pingpong.compare.promptWide')==='1')document.getElementById('promptpanel').classList.add('expanded')}catch(e){}}
 function loadWorkflows(){
   api('/api/compare_workflows').then(function(d){
     WFS=d.workflows||[];
@@ -2137,8 +2446,15 @@ function renderWf(elid,side){
   }).join('')
 }
 function wfImgInputs(id){var w=WFS.filter(function(x){return x.id===id})[0];return w?(w.image_inputs||0):0}
-function editModeOn(){return selA&&selB&&wfImgInputs(selA)>0&&wfImgInputs(selB)>0}
-function needImgs(){return Math.max(wfImgInputs(selA),wfImgInputs(selB))}
+function editModeOn(){return MODE==='single'?(!!selA&&wfImgInputs(selA)>0):(selA&&selB&&wfImgInputs(selA)>0&&wfImgInputs(selB)>0)}
+function needImgs(){return MODE==='single'?wfImgInputs(selA):Math.max(wfImgInputs(selA),wfImgInputs(selB))}
+function setMode(m){
+  MODE=m;
+  document.getElementById('mtVs').classList.toggle('on',m==='vs');
+  document.getElementById('mtSingle').classList.toggle('on',m==='single');
+  document.querySelector('.vs').classList.toggle('single',m==='single');
+  refresh();
+}
 function pick(side,id){
   if(side==='A')selA=id;else selB=id;
   renderWf('wfA','A');renderWf('wfB','B');
@@ -2157,26 +2473,35 @@ function pickEditImg(e){
 function lines(){return document.getElementById('prompts').value.split(/\r?\n/).map(function(s){return s.trim()}).filter(Boolean).slice(0,20)}
 function refresh(){
   var n=lines().length;
+  var single=MODE==='single';
   var enh=document.getElementById('enhance')&&document.getElementById('enhance').checked;
   var em=editModeOn();
-  var mixed=selA&&selB&&((wfImgInputs(selA)>0)!=(wfImgInputs(selB)>0));
+  var mixed=!single&&selA&&selB&&((wfImgInputs(selA)>0)!=(wfImgInputs(selB)>0));
   document.getElementById('editup').classList.toggle('on',em);
   var sameEl=document.getElementById('same');
   if(mixed){sameEl.textContent='⚠ 편집(📷)·t2i 는 서로 못 붙여요. 같은 종류끼리 골라주세요.';sameEl.classList.add('on');}
-  else if(selA&&selA===selB){sameEl.textContent='⚠ 같은 워크플로끼리 골랐어요 — 시드/설정 테스트용으로는 괜찮아요.';sameEl.classList.add('on');}
+  else if(!single&&selA&&selA===selB){sameEl.textContent='⚠ 같은 워크플로끼리 골랐어요 — 시드/설정 테스트용으로는 괜찮아요.';sameEl.classList.add('on');}
   else sameEl.classList.remove('on');
-  document.getElementById('cnt').textContent=(em?'편집 ':'')+(enh?('키워드 '+n+'개 (LLM 확장)'):(n+'줄'))+' · 양쪽 '+(n*2)+'장';
+  var totimg=single?n:(n*2);
+  document.getElementById('cnt').textContent=(em?'편집 ':'')+(enh?('키워드 '+n+'개 (LLM 확장)'):(n+'줄'))+(single?(' · '+n+'장'):(' · 양쪽 '+totimg+'장'));
+  var ready=single?!!selA:(selA&&selB);
   var imgOk=!em||EDITIMG.length>=needImgs();
-  document.getElementById('startb').disabled=!(selA&&selB&&n>0&&!mixed&&imgOk);
-  var rb=document.getElementById('rndb');if(rb)rb.disabled=!(selA&&selB&&!mixed&&imgOk);
+  document.getElementById('startb').disabled=!(ready&&n>0&&!mixed&&imgOk);
+  var rb=document.getElementById('rndb');if(rb)rb.disabled=!(ready&&!mixed&&imgOk);
+}
+function applySingleUI(){
+  var sb=document.getElementById('scoreb');if(sb)sb.style.display=SINGLE?'none':'';
+  var vt=document.querySelector('.vtoggle');if(vt)vt.style.display=SINGLE?'none':'';
 }
 function randSeed(){document.getElementById('seed').value=Math.floor(Math.random()*1e9)}
 function labelOf(id){var w=WFS.filter(function(x){return x.id===id})[0];return w?w.label:id}
 function showErr(m){var e=document.getElementById('err');e.textContent='⚠ '+m;e.classList.add('on')}
 function start(){
   document.getElementById('err').classList.remove('on');
-  var P=lines();if(!selA||!selB||!P.length)return;
-  var body={a:selA,b:selB,prompts:P.join('\n'),seed:parseInt(document.getElementById('seed').value)||42,
+  var single=MODE==='single';
+  var P=lines();if(!selA||(!single&&!selB)||!P.length)return;
+  savePromptDraft();
+  var body={a:selA,b:single?'':selB,single:single,prompts:P.join('\n'),seed:parseInt(document.getElementById('seed').value)||42,
     enhance:document.getElementById('enhance').checked,
     settings:{image_ratio:document.getElementById('ratio').value,image_megapixels:parseFloat(document.getElementById('mp').value)||1,
       zit_upscale:document.getElementById('zup').checked}};
@@ -2184,7 +2509,7 @@ function start(){
   document.getElementById('startb').disabled=true;
   api('/api/compare',{method:'POST',body:JSON.stringify(body)}).then(function(d){
     if(!d.ok){showErr(d.err||'요청 실패');document.getElementById('startb').disabled=false;return}
-    TAG=d.tag;PROMPTS=P;LA=labelOf(selA);LB=labelOf(selB);R={};SIG={};resetScores();
+    TAG=d.tag;PROMPTS=P;SINGLE=single;LA=labelOf(selA);LB=single?'':labelOf(selB);R={};SIG={};resetScores();applySingleUI();
     buildBoard(P.length);document.getElementById('board').classList.add('on');
     document.getElementById('board').scrollIntoView({behavior:'smooth',block:'start'});
     refresh();if(poller)clearInterval(poller);poller=setInterval(poll,3000);poll();
@@ -2192,9 +2517,10 @@ function start(){
 }
 function startRandom(){
   document.getElementById('err').classList.remove('on');
-  if(!selA||!selB)return;
-  var cnt=Math.max(1,Math.min(20,parseInt(document.getElementById('rcount').value)||10));
-  var body={a:selA,b:selB,random:true,count:cnt,theme:document.getElementById('rtheme').value||'',seed:parseInt(document.getElementById('seed').value)||42,
+  var single=MODE==='single';
+  if(!selA||(!single&&!selB))return;
+  var cnt=Math.max(1,Math.min(50,parseInt(document.getElementById('rcount').value)||10));
+  var body={a:selA,b:single?'':selB,single:single,random:true,count:cnt,theme:document.getElementById('rtheme').value||'',seed:parseInt(document.getElementById('seed').value)||42,
     settings:{image_ratio:document.getElementById('ratio').value,image_megapixels:parseFloat(document.getElementById('mp').value)||1,
       zit_upscale:document.getElementById('zup').checked}};
   if(editModeOn())body.images=EDITIMG;
@@ -2202,7 +2528,7 @@ function startRandom(){
   api('/api/compare',{method:'POST',body:JSON.stringify(body)}).then(function(d){
     if(!d.ok){showErr(d.err||'요청 실패');refresh();return}
     TAG=d.tag;PROMPTS=[];for(var i=0;i<d.count;i++)PROMPTS.push('');
-    LA=labelOf(selA);LB=labelOf(selB);R={};SIG={};resetScores();
+    SINGLE=single;LA=labelOf(selA);LB=single?'':labelOf(selB);R={};SIG={};resetScores();applySingleUI();
     buildBoard(d.count);document.getElementById('board').classList.add('on');
     document.getElementById('board').scrollIntoView({behavior:'smooth',block:'start'});
     refresh();if(poller)clearInterval(poller);poller=setInterval(poll,3000);poll();
@@ -2220,17 +2546,28 @@ function renderThumbs(){
   }
   document.getElementById('thumbs').innerHTML=h;
 }
+function avgSecs(sd){
+  var v=[];for(var k=1;k<=PROMPTS.length;k++){var rr=R[k];if(rr&&rr[sd])v.push(rr[sd])}
+  if(v.length>1)v=v.slice(1);  // 첫 컷은 모델 로딩 포함이라 제외
+  return v.length?(v.reduce(function(a,b){return a+b},0)/v.length).toFixed(1):0;
+}
 function renderViewer(){
   var n=PROMPTS.length;if(CUR<1)CUR=1;if(CUR>n)CUR=n;
   var r=R[CUR]||{},stage=document.getElementById('stage');
-  if(r.a&&r.b){
+  if(SINGLE){
+    var one=r.a||r.b;
+    stage.innerHTML=one?('<div class="single"><img src="'+H(one)+'" onclick="fsImg(\''+A(one)+'\')"></div>'):'<div class="shim">생성 대기중…</div>';
+  }else if(r.a&&r.b){
     if(VIEW==='sbs'){
       stage.innerHTML='<div class="sbs">'+
         '<div class="sbcell"><img src="'+H(r.a)+'" onclick="fsImg(\''+A(r.a)+'\')"><span class="cmpLab la">🅰 '+H(LA)+'</span></div>'+
-        '<div class="sbcell"><img src="'+H(r.b)+'" onclick="fsImg(\''+A(r.b)+'\')"><span class="cmpLab lb">🅱 '+H(LB)+'</span></div></div>';
+        '<div class="sbcell"><img src="'+H(r.b)+'" onclick="fsImg(\''+A(r.b)+'\')"><span class="cmpLab rb">🅱 '+H(LB)+'</span></div>'+
+        '<button class="cmpExp sbsExp" title="크게 비교" onclick="event.stopPropagation();fsCmp('+CUR+')">⛶</button></div>';
+      bindCompareDims(stage);
     }else{
       stage.innerHTML=cmpHTML(r.a,r.b,LA,LB,CUR);
       attachSlider(stage.querySelector('.cmp'));
+      bindCompareDims(stage);
     }
   }else if(r.a||r.b){
     var one=r.a||r.b,who=r.a?('🅰 '+LA):('🅱 '+LB),wait=r.a?('🅱 '+LB):('🅰 '+LA);
@@ -2244,10 +2581,19 @@ function renderViewer(){
     var w=sc.winner==='A'?'🏆🅰':sc.winner==='B'?'🏆🅱':'🤝 무승부';
     scHtml='<div class="vcapscore">🅰 <span class="ca">'+sc.a+'</span> : <span class="cb">'+sc.b+'</span> 🅱  ·  '+w+(sc.reason?'  ·  '+H(sc.reason):'')+'</div>';
   }
+  var aAvg=avgSecs('a_secs'),bAvg=avgSecs('b_secs');
+  var vsInner,cutTime;
+  if(SINGLE){
+    vsInner='<span class="ca">🎯 '+H(LA||'모델')+'</span>'+(aAvg?'  ·  ⏱ '+aAvg+'s':'');
+    var s1=r.a_secs||r.b_secs;cutTime=s1?('<div class="vcaptime">⏱ '+s1+'s</div>'):'';
+  }else{
+    vsInner='<span class="ca">🅰 '+H(LA||'A')+'</span>  vs  <span class="cb">🅱 '+H(LB||'B')+'</span>'+((aAvg||bAvg)?('  ·  ⏱ <span class="ca">'+aAvg+'s</span> : <span class="cb">'+bAvg+'s</span>'):'');
+    cutTime=(r.a_secs||r.b_secs)?('<div class="vcaptime">⏱ 🅰 '+(r.a_secs||'-')+'s   :   🅱 '+(r.b_secs||'-')+'s</div>'):'';
+  }
   document.getElementById('vcap').innerHTML=
-    '<div class="vcapvs"><span class="ca">🅰 '+H(LA||'A')+'</span>  vs  <span class="cb">🅱 '+H(LB||'B')+'</span></div>'+
+    '<div class="vcapvs">'+vsInner+'</div>'+
     '<div class="vcaphead">#'+CUR+' / '+n+(note?'  ·  <span class="vint">👁 '+H(note)+'</span>':'')+'</div>'+
-    scHtml+
+    cutTime+scHtml+
     (pr?'<div class="vcappr">'+H(pr)+'</div>':'');
   var ts=document.querySelectorAll('.thumb');for(var k=0;k<ts.length;k++)ts[k].classList.toggle('on',k+1===CUR);
 }
@@ -2259,8 +2605,33 @@ function cmpHTML(a,b,la,lb,i){
     '<img class="over" src="'+H(a)+'" alt="A">'+
     '<div class="cmpDiv"><div class="cmpKnob">⇆</div></div>'+
     '<span class="cmpLab la">🅰 '+H(la)+'</span>'+
-    '<span class="cmpLab lb">🅱 '+H(lb)+'</span>'+
+    '<span class="cmpLab rb">🅱 '+H(lb)+'</span>'+
     '<button class="cmpExp" title="크게 비교" onclick="event.stopPropagation();fsCmp('+i+')">⛶</button></div>';
+}
+function imgDimText(img){return img&&img.naturalWidth?(img.naturalWidth+'×'+img.naturalHeight):''}
+function setLabDim(lab,img){
+  if(!lab||!img)return;
+  var d=imgDimText(img),old=lab.querySelector('.dim');
+  if(!d)return;
+  if(!old){old=document.createElement('span');old.className='dim';lab.appendChild(old)}
+  old.textContent=d;
+}
+function bindCompareDims(root){
+  if(!root)return;
+  root.querySelectorAll('.cmp').forEach(function(box){
+    var a=box.querySelector('.over'),b=box.querySelector('.base');
+    var la=box.querySelector('.cmpLab.la'),lb=box.querySelector('.cmpLab.rb');
+    function upd(){setLabDim(la,a);setLabDim(lb,b)}
+    if(a)a.onload=upd;if(b)b.onload=upd;upd();setTimeout(upd,250);
+  });
+  root.querySelectorAll('.sbs').forEach(function(box){
+    var cells=box.querySelectorAll('.sbcell');
+    cells.forEach(function(c){
+      var img=c.querySelector('img'),lab=c.querySelector('.cmpLab');
+      function upd(){setLabDim(lab,img)}
+      if(img)img.onload=upd;upd();setTimeout(upd,250);
+    });
+  });
 }
 function attachSlider(box){
   if(!box)return;
@@ -2286,6 +2657,7 @@ function poll(){
       var i=parseInt(m[2],10);R[i]=R[i]||{};
       var side=m[1]==='A'?'a':'b';
       if(!R[i][side]){R[i][side]=it.url;changed=true}
+      if(it.gen_secs)R[i][side+'_secs']=it.gen_secs;
       if(it.prompt&&!R[i].prompt)R[i].prompt=it.prompt;
       if(it.note&&!R[i].note)R[i].note=it.note;
     });
@@ -2302,14 +2674,55 @@ function updateProgress(){
   if(done>=total&&total){t.textContent='🏁 완료 '+done+'/'+total;if(poller){clearInterval(poller);poller=null}}
   else t.textContent='⚔ '+done+' / '+total;
 }
-function fsCmp(i){var r=R[i]||{};if(!r.a||!r.b)return;
-  document.getElementById('fsbody').innerHTML=(r.note?'<div class="fsintent">👁 볼 포인트: '+H(r.note)+'</div>':'')+cmpHTML(r.a,r.b,LA,LB,'fs');
-  var box=document.getElementById('fsbody').querySelector('.cmp');var exp=box.querySelector('.cmpExp');if(exp)exp.remove();
-  attachSlider(box);document.getElementById('lb').classList.add('on');
+var FS={scale:1,tx:0,ty:0,wipe:50,drag:null,idx:1};
+function applyFSView(){
+  var z=document.getElementById('fszoom');if(z)z.style.transform='translate('+FS.tx+'px,'+FS.ty+'px) scale('+FS.scale+')';
+  applyFSWipe();
+  var h=document.getElementById('fshud');if(h)h.innerHTML='#'+(FS.idx||CUR)+' / '+PROMPTS.length+' · 휠=줌 <b>'+Math.round(FS.scale*100)+'%</b> · 드래그=이동 · 마우스 좌우=와이프 · ←/→ 컷 이동 · 더블클릭=리셋';
 }
-function fsImg(u){document.getElementById('fsbody').innerHTML='<img src="'+H(u)+'" style="max-width:96vw;max-height:86vh;border-radius:8px;border:2px solid var(--pink)">';
-  document.getElementById('lb').classList.add('on')}
-function closeFS(){document.getElementById('lb').classList.remove('on');document.getElementById('fsbody').innerHTML=''}
+function applyFSWipe(){
+  var st=document.getElementById('fsbigstage'),z=document.getElementById('fszoom');if(!st||!z)return;
+  var sr=st.getBoundingClientRect(),zr=z.getBoundingClientRect(),x=sr.left+sr.width*FS.wipe/100;
+  var p=Math.max(0,Math.min(100,(x-zr.left)/Math.max(1,zr.width)*100));
+  var o=st.querySelector('.over'),d=st.querySelector('.cmpDiv');
+  if(o)o.style.clipPath='inset(0 '+(100-p)+'% 0 0)';
+  if(d)d.style.left=p+'%';
+}
+function attachFSCompare(){
+  var st=document.getElementById('fsbigstage');if(!st)return;
+  st.addEventListener('mousemove',function(e){
+    if(FS.drag){FS.tx=FS.drag.tx+(e.clientX-FS.drag.x);FS.ty=FS.drag.ty+(e.clientY-FS.drag.y);applyFSView();return}
+    var r=st.getBoundingClientRect();FS.wipe=Math.max(0,Math.min(100,(e.clientX-r.left)/Math.max(1,r.width)*100));applyFSWipe();
+  });
+  st.addEventListener('mousedown',function(e){if(e.button!==0)return;e.preventDefault();FS.drag={x:e.clientX,y:e.clientY,tx:FS.tx,ty:FS.ty};st.classList.add('panning')});
+  window.addEventListener('mouseup',function(){if(FS.drag){FS.drag=null;var st=document.getElementById('fsbigstage');if(st)st.classList.remove('panning')}});
+  st.addEventListener('wheel',function(e){
+    e.preventDefault();
+    var r=st.getBoundingClientRect(),ns=Math.max(1,Math.min(12,FS.scale*(e.deltaY<0?1.3:1/1.3))),f=ns/FS.scale;
+    var cx=e.clientX-(r.left+r.width/2),cy=e.clientY-(r.top+r.height/2);
+    FS.tx=cx-(cx-FS.tx)*f;FS.ty=cy-(cy-FS.ty)*f;FS.scale=ns;
+    if(ns===1){FS.tx=0;FS.ty=0}
+    applyFSView();
+  },{passive:false});
+  st.addEventListener('dblclick',function(){FS.scale=1;FS.tx=0;FS.ty=0;applyFSView()});
+}
+function fsNav(d){
+  var n=PROMPTS.length;if(!n)return;
+  var start=FS.idx||CUR;
+  for(var step=1;step<=n;step++){
+    var ni=((start-1+d*step+n*10)%n)+1,r=R[ni]||{};
+    if(r.a&&r.b){CUR=ni;renderViewer();fsCmp(ni);return}
+  }
+}
+function fsCmp(i){var r=R[i]||{};if(!r.a||!r.b)return;
+  var lb=document.getElementById('lb');lb.classList.add('bigcmp');FS={scale:1,tx:0,ty:0,wipe:50,drag:null,idx:i};
+  document.getElementById('fsbody').innerHTML='<div class="fsbigstage" id="fsbigstage"><button class="fsnav prev" onclick="event.stopPropagation();fsNav(-1)">‹</button><button class="fsnav next" onclick="event.stopPropagation();fsNav(1)">›</button><div class="fszoom" id="fszoom">'+cmpHTML(r.a,r.b,LA,LB,'fs')+'</div><div class="fshud" id="fshud"></div></div>';
+  var box=document.getElementById('fsbody').querySelector('.cmp');var exp=box.querySelector('.cmpExp');if(exp)exp.remove();
+  bindCompareDims(document.getElementById('fsbody'));attachFSCompare();applyFSView();lb.classList.add('on');
+}
+function fsImg(u){var lb=document.getElementById('lb');lb.classList.remove('bigcmp');document.getElementById('fsbody').innerHTML='<img src="'+H(u)+'" style="max-width:96vw;max-height:86vh;border-radius:8px;border:2px solid var(--pink)">';
+  lb.classList.add('on')}
+function closeFS(){var lb=document.getElementById('lb');lb.classList.remove('on','bigcmp');document.getElementById('fsbody').innerHTML=''}
 function resetScores(){
   SCORES={};if(scorePoller){clearInterval(scorePoller);scorePoller=null}
   var sb=document.getElementById('scorebar');if(sb)sb.classList.remove('on');
@@ -2354,10 +2767,28 @@ function loadHistoryList(){
     el.innerHTML=h.map(function(x){
       return '<div class="histrow" onclick="openHistory(\''+H(x.tag)+'\')">'+
         '<span class="ht">'+H(x.when)+'</span>'+
-        '<span class="hvs"><span class="ca">🅰 '+H(x.a_label)+'</span> vs <span class="cb">🅱 '+H(x.b_label)+'</span></span>'+
+        '<span class="hvs">'+(x.single?('<span class="ca">🎯 '+H(x.a_label)+'</span> <span style="color:var(--mut)">단일</span>'):('<span class="ca">🅰 '+H(x.a_label)+'</span> vs <span class="cb">🅱 '+H(x.b_label)+'</span>'))+'</span>'+
         (x.scored?'<span class="hscored">🏆 채점됨</span>':'')+
-        '<span class="hc">'+x.count+'컷 · '+x.images+'장</span></div>'
+        '<span class="hc">'+x.count+'컷 · '+x.images+'장</span>'+
+        '<button class="hbtn" title="숨기기(복구가능)" onclick="event.stopPropagation();hideBattle(\''+H(x.tag)+'\')">🙈</button>'+
+        '<button class="hbtn del" title="삭제(.trash로 이동)" onclick="event.stopPropagation();delBattle(\''+H(x.tag)+'\')">🗑</button></div>'
     }).join('')
+  })
+}
+function hideBattle(tag){
+  if(!confirm('이 대결을 기록에서 숨길까요?\n(메인 갤러리에서도 숨겨지고, 메인의 "숨김 보기"로 복구 가능)'))return;
+  api('/api/compare_hide',{method:'POST',body:JSON.stringify({tag:tag})}).then(function(d){
+    if(!d.ok){alert(d.err||'실패');return}
+    if(TAG===tag){document.getElementById('board').classList.remove('on');TAG=''}
+    loadHistoryList();
+  })
+}
+function delBattle(tag){
+  if(!confirm('이 대결을 삭제할까요?\n(.trash 폴더로 이동 — 폴더에서 수동 복구 가능)'))return;
+  api('/api/compare_delete',{method:'POST',body:JSON.stringify({tag:tag})}).then(function(d){
+    if(!d.ok){alert(d.err||'실패');return}
+    if(TAG===tag){document.getElementById('board').classList.remove('on');TAG=''}
+    loadHistoryList();
   })
 }
 function openHistory(tag){
@@ -2365,9 +2796,10 @@ function openHistory(tag){
   api('/api/compare_results?tag='+encodeURIComponent(tag)).then(function(d){
     if(!d.ok){showErr(d.err||'불러오기 실패');return}
     if(poller){clearInterval(poller);poller=null}
-    TAG=tag;LA=d.a_label||'A';LB=d.b_label||'B';R={};SIG={};PROMPTS=[];resetScores();
     var rows=d.rows||[];
-    rows.forEach(function(r,idx){var i=idx+1;R[i]={a:r.a,b:r.b,prompt:r.prompt,note:r.note};PROMPTS.push(r.prompt||'')});
+    SINGLE=rows.length>0&&rows.every(function(r){return !r.b});
+    TAG=tag;LA=d.a_label||'A';LB=SINGLE?'':(d.b_label||'B');R={};SIG={};PROMPTS=[];resetScores();applySingleUI();
+    rows.forEach(function(r,idx){var i=idx+1;R[i]={a:r.a,b:r.b,prompt:r.prompt,note:r.note,a_secs:r.a_secs,b_secs:r.b_secs};PROMPTS.push(r.prompt||'')});
     CUR=1;renderThumbs();renderViewer();
     document.getElementById('board').classList.add('on');
     document.getElementById('prog').style.width='100%';
@@ -2378,12 +2810,19 @@ function openHistory(tag){
 }
 document.getElementById('lb').addEventListener('click',function(e){if(e.target===this)closeFS()});
 document.addEventListener('keydown',function(e){
-  if(e.key==='Escape'){closeFS();return}
+  var fs=document.getElementById('lb');
+  if(fs.classList.contains('on')){
+    if(e.key==='Escape'){closeFS();return}
+    if(fs.classList.contains('bigcmp')){
+      if(e.key==='ArrowLeft'){fsNav(-1);return}
+      if(e.key==='ArrowRight'){fsNav(1);return}
+    }
+  }
   if(!document.getElementById('board').classList.contains('on'))return;
   if(e.key==='ArrowLeft')nav(-1);else if(e.key==='ArrowRight')nav(1);
 });
-document.getElementById('prompts').addEventListener('input',refresh);
-loadWorkflows();refresh();loadHistoryList();
+document.getElementById('prompts').addEventListener('input',function(){savePromptDraft();refresh()});
+restorePromptDraft();restorePromptWide();loadWorkflows();refresh();loadHistoryList();
 </script></body></html>'''
 
 PAGE = r'''<!doctype html><html lang="ko"><head><meta charset="utf-8">
@@ -2405,9 +2844,10 @@ body{margin:0;background:#0a0814;color:var(--ink);font-family:'VT323',monospace;
 .heart.on{animation:beat 1s infinite}@keyframes beat{0%,100%{transform:scale(1)}45%{transform:scale(1.32)}}
 .dot{width:8px;height:8px;border-radius:50%;display:inline-block;background:#555}
 .dot.a{background:var(--grn);box-shadow:0 0 8px var(--grn);animation:blink 1s steps(2) infinite}@keyframes blink{50%{opacity:.25}}
-.genbar{display:flex;gap:8px;align-items:center;margin-bottom:16px;background:var(--b1);border:1px solid var(--pur);border-radius:10px;padding:10px}
-.msel,.gi{background:#0a0814;border:1px solid var(--ln);color:var(--ink);border-radius:7px;height:38px;font-family:'VT323';font-size:19px;padding:0 8px}
-.gi{flex:1}.gi::placeholder{color:var(--mut)}
+.genbar{display:flex;gap:8px;align-items:flex-start;margin-bottom:16px;background:var(--b1);border:1px solid var(--pur);border-radius:10px;padding:10px}
+.msel,.gi{background:#0a0814;border:1px solid var(--ln);color:var(--ink);border-radius:7px;min-height:38px;font-family:'VT323';font-size:19px;padding:0 8px}
+.msel{height:38px}.gi{flex:1}.gi::placeholder{color:var(--mut)}
+.promptbox{min-height:72px;max-height:220px;line-height:1.35;padding:8px 10px;resize:vertical;overflow:auto}
 .up{background:#0a0814;border:1px solid var(--ln);color:var(--mut);height:38px;padding:0 10px;border-radius:7px;cursor:pointer;font-family:'VT323';font-size:17px}.up:hover{color:var(--cyan);border-color:var(--cyan)}
 .genb{background:var(--pink);border:none;color:#220812;font-family:'Press Start 2P';font-size:10px;border-radius:7px;padding:0 14px;height:38px;cursor:pointer}.genb:hover:not(:disabled){background:#ff85a8}.genb:disabled{opacity:.42;cursor:default;filter:saturate(.35)}
 .folderb{background:var(--b2);border:1px solid var(--ln);color:var(--ink);font-family:'VT323';font-size:17px;border-radius:7px;padding:0 10px;height:38px;cursor:pointer}.folderb:hover:not(:disabled){color:var(--cyan);border-color:var(--cyan)}.folderb:disabled{opacity:.38;cursor:default;color:var(--mut);border-color:var(--ln)}
@@ -2471,17 +2911,50 @@ body{margin:0;background:#0a0814;color:var(--ink);font-family:'VT323',monospace;
 @media (max-width:1300px){.videoMode .wrap{display:block;max-width:1100px}.videoMode .topstick,.videoMode .maincol,.videoMode .audioDock{position:static;margin-bottom:14px;max-height:none;overflow:visible}.videoMode .grid{grid-template-columns:repeat(auto-fill,minmax(150px,1fr))}}
 .ytban{display:block;margin-top:12px;border:1px solid var(--pink);border-radius:10px;background:linear-gradient(135deg,rgba(255,93,143,.18),rgba(86,225,255,.08));padding:13px 14px;text-decoration:none;color:var(--ink);box-shadow:0 0 18px rgba(255,93,143,.12)}
 .ytban:hover{border-color:var(--cyan);box-shadow:0 0 20px rgba(86,225,255,.2)}.ytban .k{font-size:9px;color:var(--pink);margin-bottom:7px}.ytban .t{font-size:12px;color:var(--cyan);line-height:1.5}.ytban .s{font-size:16px;color:var(--amb);margin-top:6px}
+.ytban.promo{margin-top:10px;border:2px solid #15181d;background:linear-gradient(135deg,#ffd400,#ffe14d);box-shadow:0 0 20px rgba(255,212,0,.32)}
+.ytban.promo .k{display:inline-block;background:#15181d;color:#ffd400;padding:4px 7px;border-radius:5px;margin-bottom:8px}
+.ytban.promo .t{color:#15181d}
+.ytban.promo .s{color:#15181d;font-weight:bold}
+.ytban.promo:hover{border-color:#fff;box-shadow:0 0 26px rgba(255,212,0,.6);transform:translateY(-1px)}
 .ytlatest{display:none;margin-top:10px;border:1px solid var(--ln);border-radius:10px;overflow:hidden;background:var(--b1);text-decoration:none;color:var(--ink)}.ytlatest.on{display:block}.ytlatest img{width:100%;display:block;aspect-ratio:16/9;object-fit:cover}.ytlatest .ytxt{padding:9px 10px}.ytlatest .yk{font-size:9px;color:var(--pink);margin-bottom:6px}.ytlatest .yn{font-size:16px;color:var(--amb);line-height:1.15}.ytlatest:hover{border-color:var(--cyan)}
 .pbtn{background:var(--b2);border:1px solid var(--ln);color:var(--ink);border-radius:6px;width:34px;height:34px;cursor:pointer;font-size:16px}.pbtn:hover{color:var(--cyan);border-color:var(--cyan)}
 .ptrack{flex:1;font-size:17px;color:var(--amb);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .vol{width:120px;accent-color:var(--pink)}
 @media (max-width:1000px){.wrap{max-width:1100px}.sysbar{grid-template-columns:repeat(2,1fr)}.dgrid,.rbody{grid-template-columns:1fr}.content{display:block}.audioDock{margin-top:18px;position:sticky;top:auto;bottom:10px}.plist{max-height:150px}}
-.lb{display:none;position:fixed;inset:0;background:rgba(6,5,14,.94);z-index:50;overflow:auto;padding:24px 84px;grid-template-rows:minmax(0,1fr) auto;place-items:center}.lb.open{display:grid}.lb.zoomed{display:block}
-.lb img{max-height:calc(100vh - 220px);max-width:min(82vw,1200px);border-radius:8px;border:2px solid var(--pink);image-rendering:auto;cursor:zoom-in;object-fit:contain}.lb.zoomed img{max-height:none;max-width:none;cursor:zoom-out;display:block;margin:24px auto}
+.lb{display:none;position:fixed;inset:0;background:rgba(6,5,14,.94);z-index:50;overflow:hidden;padding:24px 84px;grid-template-rows:minmax(0,1fr) auto;place-items:center}.lb.open{display:grid}.lb.zoomed{cursor:grab}.lb.zoomed.panning{cursor:grabbing}
+.lb img{max-height:calc(100vh - 220px);max-width:min(82vw,1200px);border-radius:8px;border:2px solid var(--pink);image-rendering:auto;cursor:zoom-in;object-fit:contain;transform-origin:50% 50%;will-change:transform}.lb.zoomed img{cursor:grab}.lb.zoomed.panning img{cursor:grabbing}
 .nav{position:fixed;top:50%;transform:translateY(-50%);z-index:55;background:var(--b2);border:1px solid var(--ln);color:var(--ink);width:46px;height:70px;border-radius:8px;font-size:26px;cursor:pointer}.nav.prev{left:28px}.nav.next{right:28px}.nav:hover{color:var(--pink);border-color:var(--pink)}
 .lbtools{position:fixed;top:20px;right:24px;display:flex;gap:8px}.lbtools button{background:rgba(13,11,22,.7);border:1px solid var(--ln);color:var(--ink);border-radius:6px;width:36px;height:36px;cursor:pointer;font-size:15px}.lbtools button:hover{border-color:var(--pink);color:var(--pink)}
 .lbcap{width:min(900px,82vw);max-height:22vh;overflow:auto;text-align:left;font-size:18px;color:var(--amb);background:rgba(10,8,20,.86);border:1px solid var(--ln);border-radius:8px;padding:10px 12px;margin-top:14px}
 .lbcap b{display:block;color:var(--cyan);font-family:'Press Start 2P',monospace;font-size:10px;margin-bottom:7px}.lbcap .k{font-family:'Press Start 2P',monospace;font-size:8px;color:var(--pink);margin:8px 0 4px}.lbcap .pr{color:var(--ink);line-height:1.25;white-space:pre-wrap}.lbcap .rq{color:var(--amb);line-height:1.25;white-space:pre-wrap}
+.card.bundle{border-color:var(--pur);box-shadow:3px 3px 0 rgba(157,123,255,.4),6px 6px 0 rgba(157,123,255,.18)}
+.card.bundle:hover{border-color:var(--pink)}
+.bnd{position:absolute;top:5px;left:5px;background:rgba(157,123,255,.9);color:#0a0814;font-family:'Press Start 2P',monospace;font-size:8px;padding:4px 6px;border-radius:5px;pointer-events:none}
+.tbtn.cmpb{width:auto;padding:0 7px;background:rgba(157,123,255,.88);color:#0a0814;font-size:15px}.tbtn.cmpb:hover{background:var(--pink);color:#fff}
+.cfs{display:none;position:fixed;inset:0;background:rgba(4,3,10,.98);z-index:70;flex-direction:column}
+.cfs.on{display:flex}
+.cfsbar{display:grid;grid-template-columns:minmax(0,1fr) 36px;align-items:center;gap:10px;padding:8px 14px;border-bottom:1px solid var(--ln);flex:none;background:rgba(10,8,20,.9)}
+.cfsgrp{position:absolute;top:12px;bottom:12px;width:230px;z-index:5;display:flex;flex-direction:column;gap:7px;align-items:stretch;overflow-x:hidden;overflow-y:auto;padding:10px;border:1px solid rgba(157,123,255,.28);border-radius:8px;background:rgba(8,6,16,.72);box-shadow:0 14px 44px rgba(0,0,0,.36);backdrop-filter:blur(10px);scrollbar-width:thin;scrollbar-color:rgba(157,123,255,.55) transparent}
+.cfsgrp.lft{left:12px}.cfsgrp.rgt{right:12px}
+.cfsgrp::-webkit-scrollbar{width:6px}.cfsgrp::-webkit-scrollbar-track{background:transparent}.cfsgrp::-webkit-scrollbar-thumb{background:rgba(157,123,255,.48);border-radius:999px}
+.cfsgrp .sk{position:sticky;top:0;z-index:1;font-family:'Press Start 2P',monospace;font-size:9px;color:var(--mut);padding:2px 2px 6px;background:linear-gradient(rgba(8,6,16,.95),rgba(8,6,16,.72))}
+.cfsgrp.rgt .sk{text-align:right}
+.cfschip{background:var(--b2);border:1px solid var(--ln);color:var(--mut);border-radius:6px;min-height:38px;padding:6px 10px;font-family:'VT323',monospace;font-size:18px;line-height:1.1;cursor:pointer;text-align:left;white-space:normal;word-break:break-word}
+.cfsgrp.rgt .cfschip{text-align:right}
+.cfschip:hover{color:var(--ink)}
+.cfsgrp.lft .cfschip.on{border-color:var(--pink);color:var(--pink);box-shadow:0 0 10px rgba(255,93,143,.3)}
+.cfsgrp.rgt .cfschip.on{border-color:var(--cyan);color:var(--cyan);box-shadow:0 0 10px rgba(86,225,255,.3)}
+.cfsmid{flex:1;text-align:center;color:var(--mut);font-size:15px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.cfsmid b{color:var(--amb);font-weight:normal}
+.cfsx{background:rgba(13,11,22,.7);border:1px solid var(--ln);color:var(--ink);border-radius:6px;width:36px;height:32px;cursor:pointer;font-size:15px}.cfsx:hover{border-color:var(--pink);color:var(--pink)}
+.cfsstage{position:relative;flex:1;overflow:hidden;cursor:crosshair}
+.cfsstage.panning{cursor:grabbing}
+.cfszoom{position:absolute;inset:0;transform-origin:50% 50%}
+.cfszoom img{position:absolute;inset:0;width:100%;height:100%;object-fit:contain;pointer-events:none;user-select:none;-webkit-user-drag:none}
+.cfsdiv{position:absolute;top:0;bottom:0;width:2px;margin-left:-1px;background:var(--pink);box-shadow:0 0 12px rgba(255,93,143,.85);pointer-events:none;z-index:2}
+.cfslab{position:absolute;top:12px;font-family:'Press Start 2P',monospace;font-size:10px;padding:7px 10px;border-radius:6px;background:rgba(10,8,20,.82);pointer-events:none;line-height:1.5;z-index:6}
+.cfslab.la{left:258px;color:var(--pink)}.cfslab.lb{right:258px;color:var(--cyan);text-align:right}
+.cfslab .dim{display:block;margin-top:2px}.cfslab.la .dim{color:var(--pink)}.cfslab.lb .dim{color:var(--cyan)}
 </style></head><body><div class="wrap"><div class="topstick">
 <div class="bar">
   <div class="brand pix">너무바쁜베짱이 <b>STUDIO</b><small>PING·PONG GALLERY v1.0</small></div>
@@ -2489,7 +2962,7 @@ body{margin:0;background:#0a0814;color:var(--ink);font-family:'VT323',monospace;
 </div>
 <div class="genbar">
   <select id="mode" class="msel" onchange="modeChg()"><option value="image">이미지</option><option value="video">영상</option><option value="song">음악</option><option value="klein">인물합성</option><option value="faceswap">페이스스왑</option></select>
-  <input id="prompt" class="gi" placeholder="무엇을 만들까요? 예: 노을 지는 바닷가">
+  <textarea id="prompt" class="gi promptbox" rows="2" placeholder="무엇을 만들까요? /레크2 프롬프트"></textarea>
   <button class="up" id="up" style="display:none" onclick="document.getElementById('files').click()">📷 사진</button>
   <input type="file" id="files" accept="image/*" multiple style="display:none" onchange="filePick()">
   <button class="genb pix" id="genbtn" onclick="gen()">생성 ▸</button>
@@ -2515,6 +2988,9 @@ body{margin:0;background:#0a0814;color:var(--ink);font-family:'VT323',monospace;
   </div>
   <div class="optgrp" id="editopts">
     <label>SIZE <select id="emp"><option value="0.5">0.5MP</option><option value="1" selected>1MP</option><option value="1.5">1.5MP</option><option value="2">2MP</option></select></label>
+    <label id="enhlab" style="display:none" title="내장 선택 시 핑퐁 LLM 정제를 건너뛰고 워크플로 안의 인핸서가 프롬프트를 다듬어요">정제 <select id="enh"><option value="0" selected>핑퐁 LLM</option><option value="1">내장 인핸서</option></select></label>
+    <label id="slimlab" style="display:none" title="어느 단계까지 뽑을지 선택 — 줄이면 그 뒤 단계는 계산도 안 해서 빨라져요">단계 <select id="slimit"></select></label>
+    <span id="dnopts" style="display:none;gap:8px;align-items:center;flex-wrap:wrap"></span>
   </div>
   <div class="optgrp" id="vidopts">
     <label>SECONDS <input id="vsec" type="number" min="1" max="20" value="5"></label>
@@ -2582,11 +3058,30 @@ body{margin:0;background:#0a0814;color:var(--ink);font-family:'VT323',monospace;
     <div class="s">바로가기 ▶</div>
   </a>
   <a class="ytlatest" id="ytlatest" target="_blank" rel="noopener"><img id="ytthumb"><div class="ytxt"><div class="yk pix">LATEST UPLOAD</div><div class="yn" id="yttitle"></div></div></a>
+  <a class="ytban promo" id="promoban" target="_blank" rel="noopener" style="display:none">
+    <div class="k pix">HACKERS · NEW</div>
+    <div class="t pix" id="promotitle"></div>
+    <div class="s">🎓 수강하러 가기 ▶</div>
+  </a>
 </aside></div></div>
-<div class="lb" id="lb"><div class="lbtools"><button onclick="lbHide()">👁</button><button onclick="lbDel()">🗑</button><button onclick="closeLb()">✕</button></div><button class="nav prev" onclick="step(-1)">‹</button><img id="lbimg" onclick="toggleZoom()"><button class="nav next" onclick="step(1)">›</button><div class="lbcap" id="lbcap"></div></div>
+<div class="lb" id="lb"><div class="lbtools"><button onclick="lbHide()">👁</button><button onclick="lbDel()">🗑</button><button onclick="closeLb()">✕</button></div><button class="nav prev" onclick="step(-1)">‹</button><img id="lbimg" onclick="toggleZoom(event)"><button class="nav next" onclick="step(1)">›</button><div class="lbcap" id="lbcap"></div></div>
+<div class="cfs" id="cfs">
+  <div class="cfsbar">
+    <div class="cfsmid" id="cfsinfo"></div>
+    <button class="cfsx" onclick="closeCmp()">✕</button>
+  </div>
+  <div class="cfsstage" id="cfsstage">
+    <div class="cfsgrp lft" id="cfsL"><span class="sk">◀ LEFT</span></div>
+    <div class="cfsgrp rgt" id="cfsR"><span class="sk">RIGHT ▶</span></div>
+    <div class="cfszoom" id="cfszoom"><img id="cfsRimg" alt=""><img id="cfsLimg" alt=""></div>
+    <div class="cfsdiv" id="cfsdiv"></div>
+    <span class="cfslab la" id="cfslabL"></span>
+    <span class="cfslab lb" id="cfslabR"></span>
+  </div>
+</div>
 <script>
 var PP_KEY=__PP_KEY__;
-var IMGS=[],VIDS=[],AUDS=[],CUSTOMS=[],LORAS=[],BOARD_PRESETS=[],AUDDUR={},MODE_STATUS={},DOWNLOAD_SEEN={},SHUFFLE=false,MODELPANEL=false,DTDRAG=null,DTEDIT=-1,ai=0,cur=0,curAudioRel='',IMGKEY='',VIDKEY='',AUDKEY='',DURATION_FRAMES=120,IMGPAGE=1,IMGPAGES=1,IMGTOTAL=0,IMGPER=48;
+var IMGS=[],VIDS=[],AUDS=[],CUSTOMS=[],LORAS=[],BOARD_PRESETS=[],AUDDUR={},MODE_STATUS={},DOWNLOAD_SEEN={},SHUFFLE=false,MODELPANEL=false,DTDRAG=null,DTEDIT=-1,ai=0,cur=0,curAudioRel='',IMGKEY='',VIDKEY='',AUDKEY='',DURATION_FRAMES=120,IMGPAGE=1,IMGPAGES=1,IMGTOTAL=0,IMGFILETOTAL=0,IMGPER=48;
 function api(p,b){return fetch(p,{method:'POST',headers:{'Content-Type':'application/json','X-PP-Key':PP_KEY},body:JSON.stringify(b)})}
 function el(t,c){var e=document.createElement(t);if(c)e.className=c;return e}
 function esc(s){return String(s||'').replace(/[&<>"']/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]})}
@@ -2672,11 +3167,11 @@ function loadBoardPreset(){var s=document.getElementById('presetSel'),id=s&&s.va
 function optVal(id){var e=document.getElementById(id);return e?e.value:''}
 function optNum(id,def){var v=parseFloat(optVal(id));return isNaN(v)?def:v}
 function loadGenOptions(){
-  ['iratio','zup','zscale','emp','vsec','vwidth','vfps'].forEach(function(id){var v=localStorage.getItem('pingpong_'+id),e=document.getElementById(id);if(e&&v!==null)e.value=v});
+  ['iratio','zup','zscale','emp','enh','slimit','vsec','vwidth','vfps'].forEach(function(id){var v=localStorage.getItem('pingpong_'+id),e=document.getElementById(id);if(e&&v!==null)e.value=v});
   updateDurationFrames()
 }
 function saveGenOptions(){
-  ['iratio','zup','zscale','emp','vsec','vwidth','vfps'].forEach(function(id){var e=document.getElementById(id);if(e)localStorage.setItem('pingpong_'+id,e.value)})
+  ['iratio','zup','zscale','emp','enh','slimit','vsec','vwidth','vfps'].forEach(function(id){var e=document.getElementById(id);if(e)localStorage.setItem('pingpong_'+id,e.value)})
 }
 function updateDurationFrames(){
   var sec=Math.max(1,Math.min(20,parseInt(optVal('vsec')||'5',10)||5));
@@ -2691,9 +3186,16 @@ function gatherSettings(){
   if(m==='image'){s.image_ratio=optVal('iratio');s.zit_upscale=optVal('zup')==='1';s.zit_scale_by=optNum('zscale',0.5)}
   else if(m==='video'||(custom&&custom.type==='video')){s.video_seconds=optNum('vsec',5);s.video_width=optNum('vwidth',0);s.video_fps=optNum('vfps',24)}
   else if(custom&&custom.type==='image'){s.image_megapixels=optNum('emp',1);if(custom.ratio)s.image_ratio=optVal('iratio')}
+  if(custom&&custom.enhancer)s.builtin_enhancer=optVal('enh')==='1';
+  if(custom&&(custom.stages||[]).length>1)s.stage_limit=Math.max(1,parseInt(optVal('slimit'),10)||custom.stages.length);
+  if(custom&&(custom.tune||[]).length){
+    Array.prototype.forEach.call(document.querySelectorAll('#dnopts .dninp'),function(inp){
+      var v=parseFloat(inp.value);if(!isNaN(v))s['tune_'+(parseInt(inp.dataset.i,10)+1)]=v
+    })
+  }
   return s
 }
-['iratio','zup','zscale','emp','vsec','vwidth','vfps'].forEach(function(id){setTimeout(function(){var e=document.getElementById(id);if(e)e.onchange=function(){saveGenOptions();updateDurationFrames();renderAssets()}},0)});
+['iratio','zup','zscale','emp','enh','slimit','vsec','vwidth','vfps'].forEach(function(id){setTimeout(function(){var e=document.getElementById(id);if(e)e.onchange=function(){saveGenOptions();updateDurationFrames();renderAssets()}},0)});
 function setVideoFold(fold){var m=document.querySelector('.mon'),b=document.getElementById('vtog'),s=document.getElementById('vstate');m.classList.toggle('collapsed',fold);b.classList.toggle('open',!fold);b.setAttribute('aria-expanded',fold?'false':'true');b.title=fold?'비디오 플레이어 펼치기':'비디오 플레이어 접기';if(s)s.textContent=fold?'접힘 · 펼치기':'열림 · 접기';localStorage.setItem('pingpong_video_fold',fold?'1':'0')}
 function toggleVideo(){setVideoFold(!document.querySelector('.mon').classList.contains('collapsed'))}
 function initVideoFold(){setVideoFold(localStorage.getItem('pingpong_video_fold')!=='0')}
@@ -2711,14 +3213,16 @@ function pollSystem(){fetch('/api/system').then(function(r){return r.json()}).th
 function toggleLog(){var box=document.getElementById('logbox');box.classList.toggle('open');document.getElementById('logstate').textContent=box.classList.contains('open')?'열림':'접힘';if(box.classList.contains('open'))pollLog()}
 function pollLog(){if(!document.getElementById('logbox').classList.contains('open'))return;fetch('/api/comfy_log').then(function(r){return r.json()}).then(function(d){document.getElementById('logbody').textContent=(d.lines||[]).join('\n')})}
 function loadYoutube(){fetch('/api/youtube_latest').then(function(r){return r.json()}).then(function(y){
+  var p=document.getElementById('promoban');
+  if(p&&y.promo&&y.promo.url){p.href=y.promo.url;document.getElementById('promotitle').textContent=y.promo.title||'';p.style.display='block'}
   if(!y.ok||!y.thumb)return;
   var a=document.getElementById('ytlatest');a.href=y.url;document.getElementById('ytthumb').src=y.thumb;document.getElementById('yttitle').textContent=y.title;a.classList.add('on')
 })}
 
-function listKey(xs){return (xs||[]).map(function(x){return x.rel+':'+Math.floor(x.mtime||0)}).join('|')}
+function listKey(xs){return (xs||[]).map(function(x){return x.rel+':'+Math.round((x.mtime||0)*1000)}).join('|')}
 function load(){fetch('/api/list?page='+IMGPAGE+'&per='+IMGPER).then(function(r){return r.json()}).then(function(d){
   var ik=listKey(d.images),vk=listKey(d.videos),ak=listKey(d.audios);
-  IMGPAGE=d.imagePage||1;IMGPAGES=d.imagePages||1;IMGTOTAL=d.imageTotal||0;
+  IMGPAGE=d.imagePage||1;IMGPAGES=d.imagePages||1;IMGTOTAL=d.imageTotal||0;IMGFILETOTAL=d.imageFileTotal||IMGTOTAL;
   if(ik!==IMGKEY){IMGKEY=ik;IMGS=d.images;renderImgs()}
   if(vk!==VIDKEY){VIDKEY=vk;VIDS=d.videos;renderVids()}
   if(ak!==AUDKEY){AUDKEY=ak;AUDS=d.audios;renderAuds()}
@@ -2726,7 +3230,7 @@ function load(){fetch('/api/list?page='+IMGPAGE+'&per='+IMGPER).then(function(r)
   var h=document.getElementById('hid');h.textContent='↺ 숨김 복구 '+d.hiddenCount;h.className='chip'+(d.hiddenCount?'':' off');
 })}
 function goPage(p){p=Math.max(1,Math.min(IMGPAGES,p||1));if(p===IMGPAGE)return;IMGPAGE=p;IMGKEY='';load();window.scrollTo({top:document.getElementById('grid').offsetTop-180,behavior:'smooth'})}
-function renderPager(){var p=document.getElementById('pager'),info=document.getElementById('pinfo');if(!p)return;p.classList.toggle('on',IMGPAGES>1);info.textContent=IMGPAGE+' / '+IMGPAGES+'  ·  '+IMGTOTAL+' imgs';var b=p.querySelectorAll('button');b[0].disabled=b[1].disabled=IMGPAGE<=1;b[2].disabled=b[3].disabled=IMGPAGE>=IMGPAGES}
+function renderPager(){var p=document.getElementById('pager'),info=document.getElementById('pinfo');if(!p)return;p.classList.toggle('on',IMGPAGES>1);info.textContent=IMGPAGE+' / '+IMGPAGES+'  ·  '+IMGTOTAL+' cards · '+IMGFILETOTAL+' imgs';var b=p.querySelectorAll('button');b[0].disabled=b[1].disabled=IMGPAGE<=1;b[2].disabled=b[3].disabled=IMGPAGE>=IMGPAGES}
 function loadModes(){fetch('/api/modes').then(function(r){return r.json()}).then(function(d){
   CUSTOMS=d.custom||[];MODE_STATUS=d.status||{};var sel=document.getElementById('mode');
   CUSTOMS.forEach(function(c){if(sel.querySelector('option[value="'+c.mode+'"]'))return;
@@ -2758,17 +3262,49 @@ function setGenerateReady(ok,missing){
   b.disabled=!ok;
   b.title=ok?'생성 시작':('준비되지 않음: '+(missing||[]).join(' · '));
 }
-function renderImgs(){var g=document.getElementById('grid');g.innerHTML='';
+var BUNDLES={};
+function renderImgs(){var g=document.getElementById('grid');g.innerHTML='';BUNDLES={};
   if(!IMGS.length){g.innerHTML='<div class="empty">아직 생성된 이미지가 없어요. 위에서 생성해보세요!</div>';return}
-  IMGS.forEach(function(it,i){var c=el('div','card');
-    c.innerHTML='<img loading="lazy" src="'+it.url+'"><div class="cap">'+it.name+'</div><div class="tools"><button class="tbtn">👁</button><button class="tbtn del">🗑</button></div>';
+  var groups={},order=[];
+  IMGS.forEach(function(it,i){var key=it.bundle||('__solo_'+i);
+    if(!groups[key]){groups[key]=[];order.push(key)}
+    groups[key].push({it:it,i:i})});
+  order.forEach(function(key){
+    var ms=groups[key];
+    if(ms.length>1){
+      var dedup={},loose=[];
+      ms.forEach(function(m){
+        var key=(m.it.stage_idx||'')+'|'+(m.it.stage||'');
+        if(m.it.stage||m.it.stage_idx){
+          if(!dedup[key]||((m.it.mtime||0)>(dedup[key].it.mtime||0)))dedup[key]=m;
+        }else loose.push(m)
+      });
+      ms=Object.keys(dedup).map(function(k){return dedup[k]}).concat(loose);
+    }
+    if(ms.length<2){addImgCard(g,ms[0].it,ms[0].i);return}
+    ms.sort(function(a,b){return (a.it.stage_idx||0)-(b.it.stage_idx||0)});
+    BUNDLES[key]=ms.map(function(m){return m.it});
+    var fin=ms[ms.length-1],it=fin.it;
+    var c=el('div','card bundle');
+    c.innerHTML='<img loading="lazy" src="'+(it.thumb||it.url)+'"><div class="bnd">▦ '+ms.length+'단계</div><div class="cap">'+it.name+'</div>'+
+      '<div class="tools"><button class="tbtn cmpb" title="A/B/C 와이프 비교">⚖ 비교</button><button class="tbtn" title="묶음 숨기기">👁</button><button class="tbtn del" title="묶음 삭제">🗑</button></div>';
+    c.draggable=true;
+    c.ondragstart=function(e){e.dataTransfer.setData('application/x-pingpong-gallery',JSON.stringify({kind:'image',name:it.name,url:it.url,rel:it.rel}));e.dataTransfer.effectAllowed='copy'};
+    c.onclick=function(){openLb(fin.i)};
+    var b=c.querySelectorAll('.tbtn');
+    b[0].onclick=function(e){e.stopPropagation();openCmp(key)};
+    b[1].onclick=function(e){e.stopPropagation();Promise.all(ms.map(function(m){return api('/api/hide',{rel:m.it.rel})})).then(load)};
+    b[2].onclick=function(e){e.stopPropagation();if(confirm('묶음 '+ms.length+'장을 모두 삭제할까요? (.trash 폴더로 이동)'))Promise.all(ms.map(function(m){return api('/api/delete',{rel:m.it.rel})})).then(load)};
+    g.appendChild(c)})}
+function addImgCard(g,it,i){var c=el('div','card');
+    c.innerHTML='<img loading="lazy" src="'+(it.thumb||it.url)+'"><div class="cap">'+it.name+'</div><div class="tools"><button class="tbtn">👁</button><button class="tbtn del">🗑</button></div>';
     c.draggable=true;
     c.ondragstart=function(e){e.dataTransfer.setData('application/x-pingpong-gallery',JSON.stringify({kind:'image',name:it.name,url:it.url,rel:it.rel}));e.dataTransfer.effectAllowed='copy'};
     c.onclick=function(){openLb(i)};
     var b=c.querySelectorAll('.tbtn');
     b[0].onclick=function(e){e.stopPropagation();api('/api/hide',{rel:it.rel}).then(load)};
     b[1].onclick=function(e){e.stopPropagation();if(confirm('삭제할까요? (.trash 폴더로 이동)'))api('/api/delete',{rel:it.rel}).then(load)};
-    g.appendChild(c)})}
+    g.appendChild(c)}
 function renderVids(){var v=document.getElementById('vrows');v.innerHTML='';
   VIDS.forEach(function(it){var r=el('div','vrow pix');
     r.innerHTML='<span class="tg">MP4</span><span class="nm">'+it.name+'</span><button class="tbtn">🗑</button>';
@@ -2818,22 +3354,150 @@ vol.oninput=function(){aud.volume=parseFloat(vol.value);localStorage.setItem('pi
 SHUFFLE=localStorage.getItem('pingpong_shuffle')==='1';updateShuffleButton();
 function typingTarget(e){var t=e.target,tag=(t&&t.tagName||'').toLowerCase();return tag==='input'||tag==='textarea'||tag==='select'||(t&&t.isContentEditable)}
 
+var LB={scale:1,tx:0,ty:0,drag:null,moved:false};
+function applyLbView(){
+  var img=document.getElementById('lbimg'),lb=document.getElementById('lb');if(!img||!lb)return;
+  img.style.transform='translate('+LB.tx+'px,'+LB.ty+'px) scale('+LB.scale+')';
+  lb.classList.toggle('zoomed',LB.scale>1.01);
+}
+function resetLbView(){LB={scale:1,tx:0,ty:0,drag:null,moved:false};applyLbView()}
+function zoomLbAt(clientX,clientY,nextScale){
+  var lb=document.getElementById('lb'),r=lb.getBoundingClientRect(),ns=Math.max(1,Math.min(10,nextScale)),f=ns/LB.scale;
+  var cx=clientX-(r.left+r.width/2),cy=clientY-(r.top+r.height/2);
+  LB.tx=cx-(cx-LB.tx)*f;LB.ty=cy-(cy-LB.ty)*f;LB.scale=ns;
+  if(ns===1){LB.tx=0;LB.ty=0}
+  applyLbView();
+}
 function openLb(i){cur=i;showLb();document.getElementById('lb').classList.add('open');document.body.classList.add('modalopen')}
-function showLb(){if(!IMGS.length){closeLb();return}document.getElementById('lb').classList.remove('zoomed');cur=(cur+IMGS.length)%IMGS.length;var it=IMGS[cur];document.getElementById('lbimg').src=it.url;
-  var html='<b>'+esc(it.name)+'</b>';
+function showLb(){if(!IMGS.length){closeLb();return}resetLbView();cur=(cur+IMGS.length)%IMGS.length;var it=IMGS[cur];document.getElementById('lbimg').src=it.url;
+  var html='<b>'+esc(it.name)+(it.stage?' ['+esc(it.stage)+']':'')+'</b>';
   html+='<div class="k">REQUEST</div><div class="rq">'+esc(it.request||'요청 원문 기록 없음 - 새 생성부터 저장돼요')+'</div>';
   html+='<div class="k">GENERATED PROMPT</div><div class="pr">'+esc(it.prompt||'프롬프트 메타데이터 없음')+'</div>';
   document.getElementById('lbcap').innerHTML=html
 }
-function toggleZoom(){document.getElementById('lb').classList.toggle('zoomed')}
+function toggleZoom(e){
+  if(LB.moved){LB.moved=false;return}
+  var lb=document.getElementById('lb'),r=lb.getBoundingClientRect(),x=e&&e.clientX?e.clientX:(r.left+r.width/2),y=e&&e.clientY?e.clientY:(r.top+r.height/2);
+  if(LB.scale>1.01)resetLbView();else zoomLbAt(x,y,2.5);
+}
 function step(d){cur+=d;showLb()}
-function closeLb(){document.getElementById('lb').classList.remove('open','zoomed');document.body.classList.remove('modalopen')}
+function closeLb(){document.getElementById('lb').classList.remove('open','zoomed','panning');resetLbView();document.body.classList.remove('modalopen')}
 function lbHide(){var it=IMGS[cur];if(it)api('/api/hide',{rel:it.rel}).then(function(){IMGS.splice(cur,1);renderImgs();IMGS.length?showLb():closeLb();updHidQuick()})}
 function lbDel(){var it=IMGS[cur];if(it&&confirm('삭제할까요?'))api('/api/delete',{rel:it.rel}).then(function(){IMGS.splice(cur,1);renderImgs();IMGS.length?showLb():closeLb()})}
 function updHidQuick(){load()}
 function unhideAll(){api('/api/unhide_all',{}).then(load)}
+(function(){
+  var lb=document.getElementById('lb'),img=document.getElementById('lbimg');
+  if(!lb||!img)return;
+  img.addEventListener('mousedown',function(e){
+    if(LB.scale<=1.01||e.button!==0)return;
+    e.preventDefault();LB.drag={x:e.clientX,y:e.clientY,tx:LB.tx,ty:LB.ty};LB.moved=false;lb.classList.add('panning');
+  });
+  window.addEventListener('mousemove',function(e){
+    if(!LB.drag)return;
+    var dx=e.clientX-LB.drag.x,dy=e.clientY-LB.drag.y;
+    if(Math.abs(dx)+Math.abs(dy)>3)LB.moved=true;
+    LB.tx=LB.drag.tx+dx;LB.ty=LB.drag.ty+dy;applyLbView();
+  });
+  window.addEventListener('mouseup',function(){
+    if(!LB.drag)return;
+    LB.drag=null;lb.classList.remove('panning');
+    if(LB.moved)setTimeout(function(){LB.moved=false},180);
+  });
+  lb.addEventListener('wheel',function(e){
+    if(!lb.classList.contains('open')||e.target.closest('.lbtools,.nav,.lbcap'))return;
+    e.preventDefault();zoomLbAt(e.clientX,e.clientY,LB.scale*(e.deltaY<0?1.25:1/1.25));
+  },{passive:false});
+  img.addEventListener('dblclick',function(e){e.preventDefault();resetLbView()});
+})();
+
+/* ---------- 묶음 A/B/C 와이프 비교 뷰어 ---------- */
+var CMP={items:[],L:0,R:0,orig:null,scale:1,tx:0,ty:0,wipe:50,drag:null};
+function cmpLetter(i){return String.fromCharCode(65+i)}
+function openCmp(key){var ms=BUNDLES[key];if(!ms||ms.length<2)return;
+  CMP.items=ms;CMP.L=0;CMP.R=ms.length-1;CMP.orig=null;CMP.scale=1;CMP.tx=0;CMP.ty=0;CMP.wipe=50;
+  for(var oi=0;oi<ms.length;oi++){if(ms[oi].orig_url){CMP.orig={url:ms[oi].orig_url,rel:ms[oi].orig||'',label:'DEPTH SOURCE'};break}}
+  document.getElementById('cfs').classList.add('on');document.body.classList.add('modalopen');
+  renderCmpChips();applyCmpImgs();applyCmpView()}
+function closeCmp(){document.getElementById('cfs').classList.remove('on');if(!document.getElementById('lb').classList.contains('open'))document.body.classList.remove('modalopen')}
+function renderCmpChips(){
+  [['L','cfsL'],['R','cfsR']].forEach(function(p){
+    var side=p[0],box=document.getElementById(p[1]),skEl=box.querySelector('.sk'),sk=skEl?skEl.outerHTML:'';
+    if(side==='L'&&CMP.orig){
+      box.innerHTML=sk+'<button class="cfschip on" title="'+esc(CMP.orig.rel)+'">DEPTH SOURCE<br>'+esc((CMP.orig.rel||'control image').split('/').pop())+'</button>';
+      return;
+    }
+    var chips=CMP.items.map(function(it,i){
+      var on=(side==='L'?CMP.L:CMP.R)===i;
+      return '<button class="cfschip'+(on?' on':'')+'" onclick="setCmpSide(\''+side+'\','+i+')">'+cmpLetter(i)+' · '+esc(it.stage||('단계'+(i+1)))+'</button>'
+    }).join('');
+    box.innerHTML=sk+chips;
+    var on=box.querySelector('.cfschip.on');if(on)on.scrollIntoView({block:'center',inline:'nearest'});
+  })
+}
+function setCmpSide(side,i){if(i<0||i>=CMP.items.length)return;if(side==='L'&&CMP.orig)return;if(side==='L')CMP.L=i;else CMP.R=i;renderCmpChips();applyCmpImgs()}
+function applyCmpImgs(){
+  var L=document.getElementById('cfsLimg'),R=document.getElementById('cfsRimg');
+  L.onload=R.onload=updateCmpLabels;
+  L.src=CMP.orig?CMP.orig.url:CMP.items[CMP.L].url;R.src=CMP.items[CMP.R].url;
+  updateCmpLabels();
+}
+function cmpDim(img){return img.naturalWidth?(img.naturalWidth+'×'+img.naturalHeight):''}
+function updateCmpLabels(){
+  var L=document.getElementById('cfsLimg'),R=document.getElementById('cfsRimg');
+  document.getElementById('cfslabL').innerHTML=(CMP.orig?'DEPTH SOURCE':(cmpLetter(CMP.L)+' '+esc(CMP.items[CMP.L].stage||'')))+(cmpDim(L)?'<span class="dim">'+esc(cmpDim(L))+'</span>':'');
+  document.getElementById('cfslabR').innerHTML=cmpLetter(CMP.R)+' '+esc(CMP.items[CMP.R].stage||'')+(cmpDim(R)?'<span class="dim">'+esc(cmpDim(R))+'</span>':'');
+  updateCmpInfo();
+}
+function updateCmpInfo(){document.getElementById('cfsinfo').innerHTML=(CMP.orig?'왼쪽=뎁스 재료 고정 · 오른쪽=강도 선택 · ':'마우스 좌우=와이프 · ')+'휠=줌 <b>'+Math.round(CMP.scale*100)+'%</b> · 드래그=이동 · 더블클릭=리셋 · '+(CMP.orig?'키 1~9=오른쪽':'키 1~9=왼쪽 · Shift+1~9=오른쪽')+' · ESC 닫기'}
+function applyCmpView(){
+  document.getElementById('cfszoom').style.transform='translate('+CMP.tx+'px,'+CMP.ty+'px) scale('+CMP.scale+')';
+  applyCmpWipe();updateCmpInfo();
+}
+function applyCmpWipe(){
+  var st=document.getElementById('cfsstage'),z=document.getElementById('cfszoom');
+  var sr=st.getBoundingClientRect(),zr=z.getBoundingClientRect();
+  var x=sr.left+sr.width*CMP.wipe/100;
+  var p=Math.max(0,Math.min(100,(x-zr.left)/Math.max(1,zr.width)*100));
+  document.getElementById('cfsLimg').style.clipPath='inset(0 '+(100-p)+'% 0 0)';
+  document.getElementById('cfsdiv').style.left=CMP.wipe+'%';
+}
+(function(){
+  var st=document.getElementById('cfsstage');
+  ['cfsL','cfsR'].forEach(function(id){
+    var rail=document.getElementById(id);if(!rail)return;
+    ['mousedown','mousemove','wheel','dblclick','click'].forEach(function(ev){
+      rail.addEventListener(ev,function(e){e.stopPropagation()},{passive:ev==='wheel'});
+    });
+  });
+  st.addEventListener('mousemove',function(e){
+    if(CMP.drag){CMP.tx=CMP.drag.tx+(e.clientX-CMP.drag.x);CMP.ty=CMP.drag.ty+(e.clientY-CMP.drag.y);applyCmpView();return}
+    var r=st.getBoundingClientRect();
+    CMP.wipe=Math.max(0,Math.min(100,(e.clientX-r.left)/Math.max(1,r.width)*100));applyCmpWipe();
+  });
+  st.addEventListener('mousedown',function(e){if(e.button!==0)return;e.preventDefault();CMP.drag={x:e.clientX,y:e.clientY,tx:CMP.tx,ty:CMP.ty};st.classList.add('panning')});
+  window.addEventListener('mouseup',function(){if(CMP.drag){CMP.drag=null;st.classList.remove('panning')}});
+  st.addEventListener('wheel',function(e){
+    e.preventDefault();
+    var r=st.getBoundingClientRect();
+    var ns=Math.max(1,Math.min(12,CMP.scale*(e.deltaY<0?1.3:1/1.3)));
+    var f=ns/CMP.scale;
+    var cx=e.clientX-(r.left+r.width/2),cy=e.clientY-(r.top+r.height/2);
+    CMP.tx=cx-(cx-CMP.tx)*f;CMP.ty=cy-(cy-CMP.ty)*f;CMP.scale=ns;
+    if(ns===1){CMP.tx=0;CMP.ty=0}
+    applyCmpView();
+  },{passive:false});
+  st.addEventListener('dblclick',function(){CMP.scale=1;CMP.tx=0;CMP.ty=0;applyCmpView()});
+})();
+
 document.addEventListener('keydown',function(e){
   if(e.code==='Space'&&!typingTarget(e)){e.preventDefault();aplay();return}
+  if(document.getElementById('cfs').classList.contains('on')){
+    if(e.key==='Escape'){closeCmp();return}
+    var m=(e.code||'').match(/^Digit([1-9])$/);
+    if(m&&!typingTarget(e)){setCmpSide((CMP.orig||e.shiftKey)?'R':'L',parseInt(m[1],10)-1);return}
+    return;
+  }
   if(e.key==='Escape'&&document.getElementById('refboard').classList.contains('on')){closeReferenceBoard();return}
   if(!document.getElementById('lb').classList.contains('open'))return;
   if(e.key==='ArrowRight')step(1);if(e.key==='ArrowLeft')step(-1);if(e.key==='Escape')closeLb()
@@ -2858,6 +3522,22 @@ function modeChg(){var m=document.getElementById('mode').value,p=document.getEle
   io.classList.toggle('on',m==='image'||!!(c&&c.type==='image'&&c.ratio));
   ['zup','zscale'].forEach(function(id){var e=document.getElementById(id),l=e&&e.closest('label');if(l)l.style.display=(m==='image')?'flex':'none'});
   eo.classList.toggle('on',!!(c&&c.type==='image'));
+  var en=document.getElementById('enhlab');if(en)en.style.display=(c&&c.enhancer)?'flex':'none';
+  var sll=document.getElementById('slimlab'),sle=document.getElementById('slimit'),sts=(c&&c.stages)||[];
+  if(sll&&sle){sll.style.display=sts.length>1?'flex':'none';
+    if(sts.length>1){sle.innerHTML=sts.map(function(lab,i){return '<option value="'+(i+1)+'">'+esc(lab)+(i===0?'만':'까지')+'</option>'}).join('');
+      var sv=localStorage.getItem('pingpong_slimit');sle.value=(sv&&parseInt(sv,10)>=1&&parseInt(sv,10)<=sts.length)?sv:String(sts.length)}}
+  var dbox=document.getElementById('dnopts'),dns=(c&&c.tune)||[];
+  if(dbox){dbox.style.display=dns.length?'flex':'none';
+    dbox.innerHTML=dns.map(function(d,i){
+      var sv=localStorage.getItem('pingpong_dn_'+m+'_'+i);
+      var v=(sv!==null&&sv!=='')?sv:(d.value!=null?d.value:0.5);
+      var mn=(d.min==null?0:d.min),mx=(d.max==null?1:d.max);
+      return '<label title="'+mn+'~'+mx+' (기본 '+(d.value!=null?d.value:'-')+')">'+esc(d.label)+' <input type="number" step="'+(d.step||0.05)+'" min="'+mn+'" max="'+mx+'" class="dninp" data-i="'+i+'" value="'+v+'"></label>'
+    }).join('');
+    Array.prototype.forEach.call(dbox.querySelectorAll('.dninp'),function(inp){
+      inp.onchange=function(){localStorage.setItem('pingpong_dn_'+m+'_'+inp.dataset.i,inp.value)}
+    })}
   vo.classList.toggle('on',m==='video'||!!(c&&c.type==='video'));
   renderModeHint(m);
   loadModelFields();
@@ -2892,6 +3572,9 @@ function frameFromDrop(track,e){var r=track.getBoundingClientRect();return clamp
 function directorDropAsset(track,e){e.preventDefault();track.classList.remove('drop');var raw=e.dataTransfer.getData('application/x-pingpong-gallery');if(!raw)return;var it;try{it=JSON.parse(raw)}catch(_){return}var tr=track.dataset.track,frame=frameFromDrop(track,e);if(tr==='main'&&it.kind==='image'){picked.push({kind:'image',name:it.name||'gallery image',data:it.url,gallery_rel:it.rel,start:frame,length:1,trimStart:0,isEndFrame:false});renderAssets();return}if(tr==='audio'&&it.kind==='audio'){var fps=fpsVal(),dur=Math.max(fps,Math.round((it.duration||4)*fps));picked.push({kind:'audio',name:it.name||'audio',data:it.url,gallery_rel:it.rel,start:frame,length:Math.min(dur,DURATION_FRAMES-frame),trimStart:0});renderAssets();return}}
 function directorDragOver(track,e){var types=Array.prototype.slice.call(e.dataTransfer.types||[]);if(types.indexOf('application/x-pingpong-gallery')<0)return;e.preventDefault();track.classList.add('drop');e.dataTransfer.dropEffect='copy'}
 function saveTextDraft(){var a=picked[DTEDIT],t=document.getElementById('dttext');if(!a||!t||a.kind!=='text')return;a.prompt=t.value.trim();a.name=(a.prompt||'Text Segment').slice(0,28)}
+function autosizePrompt(){var p=document.getElementById('prompt');if(!p)return;p.style.height='auto';p.style.height=Math.min(220,Math.max(72,p.scrollHeight))+'px'}
+function saveMainPromptDraft(){try{localStorage.setItem('pingpong_main_prompt',document.getElementById('prompt').value||'')}catch(e){}}
+function restoreMainPromptDraft(){try{var v=localStorage.getItem('pingpong_main_prompt');if(v!==null)document.getElementById('prompt').value=v}catch(e){}autosizePrompt()}
 function addTextSegment(){saveTextDraft();var fps=fpsVal(),start=nextDirectorStart('text'),len=Math.min(DURATION_FRAMES-start,Math.max(fps,Math.round(DURATION_FRAMES/3))),item={kind:'text',name:'Text Segment',prompt:'',start:start,length:Math.max(1,len),trimStart:0,id:'text_'+Date.now()};picked.push(item);renderAssets();editTextSegment(picked.length-1)}
 function applyTextSegment(){saveTextDraft();document.getElementById('dtedit').classList.remove('on');DTEDIT=-1;renderDirectorTimeline()}
 function editTextSegment(i){saveTextDraft();DTEDIT=i;var a=picked[i],box=document.getElementById('dtedit'),t=document.getElementById('dttext');if(!a||!box||!t)return;t.value=a.prompt||'';box.classList.add('on');t.focus()}
@@ -2996,7 +3679,9 @@ function filePick(){var fs=document.getElementById('files').files,done=0;
 function gen(){var m=document.getElementById('mode').value,p=document.getElementById('prompt'),t=p.value.trim();
   var st=MODE_STATUS[m]||{},missing=st.missing||[],gb=document.getElementById('genbtn');
   if((gb&&gb.disabled)||missing.length){alert('준비되지 않은 기능이에요.\n'+missing.join('\n'));return}
-  if((m==='image'||m==='video'||m==='song'||m.indexOf('custom:')===0)&&!t){p.classList.add('shake');setTimeout(function(){p.classList.remove('shake')},300);return}
+  saveTextDraft();
+  var hasSegs=(m==='video')&&picked.some(function(a){return a&&a.kind==='text'&&(a.prompt||'').trim()});
+  if((m==='image'||m==='video'||m==='song'||m.indexOf('custom:')===0)&&!t&&!hasSegs){p.classList.add('shake');setTimeout(function(){p.classList.remove('shake')},300);return}
   var imageData=picked.filter(function(x){return x&&x.kind==='image'&&x.enabled!==false}).map(function(x){return x.data});
   if(m==='klein'&&imageData.length<1){alert('사진 1장을 첨부하세요');return}
   if(m==='faceswap'&&imageData.length<2){alert('사진 2장(몸→얼굴)을 첨부하세요');return}
@@ -3006,10 +3691,11 @@ function gen(){var m=document.getElementById('mode').value,p=document.getElement
   saveGenOptions();
   api('/api/generate',{mode:m,text:t,images:imageData,assets:picked,settings:gatherSettings()}).then(function(r){return r.json()}).then(function(j){
     if(!j.ok){alert(j.err||'실패');return}
-    p.value='';if(!(needsReferenceBoard(m,custom)||m==='video'))picked=[];document.getElementById('files').value='';renderAssets();document.getElementById('upinfo').textContent=(needsReferenceBoard(m,custom)||m==='video')?'큐에 추가됨 ✓ 작업 보드는 유지돼요':'큐에 추가됨 ✓ 봇이 곧 처리해요';
+    saveMainPromptDraft();if(!(needsReferenceBoard(m,custom)||m==='video'))picked=[];document.getElementById('files').value='';renderAssets();autosizePrompt();document.getElementById('upinfo').textContent=(needsReferenceBoard(m,custom)||m==='video')?'큐에 추가됨 ✓ 작업 보드는 유지돼요':'큐에 추가됨 ✓ 봇이 곧 처리해요';
   })}
-document.getElementById('prompt').addEventListener('keydown',function(e){if(e.key==='Enter')gen()});
-document.getElementById('prompt').addEventListener('input',renderReferenceBoard);
+document.getElementById('prompt').addEventListener('keydown',function(e){if(e.key==='Enter'&&(e.ctrlKey||e.metaKey)){e.preventDefault();gen()}});
+document.getElementById('prompt').addEventListener('input',function(){saveMainPromptDraft();autosizePrompt();renderReferenceBoard()});
+restoreMainPromptDraft();
 document.getElementById('dttext').addEventListener('input',saveTextDraft);
 var boardDrop=document.getElementById('rphoto');
 if(boardDrop){

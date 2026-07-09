@@ -252,6 +252,52 @@ def find_prefix_node(wf):
     return best[0][1] if best else None
 
 
+def find_save_nodes(wf):
+    """이미지 저장(SaveImage 계열) 노드를 id 순으로 반환: [[nid, prefix힌트], ...]"""
+    rows = []
+    for nid, node in wf.items():
+        ct = class_type(wf, nid).lower()
+        inputs = node_inputs(node)
+        if "saveimage" not in ct or "filename_prefix" not in inputs:
+            continue
+        rows.append([str(nid), str(inputs.get("filename_prefix") or nid)])
+    def _key(r):
+        try:
+            return (0, int(r[0]), r[0])
+        except ValueError:
+            return (1, 0, r[0])
+    rows.sort(key=_key)
+    return rows
+
+
+def find_tune_nodes(wf):
+    """미세조절 후보: 부분 디노이즈(0<denoise<1), 업스케일 배율(upscale_by/scale_by).
+    반환: [[nid, field, 제목, 현재값, 최소, 최대, 스텝], ...]"""
+    rows = []
+    for nid, node in wf.items():
+        inputs = node_inputs(node)
+        title = str((node.get("_meta") or {}).get("title") or class_type(wf, nid))
+        def _num(key):
+            v = inputs.get(key)
+            return float(v) if isinstance(v, (int, float)) and not isinstance(v, bool) else None
+        dn = _num("denoise")
+        if dn is not None and 0 < dn < 1:
+            rows.append([str(nid), "denoise", title, dn, 0, 1, 0.05])
+        up = _num("upscale_by")
+        if up is not None and up > 0:
+            rows.append([str(nid), "upscale_by", title, up, 1, 4, 0.05])
+        sc = _num("scale_by")
+        if sc is not None and 0 < sc <= 1:
+            rows.append([str(nid), "scale_by", title, sc, 0.25, 1, 0.05])
+    def _key(r):
+        try:
+            return (0, int(r[0]), r[0])
+        except ValueError:
+            return (1, 0, r[0])
+    rows.sort(key=_key)
+    return rows
+
+
 def find_output_candidates(wf):
     best = []
     for nid, node in wf.items():
@@ -549,6 +595,27 @@ def main():
         "prefix": "pingpong/" + safe_key(name).lower() + "_",
         "output_node": output_node or (prefix_node[0] if prefix_node else ""),
     }
+    save_rows = find_save_nodes(wf) if wtype == "image" else []
+    if len(save_rows) >= 2:
+        print(f"\n💡 이 워크플로에는 이미지 저장 노드가 {len(save_rows)}개 있어요.")
+        print("   '묶음(다단계) 저장'으로 등록하면 한 번 생성에 여러 장이 한 묶음으로 저장되고,")
+        print("   갤러리에서 ⚖ 비교 버튼으로 단계별(A/B/C) 와이프 비교를 할 수 있어요.")
+        if yes_no("묶음 저장으로 등록할까요?", True):
+            stage_nodes = []
+            for i, (nid, hint) in enumerate(save_rows, 1):
+                lab = ask(f"  단계 {i} 라벨 (저장 노드 {nid} · prefix '{hint}')", f"단계{i}")
+                stage_nodes.append([nid, lab])
+            spec["stage_nodes"] = stage_nodes
+            spec["output_node"] = stage_nodes[-1][0]
+    tune_rows = find_tune_nodes(wf) if wtype == "image" else []
+    if tune_rows:
+        print(f"\n💡 미세조절 가능한 값이 {len(tune_rows)}개 있어요 (디노이즈/업스케일 배율).")
+        if yes_no("대시보드에서 조절할 수 있게 등록할까요?", True):
+            labeled = []
+            for i, (nid, field, title, val, lo, hi, step) in enumerate(tune_rows, 1):
+                lab = ask(f"  노드 {nid} '{title}' {field} (현재 {val}) 라벨", f"{field}{i}")
+                labeled.append([nid, field, lab, val, lo, hi, step])
+            spec["tune_nodes"] = labeled
     if timeline_prompt_nodes:
         spec["timeline_prompt_nodes"] = timeline_prompt_nodes
     if negative_nodes and yes_no("네거티브(빼고 싶은 것) 칸도 등록할까요?", True):
@@ -588,13 +655,18 @@ def main():
     switches = find_prompt_switches(wf, [n for n, _ in prompt_nodes])
     if switches:
         print("\n💡 이 워크플로에 '프롬프트 자동 증강기'(내장 AI가 프롬프트를 다시 써주는 스위치)가 있어요.")
-        print("   핑퐁이 프롬프트를 직접 만들어 주니까, 끄는 걸 추천해요 (공정 비교 + 내 프롬프트 그대로).")
-        if yes_no("자동 증강기를 끌까요?", True):
+        print("   기본은 꺼두고(핑퐁 LLM이 다듬음), 대시보드 OPTIONS의 '정제' 선택으로")
+        print("   내장 인핸서를 켤 수 있게 등록해요. (켜면 핑퐁 LLM 정제는 건너뛰어요)")
+        if yes_no("이렇게(토글 가능) 등록할까요?", True):
+            first = switches[0]
+            spec["enhancer_node"] = [first["bool_node"], "value"]
+            spec["enhancer_on"] = (not first["value"])  # value=끄는 값 → 켜는 값은 반대
             sets = spec.get("set_nodes", [])
-            for s in switches:
+            for s in switches[1:]:
                 sets.append([s["bool_node"], "value", s["value"]])
-            spec["set_nodes"] = sets
-            print("   → 껐어요. 내가 넣는 프롬프트가 그대로 들어가요. ✓")
+            if sets:
+                spec["set_nodes"] = sets
+            print("   → 등록했어요. 기본은 핑퐁 LLM, 대시보드에서 '내장 인핸서'로 전환 가능 ✓")
 
     cfg = json.loads(CONFIG.read_text(encoding="utf-8"))
     cfg.setdefault("custom_workflows", {})[name] = spec

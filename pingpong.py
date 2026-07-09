@@ -144,6 +144,25 @@ def current_llm_model():
         log("config reload failed:", e)
     return MODEL
 
+def score_model():
+    """채점(비전 심판)용 모델. config의 score_model, 없으면 llm_model로 폴백."""
+    try:
+        latest = json.load(open(CFG_PATH, encoding="utf-8"))
+        return latest.get("score_model") or latest.get("llm_model") or current_llm_model()
+    except Exception:
+        return current_llm_model()
+
+def _prompt_override():
+    """config에 프롬프트 생성용 시스템프롬프트/온도 오버라이드가 켜져 있으면 (sys, temp) 반환.
+    내용·on/off는 config.json(로컬, gitignore)에만 존재."""
+    try:
+        c = json.load(open(CFG_PATH, encoding="utf-8"))
+        if c.get("prompt_override_on") and c.get("prompt_sys_override"):
+            return c.get("prompt_sys_override"), c.get("prompt_temp_override")
+    except Exception:
+        pass
+    return None, None
+
 ALIVE_FILE = os.path.join(OUTDIR, "pingpong", ".alive")
 def beat_alive():
     try:
@@ -173,12 +192,18 @@ def run_job(job):
         fanout_image_jobs(txt, int(job.get("count") or requested_image_count(txt)), settings)
     elif m == "image_direct":
         do_image_direct(txt, job.get("request") or txt, settings)
+    elif m == "redcraft2":
+        do_redcraft2(txt, job.get("request") or txt, settings)
     elif m == "compare":
         do_compare(job)
     elif m == "score":
         do_score(job)
     elif m in ("image", "video", "song"):
-        do_text(m, txt or "a creative, beautiful scene", job.get("director_assets") or [], settings)
+        assets = job.get("director_assets") or []
+        has_seg = m == "video" and any(
+            isinstance(a, dict) and a.get("kind") == "text" and str(a.get("prompt") or "").strip()
+            for a in assets)
+        do_text(m, txt if has_seg else (txt or "a creative, beautiful scene"), assets, settings)
     elif m == "klein_board":
         do_klein_board(job.get("reference_assets") or [], txt, settings)
     elif m == "klein":
@@ -211,11 +236,14 @@ def process_queue():
             log("job error:", traceback.format_exc())
 
 IMAGE_SYS = (
-    "You convert the user's request into ONE production-ready image prompt. "
-    "Output only the final prompt sentence, with no analysis, no self-talk, no labels, no word counts, no markdown. "
-    "Preserve the requested subject, medium, mood, and language intent. Do not invent unrelated subjects. "
-    "If the user asks for photo, keep it photographic; if illustration/comic/anime, keep that medium. "
-    "Use concrete visual details: subject, setting, composition, lighting, texture, camera/style. Keep under 85 words."
+    "You convert the user's request into ONE production-ready image prompt, written as natural-language sentences "
+    "(as if briefing an art director) — NOT a list of SD tags. "
+    "Output only the final prompt, no analysis, no labels, no markdown. "
+    "Preserve the requested subject, medium, mood, and language intent; do not invent unrelated subjects. "
+    "Cover, in flowing sentences: subject, scene/situation, composition & camera/lens, materials/surface/detail, "
+    "lighting & color, style/medium, and intended use or mood. Aim for about 60-110 words. "
+    "Do NOT spam empty quality tags ('masterpiece', 'best quality', '8k', 'ultra detailed'). "
+    "If specific text must appear in the image, wrap that exact text in double quotes. Keep one coherent style (no conflicting styles)."
 )
 VIDEO_SYS = (
     "You convert the user's request into ONE production-ready video prompt. "
@@ -245,24 +273,30 @@ MULTI_IMAGE_SYS = (
     "Respect the requested medium instead of forcing photorealism. Keep each under 85 words."
 )
 COMPARE_PROMPT_SYS = (
-    "You expand each given keyword/idea into ONE vivid, richly detailed English image generation prompt. "
+    "You expand each given short keyword/idea into ONE rich, natural-language English image prompt "
+    "(write it like a brief to an art director, in flowing sentences — NOT a list of SD tags). "
     "Return ONLY a JSON array of objects, the SAME length and order as the input list (i-th object expands i-th keyword). "
-    'Each object = {"prompt": <full English image prompt>, "intent": <SHORT Korean note, 3~10 단어>}. '
-    "The 'intent' says what this image is meant to test and what to focus on when comparing two models "
+    'Each object = {"prompt": <the English prompt, ~60-120 words>, "intent": <SHORT Korean note, 3~10 단어>}. '
+    "The prompt must cover: subject, scene/situation, composition & camera/lens, materials/surface/detail, "
+    "lighting & color, style/medium, and intended use or mood — staying faithful to the keyword. "
+    "Do NOT spam empty quality tags ('masterpiece', 'best quality', '8k', 'ultra detailed'). "
+    "If specific text must appear in the image, wrap that exact text in double quotes. Keep one coherent style per image. "
+    "The 'intent' says what this image is meant to test when comparing two models "
     "(예: '털 질감과 수염 디테일', '복잡한 손 해부학', '금속 반사와 조명 일관성', '작은 글자 가독성'). "
-    "Each prompt stays faithful to its keyword while adding concrete detail: setting, composition, lighting, mood, texture, palette, camera/style. "
-    "Respect the implied medium. No commentary, no markdown. Keep each prompt under 85 words."
+    "No commentary, no markdown."
 )
 RANDOM_PROMPT_SYS = (
     "You are an art director building a diverse test set of image prompts to compare image-generation models. "
+    "Write each prompt as natural-language sentences (like an art-director brief, NOT a list of SD tags), about 60-120 words. "
     "Return ONLY a JSON array of objects. "
-    'Each object = {"prompt": <full English image prompt>, "intent": <SHORT Korean note, 3~10 단어>}. '
-    "The 'intent' says what this test image stresses and what to focus on when comparing two models "
+    'Each object = {"prompt": <the English prompt>, "intent": <SHORT Korean note, 3~10 단어>}. '
+    "Each prompt should cover subject, scene, composition & camera/lens, materials/detail, lighting & color, style/medium, and mood/use. "
+    "Make the set diverse across subject, medium (photo, oil painting, anime, 3D render, watercolor), lighting, and composition. "
+    "Do NOT spam empty quality tags ('masterpiece', 'best quality', '8k', 'ultra detailed'). "
+    "If specific text must appear in the image, wrap that exact text in double quotes. Keep one coherent style per image. "
+    "The 'intent' says what this test image stresses when comparing two models "
     "(예: '털 질감과 수염 디테일', '복잡한 군중 묘사', '역광 실루엣', '반투명 유리 표현'). "
-    "Make the prompts diverse across composition, framing, lighting, mood, color palette, and art style/medium "
-    "(photo, oil painting, anime, 3D render, watercolor, pixel art). "
-    "Each prompt concrete and vivid with setting, lighting, color, texture, camera/lens or art-style cue. "
-    "No commentary, no markdown. Keep each prompt under 85 words."
+    "No commentary, no markdown."
 )
 
 TG_BANNER = ("🦗▸ 너무바쁜베짱이 STUDIO ◂🦗\n"
@@ -283,16 +317,17 @@ HELP = (
 )
 
 def help_text():
+    extra_help = "\n전용: /레크2 설명 — Redcraft2 KREA2 1MP + 2K + jkye 얼굴로라 FD 세 장"
     if not CUSTOM:
-        return HELP
+        return HELP + extra_help
     triggers = []
     for spec in CUSTOM.values():
         trigger = spec.get("trigger")
         if trigger:
             triggers.append(trigger)
     if not triggers:
-        return HELP
-    return HELP + "\n커스텀: " + "  ".join(triggers)
+        return HELP + extra_help
+    return HELP + extra_help + "\n커스텀: " + "  ".join(triggers)
 
 def log(*a): print("[pingpong]", *a, flush=True)
 def tag_now(): return time.strftime("%m%d_%H%M%S")
@@ -327,10 +362,15 @@ def start_dashboard():
     except Exception:
         pass
     try:
+        # 콘솔 창 안 뜨게: pythonw(창 없는 파이썬) + CREATE_NO_WINDOW
+        exe = sys.executable
+        pyw = exe[:-len("python.exe")] + "pythonw.exe" if exe.lower().endswith("python.exe") else exe
+        if not os.path.isfile(pyw):
+            pyw = exe
         flags = 0
         if os.name == "nt":
-            flags = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS
-        subprocess.Popen([sys.executable, os.path.join(HERE, "dashboard.py")],
+            flags = subprocess.CREATE_NEW_PROCESS_GROUP | getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        subprocess.Popen([pyw, os.path.join(HERE, "dashboard.py")],
                          cwd=HERE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                          creationflags=flags)
         threading.Timer(1.5, lambda: webbrowser.open(page_url)).start()
@@ -385,8 +425,8 @@ def tg_download(file_id, dest):
 def lms(*args):
     return subprocess.run(["lms", *args], capture_output=True, text=True, encoding="utf-8")
 
-def llm_up():
-    model = current_llm_model()
+def llm_up(model=None):
+    model = model or current_llm_model()
     lms("server", "start")
     log("lms load", model)
     r = lms("load", model, "-y", "--gpu", "max")
@@ -537,14 +577,19 @@ def llm_image_variations(model_id, user, count):
     return prompts[:count]
 
 def _parse_prompt_intent(out):
-    """LLM 출력(JSON 객체 배열)을 [{'prompt','intent'}]로 파싱. 문자열만 와도 흡수."""
+    """LLM 출력(JSON 객체 배열)을 [{'prompt','intent'}]로 파싱. JSON이 깨지면 줄 단위로 건져냄."""
+    data = []
     try:
         data = json.loads(out)
     except Exception:
         m = re.search(r"\[[\s\S]*\]", out)
-        data = json.loads(m.group(0)) if m else []
+        if m:
+            try:
+                data = json.loads(m.group(0))
+            except Exception:
+                data = []
     items = []
-    for d in data:
+    for d in (data if isinstance(data, list) else []):
         if isinstance(d, dict):
             p = clean_llm_prompt(d.get("prompt") or d.get("text") or "")
             it = str(d.get("intent") or d.get("note") or "").strip()
@@ -554,6 +599,14 @@ def _parse_prompt_intent(out):
             continue
         if p:
             items.append({"prompt": p, "intent": it})
+    # JSON으로 못 건졌으면(포맷 안 지키는 모델 대비) 줄 단위로 살림
+    if not items:
+        for ln in re.split(r"\r?\n", out or ""):
+            ln = re.sub(r'^\s*(?:\d+\s*[\.\):：]|[-*•]|prompt\s*[:：])\s*', '', ln, flags=re.I)
+            ln = ln.strip().strip('"').strip("'").strip().lstrip(':：').strip().strip('"').strip()
+            ln = clean_llm_prompt(ln)
+            if len(ln) >= 15 and not ln.lower().startswith(("intent", "json", "here")):
+                items.append({"prompt": ln, "intent": ""})
     return items
 
 def llm_compare_prompts(model_id, keywords, edit=False):
@@ -565,9 +618,10 @@ def llm_compare_prompts(model_id, keywords, edit=False):
                     f"Convert these {n} keywords into exactly {n} EDIT instructions as a JSON array, same order:\n{numbered}",
                     max_tokens=2800, temp=0.85)
     else:
-        out = _chat(model_id, COMPARE_PROMPT_SYS,
+        ov_sys, ov_temp = _prompt_override()
+        out = _chat(model_id, ov_sys or COMPARE_PROMPT_SYS,
                     f"Expand these {n} keywords into exactly {n} objects as a JSON array, same order:\n{numbered}",
-                    max_tokens=2800, temp=0.85)
+                    max_tokens=2800, temp=(ov_temp if ov_temp else 0.85))
     items = _parse_prompt_intent(out)
     if len(items) == n:
         return items
@@ -592,7 +646,7 @@ EDIT_SYS = (
 
 def llm_random_prompts(model_id, count, theme="", edit=False):
     """무작위 프롬프트 count개 생성. edit=True면 '같은 사람 유지 + 한 가지만 바꾸는' 편집 지시로."""
-    count = max(1, min(20, int(count or 10)))
+    count = max(1, min(50, int(count or 10)))
     theme = (theme or "").strip()
     if edit:
         if theme:
@@ -615,6 +669,21 @@ def llm_random_prompts(model_id, count, theme="", edit=False):
         user = (f"Generate exactly {count} wildly diverse image prompts as a JSON array, "
                 f"spanning many different subjects (portrait, landscape, animal, food, object, sci-fi, "
                 f"fantasy, architecture, street, abstract).")
+    ov_sys, ov_temp = _prompt_override()
+    if ov_sys:
+        # 커스텀 오버라이드(예: 무검열 모델)는 JSON 배열을 잘 못 지키는 경우가 많아 → 한 개씩 확실히 생성
+        items = []
+        for _i in range(count):
+            u = ("Write ONE vivid, fully detailed English image prompt"
+                 + (f' on the theme "{theme}"' if theme else "")
+                 + ". Make it DISTINCT — vary setting, camera angle, lighting, composition, subjects, wardrobe, and style. "
+                   "Output ONLY the single prompt sentence: no numbering, no quotes, no JSON, no commentary.")
+            try:
+                p = clean_llm_prompt(_chat(model_id, ov_sys, u, max_tokens=500, temp=(ov_temp if ov_temp else 1.15)))
+            except Exception:
+                p = ""
+            items.append({"prompt": p or "a highly detailed cinematic scene", "intent": ""})
+        return items[:count]
     out = _chat(model_id, RANDOM_PROMPT_SYS, user, max_tokens=2800, temp=1.0)
     items = _parse_prompt_intent(out)[:count]
     while len(items) < count:
@@ -640,15 +709,18 @@ def fanout_image_jobs(body, count, settings=None):
         enqueue_job({"mode": "image_direct", "text": prompt, "request": body, "settings": settings or {}, "source": "fanout", "idx": i, "total": count})
     tg_send("📦▸ 독립 이미지 큐 " + str(len(prompts)) + "개 추가 완료\n" + "\n".join(f"{i}. {p[:80]}" for i, p in enumerate(prompts, 1)))
 
-def write_generation_meta(files, mode, request_text="", generated_prompt="", note="", orig=""):
+def write_generation_meta(files, mode, request_text="", generated_prompt="", note="", orig="", gen_secs=0, extra=None):
     meta = {
         "mode": mode,
         "request": request_text or "",
         "generated": generated_prompt or "",
         "note": note or "",
         "orig": orig or "",
+        "gen_secs": round(float(gen_secs or 0), 1),
         "time": time.strftime("%Y-%m-%d %H:%M:%S"),
     }
+    if isinstance(extra, dict):
+        meta.update(extra)
     for path in files or []:
         try:
             with open(path + ".pingpong.json", "w", encoding="utf-8") as f:
@@ -664,6 +736,49 @@ def do_image_direct(prompt, request_text=None, settings=None):
     files = comfy_run(wf, save)
     write_generation_meta(files, "image", request_text or prompt, prompt)
     tg_send_file("photo", files[0], caption=prompt[:1000])
+    comfy_free()
+
+def do_redcraft2(body, request_text=None, settings=None):
+    body = (body or "").strip()
+    if not body:
+        tg_send("사용법: /레크2 원하는 이미지 설명\n예: /레크2 초록색 무대의상을 입은 한국 여성 가수, 럭셔리 콘서트 포스터")
+        return
+    tg_send("레크2 생성 준비 중... 1MP / 2K / 얼굴로라 FD 세 장으로 보낼게요.")
+    comfy_free()
+    mid = llm_up()
+    try:
+        prompt = llm_prompt(mid, IMAGE_SYS, body)
+    finally:
+        llm_down()
+    tg_send("레크2 생성 시작:\n" + prompt[:700])
+    wf, save_nodes, tag = inject_redcraft2(prompt, settings)
+    t0 = time.time()
+    per = comfy_run(wf, save_nodes)
+    gen_secs = time.time() - t0
+    labels = [("29", "1MP 원본"), ("54", "2K 하이레즈"), ("90", "FD 얼굴로라")]
+    bundle = f"redcraft2_{tag}"
+    sent = 0
+    for node, label in labels:
+        files = per.get(node) or []
+        write_generation_meta(
+            files,
+            "redcraft2",
+            request_text or body,
+            prompt,
+            note=label,
+            gen_secs=gen_secs,
+            extra={
+                "bundle": bundle,
+                "stage": label,
+                "model": "Redcraft22 INT8 Convrot KREA2 Edition / FD clean KREA2 + jkye",
+                "face_lora": r"KREA2\kr2_jkye.safetensors",
+            },
+        )
+        if files:
+            sent += 1
+            tg_send_file("photo", files[0], caption=f"/레크2 {label}\n{prompt[:700]}")
+    if sent == 0:
+        raise RuntimeError("레크2 결과 파일을 찾지 못했어요.")
     comfy_free()
 
 def llm_song(model_id, user):
@@ -785,6 +900,15 @@ def comfy_run(wf, save_node):
         except Exception:
             pass
     outputs = requests.get(f"{COMFY}/history/{pid}", timeout=15).json()[pid]["outputs"]
+    if isinstance(save_node, (list, tuple)):
+        # 다단계 저장(묶음): 노드별 파일 dict 반환
+        per = {}
+        for n in save_node:
+            per[str(n)] = [_resolve_existing_media_path(f) for f in _files_from(outputs.get(str(n), {}))]
+        if not any(per.values()):
+            raise RuntimeError("결과 파일을 찾지 못함")
+        write_comfy_progress("done", 100, "done", pid)
+        return per
     # save_node 우선, 없으면 전체에서 탐색
     files = _files_from(outputs.get(save_node, {}))
     if not files:
@@ -971,6 +1095,29 @@ def _dims_from_ratio_mp(ratio, mp, multiple=16):
         return max(multiple, int(round(v / multiple)) * multiple)
     return snap(w), snap(h)
 
+def _image_dims_for_rel(relpath):
+    try:
+        from PIL import Image
+        p = os.path.join(INPUTDIR, str(relpath or "").replace("/", os.sep))
+        with Image.open(p) as im:
+            return im.size
+    except Exception as e:
+        log("image size probe fail:", relpath, e)
+        return None
+
+def _fit_dims_to_mp(width, height, max_mp=1.15, multiple=32):
+    try:
+        width, height = int(width), int(height)
+        max_px = float(max_mp) * 1_000_000
+    except Exception:
+        return 768, 1024
+    if width <= 0 or height <= 0:
+        return 768, 1024
+    scale = min(1.0, (max_px / float(width * height)) ** 0.5)
+    w = max(multiple, int(round(width * scale / multiple)) * multiple)
+    h = max(multiple, int(round(height * scale / multiple)) * multiple)
+    return w, h
+
 def _set_any_megapixels(wf, megapixels):
     for node in wf.values():
         inputs = node.get("inputs") if isinstance(node, dict) else None
@@ -980,10 +1127,10 @@ def _set_any_megapixels(wf, megapixels):
             if key == "megapixels" or key.endswith(".megapixels"):
                 inputs[key] = megapixels
 
-def inject_custom(spec, prompt, image_refs=None, settings=None, mode_name=None):
+def inject_custom(spec, prompt, image_refs=None, settings=None, mode_name=None, tag=None):
     wf_path = os.path.join(HERE, spec["file"])
     wf = json.load(open(wf_path, encoding="utf-8"))
-    tag = tag_now()
+    tag = tag or tag_now()
     for node, field in spec.get("prompt_nodes", []):
         wf[str(node)]["inputs"][field] = prompt
     for node, field in spec.get("timeline_prompt_nodes", []):
@@ -1015,6 +1162,25 @@ def inject_custom(spec, prompt, image_refs=None, settings=None, mode_name=None):
         wf[str(node)]["inputs"][field] = rseed()
     for node, field, value in spec.get("set_nodes", []):
         wf[str(node)]["inputs"][field] = value
+    if spec.get("enhancer_node"):
+        # 내장 인핸서 토글: 켜면 워크플로 안에서 프롬프트를 다듬음(핑퐁 LLM 정제는 건너뜀)
+        node, field = spec["enhancer_node"]
+        on_val = bool(spec.get("enhancer_on", True))
+        want = _bool_setting(settings, "builtin_enhancer", False)
+        wf[str(node)]["inputs"][field] = on_val if want else (not on_val)
+    # 미세조절 노드: [node, field, 라벨, 기본, 최소, 최대, 스텝] — 설정 tune_1..n (구 denoise_nodes 호환)
+    for i, dn in enumerate(spec.get("tune_nodes") or spec.get("denoise_nodes") or [], 1):
+        node, field = str(dn[0]), str(dn[1])
+        if node not in wf or not isinstance(wf[node].get("inputs"), dict):
+            continue
+        try:
+            cur = float(dn[3]) if len(dn) > 3 else float(wf[node]["inputs"].get(field, 0.5))
+        except (TypeError, ValueError):
+            cur = 0.5
+        lo = float(dn[4]) if len(dn) > 4 else 0.0
+        hi = float(dn[5]) if len(dn) > 5 else 1.0
+        fallback = _float_setting(settings, f"denoise_{i}", cur, lo, hi)
+        wf[node]["inputs"][field] = _float_setting(settings, f"tune_{i}", fallback, lo, hi)
     if settings and spec.get("type") == "video" and spec.get("video_length_node"):
         node, field = spec["video_length_node"]
         fps = int(spec.get("fps", 24) or 24)
@@ -1036,6 +1202,19 @@ def inject_custom(spec, prompt, image_refs=None, settings=None, mode_name=None):
     if spec.get("prefix_node"):
         node, field = spec["prefix_node"]
         wf[str(node)]["inputs"][field] = spec.get("prefix", "pingpong/custom_") + tag
+    # 다단계 저장(묶음): 저장 노드마다 같은 태그 + 단계 접미사로 저장 → 갤러리에서 묶음 인식
+    # stage_limit 설정으로 뒷 단계를 잘라내면 저장 노드를 제거 → 그 브랜치 계산 자체를 스킵
+    stage_nodes = spec.get("stage_nodes", [])
+    if stage_nodes:
+        limit = _int_setting(settings, "stage_limit", len(stage_nodes), 1, len(stage_nodes))
+        for i, st in enumerate(stage_nodes, 1):
+            node = str(st[0] if isinstance(st, (list, tuple)) else st)
+            if node not in wf or not isinstance(wf[node].get("inputs"), dict):
+                continue
+            if i > limit and not _node_referenced(wf, node):
+                wf.pop(node)
+                continue
+            wf[node]["inputs"]["filename_prefix"] = spec.get("prefix", "pingpong/custom_") + tag + f"_s{i}"
     apply_model_overrides(wf, mode_name or "custom", settings)
     return wf, str(spec["output_node"])
 
@@ -1066,6 +1245,54 @@ def inject_zit(prompt, settings=None):
     apply_model_overrides(wf, "image", settings)
     return wf, "2"
 
+def inject_redcraft2(prompt, settings=None):
+    wf = load_wf("image_redcraft2_krea2_hires_fd_jkye_API.json")
+    tag = tag_now()
+    settings = settings or {}
+    if "30:19" in wf:
+        wf["30:19"]["inputs"]["value"] = prompt
+    if "30:24" in wf:
+        wf["30:24"]["inputs"]["value"] = False
+    if "30:28" in wf:
+        wf["30:28"]["inputs"]["switch"] = False
+    ratio = _ratio_setting(settings)
+    ratio_map = {
+        "1:1": "1:1 (Square)",
+        "3:4": "3:4 (Portrait Standard)",
+        "4:3": "4:3 (Standard)",
+        "2:3": "2:3 (Portrait Photo)",
+        "3:2": "3:2 (Photo)",
+        "9:16": "9:16 (Portrait Widescreen)",
+        "16:9": "16:9 (Widescreen)",
+        "21:9": "21:9 (Ultrawide)",
+    }
+    if "49" in wf:
+        wf["49"]["inputs"]["aspect_ratio"] = ratio_map.get(ratio, ratio_map["3:4"])
+        wf["49"]["inputs"]["megapixels"] = _float_setting(settings, "image_megapixels", 1.0, 0.5, 1.5)
+    seed = rseed()
+    for offset, pair in enumerate((("30:3", "seed"), ("52", "seed"), ("81", "seed")), 0):
+        node, field = pair
+        if node in wf and field in wf[node].get("inputs", {}):
+            wf[node]["inputs"][field] = seed + offset
+    for node, suffix in (("29", "1mp"), ("54", "2k"), ("90", "fd")):
+        if node in wf:
+            wf[node]["inputs"]["filename_prefix"] = f"pingpong/rec2_{tag}_{suffix}"
+    if "81" in wf:
+        wf["81"]["inputs"]["denoise"] = _float_setting(settings, "face_denoise", 0.34, 0.05, 0.7)
+        wf["81"]["inputs"]["cycle"] = _int_setting(settings, "face_cycles", 2, 1, 4)
+    if "71" in wf:
+        wf["71"]["inputs"]["lora_name"] = str(settings.get("face_lora") or r"KREA2\kr2_jkye.safetensors")
+        wf["71"]["inputs"]["strength_model"] = _float_setting(settings, "face_lora_strength", 0.85, 0.0, 2.0)
+    apply_model_overrides(wf, "redcraft2", settings)
+    # FD must stay on the clean KREA2 model because the face LoRA was trained on it.
+    if "70" in wf:
+        wf["70"]["inputs"]["unet_name"] = "krea2_turbo_fp8_scaled.safetensors"
+        wf["70"]["inputs"]["weight_dtype"] = "default"
+    if "71" in wf:
+        wf["71"]["inputs"]["lora_name"] = str(settings.get("face_lora") or r"KREA2\kr2_jkye.safetensors")
+        wf["71"]["inputs"]["strength_model"] = _float_setting(settings, "face_lora_strength", 0.85, 0.0, 2.0)
+    return wf, ["29", "54", "90"], tag
+
 # ---------- 모델 비교 (A vs B) ----------
 def compare_candidates():
     """대결 가능한 이미지 워크플로(내장 ZIT + 입력사진 불필요한 이미지 커스텀)."""
@@ -1079,6 +1306,18 @@ def compare_kb():
     rows = [[c["label"]] for c in compare_candidates()]
     rows.append(["❎ 취소"])
     return {"keyboard": rows, "resize_keyboard": True}
+
+def _node_referenced(wf, nid):
+    """워크플로 안에서 nid의 출력을 참조하는 노드가 있는지 (저장 노드 제거 안전성 확인용)."""
+    nid = str(nid)
+    for node in wf.values():
+        inputs = node.get("inputs") if isinstance(node, dict) else None
+        if not isinstance(inputs, dict):
+            continue
+        for v in inputs.values():
+            if isinstance(v, list) and v and str(v[0]) == nid:
+                return True
+    return False
 
 def _compare_label(wf_id):
     if wf_id == "zit":
@@ -1129,6 +1368,17 @@ def _compare_build(wf_id, prompt, seed, settings, prefix, image_refs=None):
     if spec.get("prefix_node"):
         node, field = spec["prefix_node"]
         wf[str(node)]["inputs"][field] = prefix
+    # 다단계 저장 워크플로: 비교 모드에선 최종 단계만 cmp_ 로 저장(중간 저장 제거/격리)
+    for st in spec.get("stage_nodes", []):
+        nid = str(st[0] if isinstance(st, (list, tuple)) else st)
+        if nid == str(out):
+            if isinstance(wf.get(nid, {}).get("inputs"), dict):
+                wf[nid]["inputs"]["filename_prefix"] = prefix
+            continue
+        if not _node_referenced(wf, nid):
+            wf.pop(nid, None)
+        elif isinstance(wf.get(nid, {}).get("inputs"), dict) and "filename_prefix" in wf[nid]["inputs"]:
+            wf[nid]["inputs"]["filename_prefix"] = "cmp_scratch/" + os.path.basename(str(prefix))
     return wf, str(out)
 
 def do_compare(job):
@@ -1141,18 +1391,20 @@ def do_compare(job):
         seed = rseed()
     image_refs = job.get("image_refs") or []
     is_edit = bool(image_refs)
+    quiet = job.get("source") != "telegram"  # 대시보드에서 돌리면 텔레그램은 조용히
     raw = job.get("prompts")
     lines = raw.splitlines() if isinstance(raw, str) else list(raw or [])
-    prompts = [p.strip() for p in lines if p and p.strip()][:20]
+    prompts = [p.strip() for p in lines if p and p.strip()][:50]
     intents = [""] * len(prompts)
-    if not a or not b:
-        tg_send("⚠️ 모델 대결: A/B 워크플로를 둘 다 골라주세요."); return
+    if not a:
+        tg_send("⚠️ 워크플로를 골라주세요."); return
     is_random = bool(job.get("random"))
     if is_random:
-        count = max(1, min(20, int(job.get("count") or 10)))
+        count = max(1, min(50, int(job.get("count") or 10)))
         theme = (job.get("theme") or "").strip()
         kind_msg = "편집 지시" if is_edit else "프롬프트"
-        tg_send(f"🎲▸ {'[' + theme + '] ' if theme else ''}무작위 {kind_msg} {count}개 생성 중...")
+        if not quiet:
+            tg_send(f"🎲▸ {'[' + theme + '] ' if theme else ''}무작위 {kind_msg} {count}개 생성 중...")
         comfy_free()
         mid = llm_up()
         try:
@@ -1165,13 +1417,11 @@ def do_compare(job):
             prompts, intents = [], []
         finally:
             llm_down()
-        if prompts:
-            tg_send("🎲 생성된 무작위 프롬프트:\n" + "\n".join(
-                f"{i}. {p[:80]}" + (f"  · 👁 {intents[i-1]}" if intents[i-1] else "") for i, p in enumerate(prompts, 1)))
     if not prompts:
         tg_send("⚠️ 모델 대결: 프롬프트를 한 줄 이상 적어주세요."); return
     if not is_random and job.get("enhance"):
-        tg_send(f"🧠▸ 키워드 {len(prompts)}개를 화려한 프롬프트로 확장 중...")
+        if not quiet:
+            tg_send(f"🧠▸ 키워드 {len(prompts)}개를 화려한 프롬프트로 확장 중...")
         comfy_free()
         mid = llm_up()
         try:
@@ -1183,23 +1433,32 @@ def do_compare(job):
             log("compare enhance fail:", traceback.format_exc())
         finally:
             llm_down()
-        tg_send("✅ 확장 완료:\n" + "\n".join(
-            f"{i}. {p[:80]}" + (f"  · 👁 {intents[i-1]}" if i - 1 < len(intents) and intents[i-1] else "") for i, p in enumerate(prompts, 1)))
     orig_rel = image_refs[0] if image_refs else ""
-    la, lb = _compare_label(a), _compare_label(b)
-    edit_tag = " (편집 대결)" if image_refs else ""
-    tg_send(f"⚔️ 모델 대결 시작!{edit_tag}\nA ▸ {la}\nB ▸ {lb}\n"
-            f"프롬프트 {len(prompts)}줄 · 같은 시드 {seed} · 한 줄당 1장 (총 {len(prompts) * 2}장)")
+    single = not b  # B가 없으면 단일 모델 생성(대결 아님)
+    la = _compare_label(a)
+    lb = _compare_label(b) if b else ""
+    sides = [("A", a, la)] if single else [("A", a, la), ("B", b, lb)]
+    total = len(prompts) * len(sides)
+    edit_tag = " (편집)" if image_refs else ""
+    if not quiet:
+        if single:
+            tg_send(f"🎯 단일 생성 시작!{edit_tag} {la}\n{len(prompts)}장 · 같은 시드 {seed}")
+        else:
+            tg_send(f"⚔️ 모델 대결 시작!{edit_tag}\nA ▸ {la}\nB ▸ {lb}\n"
+                    f"프롬프트 {len(prompts)}줄 · 같은 시드 {seed} (총 {total}장)")
     try:
-        for side, wf_id, label in (("A", a, la), ("B", b, lb)):
+        for side, wf_id, label in sides:
             comfy_free()  # 라운드 전환 시 1회만 언로드(라운드 안에서는 모델 상주 → 빠름)
-            tg_send(f"▸ [{side}] {label} 생성 중... {len(prompts)}장")
+            if not quiet:
+                tg_send(f"▸ [{side}] {label} 생성 중... {len(prompts)}장")
             for i, prompt in enumerate(prompts, 1):
                 note = intents[i - 1] if i - 1 < len(intents) else ""
                 prefix = f"pingpong/cmp_{tag}_{side}{i:02d}"
                 wf, out = _compare_build(wf_id, prompt, seed, settings, prefix, image_refs)
+                _t0 = time.time()
                 files = comfy_run(wf, out)  # 줄 사이엔 언로드 없이 연속 제출
-                write_generation_meta(files, f"compare:{side}:{label}", f"[{side}] {label} · #{i}", prompt, note=note, orig=orig_rel)
+                gen_secs = round(time.time() - _t0, 1)
+                write_generation_meta(files, f"compare:{side}:{label}", f"[{side}] {label} · #{i}", prompt, note=note, orig=orig_rel, gen_secs=gen_secs)
                 if job.get("send_files") and files:
                     try:
                         cap = f"[{side}] {label} #{i}"
@@ -1208,10 +1467,11 @@ def do_compare(job):
                         tg_send_file("photo", files[0], caption=cap + f"\n{prompt[:240]}")
                     except Exception as e:
                         log("compare send fail:", e)
-            tg_send(f"✅ [{side}] {label} 완료")
-        tg_send(f"🏁 모델 대결 끝! 갤러리에서 cmp_{tag} 로 확인하세요.")
+            if not quiet:
+                tg_send(f"✅ [{side}] {label} 완료")
+        tg_send(f"🏁 {'생성' if single else '대결'} 끝! ({total}장) 갤러리 cmp_{tag}")
     except Exception as e:
-        tg_send(f"⚠️ 모델 대결 오류: {e}")
+        tg_send(f"⚠️ {'생성' if single else '대결'} 오류: {e}")
         log("compare error:", traceback.format_exc())
     finally:
         comfy_free()
@@ -1221,8 +1481,9 @@ SCORE_SYS = (
     "You are a strict but fair judge for an A/B image-model comparison. "
     "You are shown TWO images generated from the SAME prompt (the first is A, the second is B), "
     "plus a '관전포인트(focus)' to evaluate. "
-    "Score each image 0-10 on how well it achieves the focus point AND matches the prompt. "
-    'Return ONLY JSON: {"a": <0-10 number>, "b": <0-10 number>, "winner": "A" | "B" | "tie", "reason": "<짧은 한국어 한 줄 이유>"}. '
+    "Score each image 0-100 on how well it achieves the focus point AND matches the prompt. "
+    "Use the FULL range and differentiate clearly — if one is better, give a clear gap (don't bunch both near the same number). "
+    'Return ONLY JSON: {"a": <0-100 integer>, "b": <0-100 integer>, "winner": "A" | "B" | "tie", "reason": "<짧은 한국어 한 줄 이유>"}. '
     "No markdown, no extra text."
 )
 
@@ -1253,9 +1514,10 @@ SCORE_SYS_FACE = (
     "You are a strict judge for an A/B IMAGE-EDIT comparison focused on IDENTITY/FACE CONSISTENCY. "
     "The FIRST image is the ORIGINAL subject. The SECOND is edit A, the THIRD is edit B "
     "(both edited from the original with the same instruction). "
-    "Score each edit 0-10 on how well it PRESERVES the original person's identity and facial features "
+    "Score each edit 0-100 on how well it PRESERVES the original person's identity and facial features "
     "(이목구비, 인상, 머리/피부 등) while applying the requested edit. "
-    'Return ONLY JSON: {"a": <0-10>, "b": <0-10>, "winner": "A" | "B" | "tie", "reason": "<짧은 한국어 한 줄>"}. '
+    "Use the FULL range and differentiate clearly — give a clear gap when one preserves identity better. "
+    'Return ONLY JSON: {"a": <0-100 integer>, "b": <0-100 integer>, "winner": "A" | "B" | "tie", "reason": "<짧은 한국어 한 줄>"}. '
     "No markdown."
 )
 
@@ -1295,7 +1557,7 @@ def llm_score_pair(model_id, a_path, b_path, prompt, focus, orig_path=None):
         d = json.loads(mt.group(0)) if mt else {}
     def num(x):
         try:
-            return max(0, min(10, round(float(x), 1)))
+            return max(0, min(100, int(round(float(x)))))
         except Exception:
             return 0
     a, b = num(d.get("a")), num(d.get("b"))
@@ -1322,9 +1584,10 @@ def do_score(job):
     lb = job.get("b_label") or "B"
     if not tag or not items:
         tg_send("⚠️ 채점할 대결을 찾지 못했어요."); return
-    tg_send(f"🏆 채점 시작! {len(items)}컷을 심판 모델이 평가해요... (gemma)")
+    smodel = score_model()
+    tg_send(f"🏆 채점 중... ({len(items)}컷)")
     comfy_free()
-    mid = llm_up()
+    mid = llm_up(smodel)
     results = {}
     a_wins = b_wins = ties = 0
     a_sum = b_sum = 0.0
@@ -1350,7 +1613,6 @@ def do_score(job):
             else:
                 ties += 1
         if results:
-            tg_send("🎙️ 총평 작성 중...")
             try:
                 verdict = llm_battle_verdict(mid, la, lb, results, a_wins, b_wins, ties)
             except Exception as e:
@@ -1369,11 +1631,7 @@ def do_score(job):
         tg_send("⚠️ 채점 실패 — 점수를 못 냈어요. (비전모델 확인 필요)")
         return
     champ = f"🅰 {la}" if overall == "A" else f"🅱 {lb}" if overall == "B" else "무승부"
-    msg = (f"🏆 채점 완료!\n🅰 {la} {a_wins}승 (평균 {payload['a_avg']})\n"
-           f"🅱 {lb} {b_wins}승 (평균 {payload['b_avg']})\n무 {ties}\n최종 승자: {champ}")
-    if verdict:
-        msg += f"\n\n🎙️ 총평\n{verdict}"
-    tg_send(msg)
+    tg_send(f"🏆 채점 완료! 🅰 {a_wins} : {b_wins} 🅱 (무 {ties}) · 최종 {champ}\n총평·점수는 대시보드에서")
 
 def _apply_ltx_director_assets(td, assets, duration_frames):
     assets = assets or []
@@ -1495,9 +1753,12 @@ def inject_ltx(prompt, director_assets=None, settings=None):
     wf["131"]["inputs"]["local_prompts"] = local_prompts
     wf["131"]["inputs"]["segment_lengths"] = segment_lengths
     w = _int_setting(settings, "video_width", CFG.get("video_width", 0), 0, 1920)
-    if w:
-        wf["131"]["inputs"]["custom_width"] = w
-        wf["131"]["inputs"]["custom_height"] = 0
+    if not w:
+        # 미지정(0)이면 디렉터 노드가 가이드 이미지 해상도를 그대로 따라감 —
+        # 업스케일 이미지(5K+)를 키프레임으로 쓰면 5K 영상을 뽑으려다 30분+/OOM. 기본 FHD 강제.
+        w = 1920
+    wf["131"]["inputs"]["custom_width"] = w
+    wf["131"]["inputs"]["custom_height"] = 0
     if MODELS.get("ltx_gguf"):
         wf["137"]["inputs"]["unet_name"] = MODELS["ltx_gguf"]
     apply_model_overrides(wf, "video", settings)
@@ -1539,28 +1800,51 @@ def inject_klein(ref_relpath, goal_text):
 
 def inject_klein_faceswap(char_rel, face_rel, goal_text):
     """character(몸/포즈/의상/장면) + face(얼굴 정체성)로 face_swap 합성."""
-    wf = load_wf("toobusy_flux2klein_vram.json"); tag = tag_now()
-    board = {"version": 1, "global_note": "", "items": [
-        {"id": "charA", "role": "character_a", "name": "Character A",
-         "filename": char_rel, "note": "body, pose, outfit, scene"},
-        {"id": "faceA", "role": "face_a", "name": "Face A",
-         "filename": face_rel, "note": "face identity only"},
-        {"id": "goal1", "type": "text", "text_category": "goal",
-         "text": goal_text or "seamless natural face swap, keep body pose outfit and scene, photorealistic"}]}
-    sel = {"version": 1, "blocks": [
-        {"kind": "reference", "role": "character_a", "category": "character", "label": "Character A"},
-        {"kind": "reference", "role": "face_a", "category": "face", "label": "Face A"},
-        {"kind": "flag", "flag": "face_swap"},
-        {"kind": "modifier", "category": "style", "text": "photoreal", "label": "Style"}]}
-    wf["7"]["inputs"]["board_json"] = json.dumps(board, ensure_ascii=False)
-    wf["2"]["inputs"]["director_selection_json"] = json.dumps(sel, ensure_ascii=False)
+    wf = load_wf("toobusy_flux2klein_faceswap_direct.json"); tag = tag_now()
+    prompt = (
+        "Face swap / identity transfer edit. Use reference image 1 as the face identity source: "
+        "preserve the same facial features, skin tone, age impression, jawline, eyes, nose, mouth, "
+        "and hairstyle as much as possible. Use reference image 2 as the target composition, camera angle, "
+        "lighting, outfit, body pose, and background. Generate one coherent realistic portrait where the "
+        "person in the target scene has the face identity from reference image 1. Keep the target camera "
+        "framing and scene structure. Natural skin, no uncanny face, no duplicated faces, no text, no watermark."
+    )
+    if goal_text:
+        prompt += " User request: " + goal_text.strip()
+    wf["1"]["inputs"]["image"] = face_rel
+    wf["2"]["inputs"]["image"] = char_rel
+    wf["4"]["inputs"]["positive"] = prompt
+    target_dims = _image_dims_for_rel(char_rel)
+    if target_dims:
+        w, h = _fit_dims_to_mp(*target_dims)
+        wf["4"]["inputs"]["size_mode"] = "manual"
+        wf["4"]["inputs"]["width"] = w
+        wf["4"]["inputs"]["height"] = h
     if MODELS.get("klein"):
-        wf["3"]["inputs"]["model_name"] = MODELS["klein"]
+        wf["4"]["inputs"]["model_name"] = MODELS["klein"]
     apply_model_overrides(wf, "faceswap", {})
-    wf["2"]["inputs"]["seed"] = rseed()
-    wf["3"]["inputs"]["seed"] = rseed()
-    wf["4"]["inputs"]["filename_prefix"] = f"pingpong/swap_{tag}"
-    return wf, "4"
+    wf["4"]["inputs"]["seed"] = rseed()
+    wf["5"]["inputs"]["filename_prefix"] = f"pingpong/swap_{tag}"
+    return wf, "5"
+
+def _faceswap_refs_from_assets(assets):
+    target_roles = {"character_a", "main_character", "character", "body", "pose_a", "pose"}
+    face_roles = {"face_a", "face", "face_b"}
+    target = face = None
+    for a in assets or []:
+        if not a.get("rel") or a.get("enabled", True) is False:
+            continue
+        role = str(a.get("role") or "").lower()
+        if face is None and role in face_roles:
+            face = a["rel"]
+        elif target is None and (role in target_roles or not role):
+            target = a["rel"]
+    refs = [a.get("rel") for a in assets or [] if a.get("rel") and a.get("enabled", True) is not False]
+    if target is None and refs:
+        target = refs[0]
+    if face is None and len(refs) > 1:
+        face = refs[1]
+    return target, face
 
 def inject_klein_board(assets, goal_text, settings=None, flags=None):
     wf = load_wf("toobusy_flux2klein_vram.json"); tag = tag_now()
@@ -1642,6 +1926,7 @@ def detect_mode(text):
     table = [("/video", "video"), ("/영상", "video"),
              ("/song", "song"), ("/음악", "song"), ("/노래", "song"),
              ("/image", "image"), ("/그림", "image"),
+             ("/레크2", "redcraft2"),
              ("/klein", "klein"), ("/합성", "klein"), ("/인물", "klein")]
     for kw, mode in table:
         if low.startswith(kw):
@@ -1665,7 +1950,12 @@ def do_custom_text(mode, body, image_refs=None, settings=None):
             return
         comfy_free()
         llm_mode = spec.get("llm", "none")
-        if llm_mode == "none":
+        use_builtin = bool(spec.get("enhancer_node")) and _bool_setting(settings, "builtin_enhancer", False)
+        if use_builtin:
+            # 내장 인핸서가 다듬으므로 원문 그대로 전달 (이중 증강 방지)
+            prompt = body
+            tg_send("🎛▸ 내장 인핸서 모드: 원문을 그대로 넣고 워크플로 안에서 다듬어요.")
+        elif llm_mode == "none":
             prompt = body
         else:
             tg_send("🧠▸ 두뇌 가동...")
@@ -1679,20 +1969,62 @@ def do_custom_text(mode, body, image_refs=None, settings=None):
             finally:
                 llm_down()
         tg_send("▸ 생성 중 ░▒▓ : " + prompt[:120])
-        wf, out = inject_custom(spec, prompt, image_refs, settings, "custom:" + name)
-        files = comfy_run(wf, out)
-        write_generation_meta(files, "custom:" + name, body, prompt)
-        tg_send_file(kind, files[0], caption=prompt[:1000])
+        stages = spec.get("stage_nodes") or []
+        if stages:
+            # 다단계 저장: 한 큐에 여러 장 → 같은 bundle 메타로 묶어서 갤러리에서 비교 가능
+            stages = stages[:_int_setting(settings, "stage_limit", len(stages), 1, len(stages))]
+            tag = tag_now()
+            wf, out = inject_custom(spec, prompt, image_refs, settings, "custom:" + name, tag=tag)
+            t0 = time.time()
+            per = comfy_run(wf, [st[0] if isinstance(st, (list, tuple)) else st for st in stages])
+            gen_secs = time.time() - t0
+            bundle = f"{name}_{tag}"
+            last = None
+            for i, st in enumerate(stages, 1):
+                nid = str(st[0] if isinstance(st, (list, tuple)) else st)
+                label = str(st[1]) if isinstance(st, (list, tuple)) and len(st) > 1 else f"단계{i}"
+                fs = per.get(nid) or []
+                extra = {"stage": label, "stage_idx": i}
+                if len(stages) > 1:
+                    extra["bundle"] = bundle
+                write_generation_meta(fs, "custom:" + name, body, prompt, gen_secs=gen_secs,
+                                      note="내장 인핸서" if use_builtin else "", extra=extra)
+                if fs:
+                    last = fs[0]
+            cap = (f"[{len(stages)}단계 묶음 · 최종] " if len(stages) > 1 else "") + prompt
+            tg_send_file(kind, last, caption=cap[:1000])
+        else:
+            wf, out = inject_custom(spec, prompt, image_refs, settings, "custom:" + name)
+            files = comfy_run(wf, out)
+            write_generation_meta(files, "custom:" + name, body, prompt, note="내장 인핸서" if use_builtin else "")
+            tg_send_file(kind, files[0], caption=prompt[:1000])
         comfy_free()
     except (KeyError, IndexError, TypeError, json.JSONDecodeError, OSError) as e:
         tg_send(f"⚠️ 커스텀 워크플로 설정 오류: {e}")
         log("custom workflow config error:", traceback.format_exc())
 
 def do_text(mode, body, director_assets=None, settings=None):
+    seg_prompts = [str(a.get("prompt") or "").strip() for a in (director_assets or [])
+                   if isinstance(a, dict) and a.get("kind") == "text"]
+    seg_prompts = [s for s in seg_prompts if s]
+    if mode == "video" and not body and seg_prompts:
+        # 디렉터 타임라인 전용 생성: LLM 정제 없이 세그먼트 프롬프트를 그대로 사용
+        prompt = seg_prompts[0]
+        tg_send(f"🎬▸ 디렉터 타임라인 모드 · 세그먼트 {len(seg_prompts)}개 ░▒▓ (수 분 소요)")
+        comfy_free()
+        wf, save = inject_ltx(prompt, director_assets, settings)
+        files = comfy_run(wf, save)
+        write_generation_meta(files, "video", " | ".join(seg_prompts), prompt)
+        tg_send_file("video", files[0], caption=" | ".join(seg_prompts)[:1000])
+        comfy_free()
+        return
     if mode == "help" or not body:
         tg_send(help_text()); return
     if mode.startswith("custom:"):
         do_custom_text(mode, body)
+        return
+    if mode == "redcraft2":
+        do_redcraft2(body, body, settings)
         return
     if mode == "klein":
         tg_send("🎭 Klein 인물합성은 사진을 첨부해서 보내주세요 (캡션에 원하는 장면).")
@@ -1770,6 +2102,13 @@ def do_faceswap(char_rel, face_rel, goal):
 def do_klein_board(reference_assets, goal, settings=None, flags=None):
     if not reference_assets:
         tg_send("⚠️ Klein 레퍼런스 보드에는 이미지가 최소 1장 필요해요.")
+        return
+    if "face_swap" in (flags or []):
+        char_rel, face_rel = _faceswap_refs_from_assets(reference_assets)
+        if not char_rel or not face_rel:
+            tg_send("⚠️ 페이스스왑에는 몸/장면 이미지와 얼굴 이미지가 각각 1장씩 필요해요.")
+            return
+        do_faceswap(char_rel, face_rel, goal)
         return
     tg_send(f"🎭▸ 레퍼런스 보드 생성 중 ░▒▓█▓▒░\n{goal or '(보드 기반 자동 생성)'}")
     comfy_free()
@@ -1904,7 +2243,7 @@ def handle_message(msg):
         tlabel = f"[{theme}] " if theme else ""
         send_menu(f"🎲 {tlabel}무작위 대결 큐에 넣었어요!\n🅰 {la} vs 🅱 {lb}\nLLM이 알아서 10장 × 2 = 20장 · 비율 3:4 · 같은 시드\n프롬프트부터 뽑고 생성되는 대로 사진으로 보내드릴게요."); return
     if f == "compare_prompts":
-        P = [ln.strip() for ln in text.splitlines() if ln.strip()][:20]
+        P = [ln.strip() for ln in text.splitlines() if ln.strip()][:50]
         if not P:
             tg_send("✏️ 한 줄 이상 보내주세요. (취소: /취소)"); return
         a, b = STATE["cmp_a"], STATE["cmp_b"]; enhance = STATE["cmp_enhance"]
@@ -2040,9 +2379,10 @@ def main():
         print("   " + ln, flush=True)
     print("  +---------------------------------------------------+", flush=True)
     print("  >> INSERT COIN... 폰에서 봇에게 메시지를 보내세요 <<\n", flush=True)
-    summary = (TG_BANNER + "\n✦ 가동 완료! ✦\n\n[ 점검 결과 ]\n" +
-               "\n".join(lines) + "\n\n" + help_text())
-    send_menu(summary)
+    # 텔레그램엔 짧게(상세 점검은 콘솔에만). 실패한 항목만 요약.
+    fails = [ln for ln in lines if ln.lstrip().startswith(("❌", "⚠️"))]
+    health = "✅ 점검 통과" if (comfy_ok and not fails) else ("⚠️ 점검 주의:\n" + "\n".join(fails[:6]))
+    send_menu(TG_BANNER + "\n✦ 가동 완료! ✦\n" + health)
     init = tg_updates(0)
     offset = (init[-1]["update_id"] + 1) if init else 0
     beat = 0

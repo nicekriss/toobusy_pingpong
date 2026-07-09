@@ -1,4 +1,4 @@
-{
+﻿{
   "2": {
     "inputs": {
       "analysis_mode": "balanced",
@@ -21,8 +21,8 @@
   "3": {
     "inputs": {
       "model_name": "FLUX2\\flux-2-klein-9b-kv-fp8.safetensors",
-      "clip_name": "qwenLayerwiseForKlein9b_fp8FP32.safetensors",
-      "vae_name": "flux2DevFP8GGUF_flux2DevVAE.safetensors",
+      "clip_name": "qwen_3_8b_fp4mixed.safetensors",
+      "vae_name": "flux2-vae.safetensors",
       "positive": "",
       "size_mode": "from reference",
       "ratio_preset": "1:1",
