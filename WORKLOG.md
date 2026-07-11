@@ -71,3 +71,49 @@
 - 이미지/영상/음악 날짜별 필터와 검색
 - 오래된 생성물 아카이브/정리 도구
 - Comfy 실행 로그를 파일 기반으로 더 자세히 표시
+## 2026-07-11 KREA2 Canny Telegram sketch workflow
+
+- Added `.크케`: attach one Telegram image and put the short command plus a description in its caption.
+- Base pass is locked to KREA2 + NK2E Canny, 8 steps.
+- Final pass is a 2K HiRes Fix, 4 steps, denoise 0.35, connected directly to the clean KREA2 UNET with no NK2E/ControlNet reference.
+- Added direct routing for one-image custom workflows so a captioned Telegram image runs immediately instead of opening the generic photo-action menu.
+- Verified Python/JSON syntax, graph references, and all 19 node/input schemas against the live ComfyUI API.
+## 2026-07-11 Dot aliases for Telegram commands
+
+- Every built-in slash command now also accepts a leading dot for easier mobile entry (`.영상`, `.음악`, `.그림`, `.레크2`, `.취소`, `.메뉴`, `.페이스스왑`, etc.).
+- Custom workflow triggers are normalized the same way, whether configured with `/` or `.`.
+- Existing slash commands remain backward compatible.
+## 2026-07-11 Manual gallery compare workbench
+
+- Added a persistent bottom `직접비교` workbench to the Pingpong gallery.
+- Gallery image cards can be dragged into independent LEFT/RIGHT sets; each side supports multiple images, removal, and current-image selection.
+- Added per-card `L` and `R` buttons as a reliable alternative to HTML5 drag-and-drop.
+- `비교 열기` reuses the full-screen wipe viewer with zoom, pan, reset, number-key selection, and independent left/right rails.
+- Manual sets persist in browser localStorage and do not modify bundles or sidecars.
+## 2026-07-11 External images in manual compare
+
+- Manual compare LEFT/RIGHT zones now accept image files dragged from Explorer.
+- Added clipboard screenshot paste with a visible LEFT/RIGHT paste target toggle.
+- Added a multi-file picker fallback.
+- External images are downscaled to a maximum 1800px edge and encoded as WebP quality 0.9 before entering the comparison session.
+- Verified an image clipboard paste creates a screenshot card in the selected RIGHT set.
+## 2026-07-11 Native-pixel 4K comparison
+
+- External files and clipboard screenshots now use original Blob URLs with no resizing, recompression, or format conversion.
+- Added a `1:1` button and `N` shortcut to calculate native-pixel zoom from image natural dimensions.
+- Raised wipe viewer zoom limit from 12x to 32x; double-click still resets to fit.
+- External Blob images intentionally persist for the current browser session only; gallery-backed selections remain localStorage-persistent.
+- Verified two original 1920×1080 PNGs remained 1920×1080 and native mode moved fit zoom from 100% to 161%.
+## 2026-07-11 Right comparison resolution label fix
+
+- Fixed a CSS class collision between the right comparison label (`lb`) and the global lightbox `.lb { display:none }` rule.
+- Renamed the right label modifier to `rb` in CSS and HTML.
+- Verified both LEFT and RIGHT labels are visible and independently show `1920×1080` in the live manual comparison viewer.
+## 2026-07-11 Gallery marquee multi-delete
+
+- Added a `다중선택` mode to the image gallery.
+- Mouse-dragging a marquee across cards selects every intersecting card; Ctrl/Shift preserves prior selections for additive passes.
+- Selected cards show an amber outline/check badge and the toolbar reports both card count and actual image-file count.
+- Bundle cards carry every displayed bundle member as their delete payload.
+- `선택 삭제` asks for confirmation and moves all unique selected image files through the existing `.trash` delete API.
+- Verified a marquee over three cards yields `3개 카드 · 3개 파일` and enables the delete button; no user files were deleted during testing.

@@ -1,0 +1,21 @@
+{
+  "1": {"inputs": {"image": "example.png"}, "class_type": "LoadImage", "_meta": {"title": "텔레그램 스케치"}},
+  "2": {"inputs": {"image": ["1", 0], "low_threshold": 80, "high_threshold": 180, "resolution": 1024}, "class_type": "CannyEdgePreprocessor", "_meta": {"title": "Canny 엣지 추출"}},
+  "3": {"inputs": {"unet_name": "krea2_turbo_fp8_scaled.safetensors", "weight_dtype": "default"}, "class_type": "UNETLoader", "_meta": {"title": "클린 KREA2 모델 (2K 마무리에도 직접 연결)"}},
+  "4": {"inputs": {"model": ["3", 0], "lora_name": "KREA2_ControlNet\\NK2E-canny-v0.1.safetensors", "strength_model": 0.7}, "class_type": "LoraLoaderModelOnly", "_meta": {"title": "NK2E Canny (1차 전용)"}},
+  "5": {"inputs": {"model": ["4", 0]}, "class_type": "NK2EInContextModelNode", "_meta": {"title": "NK2E 모델 (1차 전용)"}},
+  "6": {"inputs": {"clip_name": "qwen3vl_4b_fp8_scaled.safetensors", "type": "krea2", "device": "default"}, "class_type": "CLIPLoader"},
+  "7": {"inputs": {"vae_name": "qwen_image_vae.safetensors"}, "class_type": "VAELoader"},
+  "8": {"inputs": {"image": ["2", 0], "upscale_method": "lanczos", "megapixels": 1.0, "resolution_steps": 1}, "class_type": "ImageScaleToTotalPixels", "_meta": {"title": "1MP 기준 입력"}},
+  "9": {"inputs": {"pixels": ["8", 0], "vae": ["7", 0]}, "class_type": "VAEEncode", "_meta": {"title": "Canny 시작 latent/reference"}},
+  "10": {"inputs": {"text": "Turn the supplied sketch into a polished high quality image while preserving its composition and silhouette.", "clip": ["6", 0]}, "class_type": "CLIPTextEncode", "_meta": {"title": "텔레그램 설명"}},
+  "11": {"inputs": {"conditioning": ["10", 0]}, "class_type": "ConditioningZeroOut"},
+  "12": {"inputs": {"conditioning": ["10", 0], "reference": ["9", 0]}, "class_type": "NK2ESetReferenceNode", "_meta": {"title": "Canny reference (1차 전용)"}},
+  "13": {"inputs": {"seed": 1, "steps": 8, "cfg": 1.0, "sampler_name": "euler", "scheduler": "simple", "denoise": 1.0, "model": ["5", 0], "positive": ["12", 0], "negative": ["11", 0], "latent_image": ["9", 0]}, "class_type": "KSampler", "_meta": {"title": "KREA2 Canny 1차 — STEPS 8 고정"}},
+  "14": {"inputs": {"samples": ["13", 0], "vae": ["7", 0]}, "class_type": "VAEDecode"},
+  "15": {"inputs": {"model_name": "4xRealWebPhoto_v4_dat2.pth"}, "class_type": "UpscaleModelLoader"},
+  "16": {"inputs": {"image": ["14", 0], "vae": ["7", 0], "upscale_model_name": "4xRealWebPhoto_v4_dat2.pth", "downscale_method": "lanczos", "scale_by": 0.5, "upscale_model": ["15", 0]}, "class_type": "ToobusyHiresUpscale", "_meta": {"title": "2K HiRes latent"}},
+  "17": {"inputs": {"seed": 2, "steps": 4, "cfg": 1.0, "sampler_name": "euler", "scheduler": "simple", "denoise": 0.35, "model": ["3", 0], "positive": ["10", 0], "negative": ["11", 0], "latent_image": ["16", 1]}, "class_type": "KSampler", "_meta": {"title": "2K CLEAN 마무리 — 4 steps / ControlNet 없음 / denoise 0.35"}},
+  "18": {"inputs": {"samples": ["17", 0], "vae": ["7", 0]}, "class_type": "VAEDecode"},
+  "19": {"inputs": {"filename_prefix": "pingpong/krea2_canny_clean2k_", "images": ["18", 0]}, "class_type": "SaveImage", "_meta": {"title": "최종 2K 저장"}}
+}

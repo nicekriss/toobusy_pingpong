@@ -23,6 +23,23 @@
   "model_overrides": {},
   "model_downloads": {},
   "custom_workflows": {
+    "\uD06C\uB808\uC5442_\uCE90\uB2C8_\uD074\uB9B02K": {
+      "file": "workflows/image_krea2_canny_sketch_clean_2k_API.json",
+      "trigger": ".\uD06C\uCF00",
+      "type": "image",
+      "llm": "image",
+      "prompt_nodes": [["10", "text"]],
+      "image_nodes": [["1", "image"]],
+      "seed_nodes": [["13", "seed"], ["17", "seed"]],
+      "set_nodes": [
+        ["13", "steps", 8],
+        ["17", "steps", 4],
+        ["17", "denoise", 0.35]
+      ],
+      "prefix_node": ["19", "filename_prefix"],
+      "prefix": "pingpong/krea2_canny_clean2k_",
+      "output_node": "19"
+    },
     "스티커": {
       "file": "workflows/my_sticker.json",
       "trigger": "/스티커",

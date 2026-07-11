@@ -123,13 +123,19 @@ def reload_custom_workflows():
 def _custom_key(s):
     return unicodedata.normalize("NFC", str(s or "").strip()).lower()
 
+def _slash_command(s):
+    """휴대폰 입력용 `.명령`을 기존 `/명령`과 같은 형태로 정규화."""
+    s = str(s or "")
+    return "/" + s[1:] if s.startswith(".") else s
+
 def resolve_custom_workflow(name):
     wanted = _custom_key(name)
     for workflows in (CUSTOM, reload_custom_workflows()):
         if not workflows:
             continue
         for key, spec in workflows.items():
-            aliases = [key, spec.get("trigger", ""), spec.get("trigger", "").lstrip("/")]
+            trigger = spec.get("trigger", "")
+            aliases = [key, trigger, trigger.lstrip("/."), _slash_command(trigger)]
             if wanted in {_custom_key(a) for a in aliases}:
                 return key, spec
     available = ", ".join((s.get("trigger") or k) for k, s in CUSTOM.items()) or "none"
@@ -312,12 +318,12 @@ HELP = (
     "▰▰▰▰▰▰▰▰▰▰▰▰▰▰\n"
     "✧ 버튼 누르면 뭐 필요한지 물어봐요\n"
     "✧ 그냥 글만 보내도 → 이미지 ✏️\n"
-    "✧ 언제든 취소: /취소\n"
+    "✧ 언제든 취소: .취소  (/취소도 가능)\n"
     "🦗 너무바쁜베짱이 · 코다 & 크룩스"
 )
 
 def help_text():
-    extra_help = "\n전용: /레크2 설명 — Redcraft2 KREA2 1MP + 2K + jkye 얼굴로라 FD 세 장"
+    extra_help = "\n전용: .레크2 설명 — Redcraft2 KREA2 1MP + 2K + jkye 얼굴로라 FD 세 장"
     if not CUSTOM:
         return HELP + extra_help
     triggers = []
@@ -1920,7 +1926,7 @@ def inject_klein_board(assets, goal_text, settings=None, flags=None):
 
 # ---------- 모드 라우팅 ----------
 def detect_mode(text):
-    low = text.lower()
+    low = _slash_command(text.lower())
     if low in ("/help", "/?", "help", "도움말"):
         return "help", ""
     table = [("/video", "video"), ("/영상", "video"),
@@ -1933,7 +1939,8 @@ def detect_mode(text):
             return mode, text[len(kw):].strip()
     for name, spec in reload_custom_workflows().items():
         trigger = (spec.get("trigger") or "").strip()
-        if trigger and low.startswith(trigger.lower()):
+        normalized_trigger = _slash_command(trigger.lower())
+        if trigger and low.startswith(normalized_trigger):
             return "custom:" + name, text[len(trigger):].strip()
     return "image", text
 
@@ -2161,15 +2168,16 @@ def start_mode(mode):
 def handle_message(msg):
     text = (msg.get("caption") or msg.get("text") or "").strip()
     low = text.lower()
+    command_low = _slash_command(low)
     photo = msg.get("photo")
     f = STATE["flow"]
 
     # 취소
-    if low in ("/취소", "/cancel", "취소") or text == "❎ 취소":
+    if command_low in ("/취소", "/cancel", "취소") or text == "❎ 취소":
         reset_state(); send_menu("❎ 취소했어요."); return
 
     # 메뉴/도움말
-    if low in ("/start", "/메뉴", "/menu", "메뉴"):
+    if command_low in ("/start", "/메뉴", "/menu", "메뉴"):
         send_menu("🏓 핑퐁 봇\n" + help_text()); return
 
     # 사진을 받고 '뭘 할지' 고르는 단계 (메뉴매칭보다 먼저 처리)
@@ -2288,12 +2296,30 @@ def handle_message(msg):
         do_faceswap(char_rel, face_rel, goal); send_menu("✦･ﾟ: 완성! :ﾟ･✦  ヽ(•‿•)ノ  다음은?"); return
 
     # 프리픽스 직접 입력 (하위 호환: /페이스스왑 등)
-    if any(low.startswith(k) for k in SWAP_KW):
+    if any(command_low.startswith(k) for k in SWAP_KW):
         for k in SWAP_KW:
-            if low.startswith(k):
+            if command_low.startswith(k):
                 STATE["goal"] = text[len(k):].strip(); break
         STATE["flow"] = "swap_char"
         tg_send("🔀 페이스 스왑 시작!\n① '몸/포즈/의상' 담당 사진을 보내주세요 (1/2)"); return
+
+    # 사진 캡션이 이미지 입력형 커스텀 명령이면 선택 메뉴를 건너뛰고 바로 실행.
+    # 예: 스케치 사진 + ".크케 네온 간판 스타일"
+    if photo and text:
+        photo_mode, photo_body = detect_mode(text)
+        if photo_mode.startswith("custom:"):
+            try:
+                custom_name, custom_spec = resolve_custom_workflow(photo_mode.split(":", 1)[1])
+            except (KeyError, TypeError):
+                custom_name, custom_spec = None, None
+            if custom_spec and custom_spec.get("image_nodes"):
+                required = len(custom_spec.get("image_nodes", []))
+                if required == 1:
+                    rel = download_ref(photo[-1]["file_id"])
+                    photo_body = photo_body or "스케치의 구도와 실루엣을 유지해서 완성도 높은 이미지로 만들어줘"
+                    do_custom_text("custom:" + custom_name, photo_body, [rel])
+                    send_menu("✦･ﾟ: 크레아2 캐니 완성! :ﾟ･✦  다음은?")
+                    return
 
     # 기본: 사진은 '뭘 할지' 물어보고, 텍스트는 이미지 생성
     if photo:
