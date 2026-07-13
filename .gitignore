@@ -20,3 +20,9 @@ compare_scores/
 
 # 사용자 등록 커스텀 워크플로(모델 자동다운로드 미지원) — 기존 추적분은 유지됨
 workflows/*.json
+
+# Codex/local runtime artifacts
+logs/
+*.log
+config.*backup*.json
+config.codex_*.json
