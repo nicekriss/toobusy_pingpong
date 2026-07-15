@@ -117,3 +117,12 @@
 - Bundle cards carry every displayed bundle member as their delete payload.
 - `선택 삭제` asks for confirmation and moves all unique selected image files through the existing `.trash` delete API.
 - Verified a marquee over three cards yields `3개 카드 · 3개 파일` and enables the delete button; no user files were deleted during testing.
+
+## 2026-07-16
+
+### 오늘 한 일
+
+- 대시보드 비디오 플레이어 리스트 레이아웃 수정
+  - 영상이 많아지면 VIDEO LIST가 무한정 길어져 옆 플레이어(.crt)까지 같이 늘어나며 레이아웃이 무너지던 문제
+  - `#vrows`를 `.vlist` 안에서 absolute + overflow-y:auto로 바꿔 리스트가 항상 플레이어 높이에 맞춰 내부 스크롤되게 함
+  - 영상 생성 모드(.videoMode)의 기존 그리드(132px) 레이아웃은 position:static으로 유지
