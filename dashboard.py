@@ -1327,6 +1327,13 @@ BUILTIN_MODE_CHECKS = {
         "field": "unet_name",
         "model_key": "ace",
     },
+    "song_reference": {
+        "label": "ACE 참고곡 음악",
+        "nodes": ["TextEncodeAceStepAudio1.5", "LoadAudio", "VAEEncodeAudio", "ReferenceTimbreAudio"],
+        "loader": "UNETLoader",
+        "field": "unet_name",
+        "model_key": "ace",
+    },
     "klein": {
         "label": "Flux2 Klein",
         "nodes": ["ToobusyFlux2Klein", "ToobusyReferenceBoard"],
@@ -1476,6 +1483,7 @@ BUILTIN_WORKFLOW_FILES = {
     "image": "workflows/toobusy_zimgt.json",
     "video": "workflows/LTX_Director_2_Workflow_ggufdis_API.json",
     "song": "workflows/audio_ace_step1_5_xl_turbo_API.json",
+    "song_reference": "workflows/audio_ace_step1_5_xl_turbo_API.json",
     "klein": "workflows/toobusy_flux2klein_vram.json",
     "faceswap": "workflows/toobusy_flux2klein_vram.json",
 }
@@ -1881,6 +1889,14 @@ class H(BaseHTTPRequestHandler):
                     if len(rels) < 2:
                         return self._json({"ok": False, "err": "사진 2장 필요"}, 400)
                     enqueue({"mode": "faceswap_board", "reference_assets": refs, "text": text, "settings": settings})
+            elif mode == "song_reference":
+                audio_assets = [a for a in (assets or []) if isinstance(a, dict) and a.get("kind") == "audio"]
+                if not audio_assets:
+                    return self._json({"ok": False, "err": "참고할 음악 파일 1개를 추가해주세요."}, 400)
+                saved = save_director_asset(audio_assets[0], 0)
+                if not saved or saved.get("kind") != "audio" or not saved.get("rel"):
+                    return self._json({"ok": False, "err": "참고 음원을 저장하지 못했습니다."}, 400)
+                enqueue({"mode": "song_reference", "text": text, "reference_audio": saved["rel"], "settings": settings})
             else:
                 job = {"mode": mode, "text": text, "settings": settings}
                 if mode == "image":
@@ -2943,8 +2959,8 @@ body{margin:0;background:#0a0814;color:var(--ink);font-family:'VT323',monospace;
 .cmpbench{display:none;position:fixed;left:18px;right:18px;bottom:14px;height:270px;z-index:46;background:rgba(8,6,16,.97);border:1px solid var(--pur);border-radius:12px;box-shadow:0 18px 70px rgba(0,0,0,.68);overflow:hidden;backdrop-filter:blur(12px)}
 .cmpbench.on{display:flex;flex-direction:column}.cmpbenchbar{height:42px;display:flex;align-items:center;gap:9px;padding:0 11px;border-bottom:1px solid var(--ln);flex:none}.cmpbenchbar b{color:var(--amb);font-family:'Press Start 2P',monospace;font-size:9px}.cmpbenchbar .sp{flex:1;color:var(--mut);font-size:15px}.cmpbenchbar button{height:29px;padding:0 10px;background:var(--b2);border:1px solid var(--ln);border-radius:6px;color:var(--ink);font-family:'VT323';font-size:16px;cursor:pointer}.cmpbenchbar button:hover{border-color:var(--cyan);color:var(--cyan)}.cmpbenchbar .go{background:rgba(157,123,255,.9);color:#080610;border-color:var(--pur)}
 .cmpbenchbody{display:grid;grid-template-columns:1fr 1fr;gap:10px;padding:10px;min-height:0;flex:1}.cmpdrop{min-width:0;border:1px dashed rgba(157,123,255,.48);border-radius:9px;background:rgba(255,255,255,.025);padding:8px;overflow:auto}.cmpdrop.drag{border-color:var(--cyan);background:rgba(86,225,255,.08);box-shadow:inset 0 0 24px rgba(86,225,255,.1)}.cmpdrop.paste{border-style:solid;box-shadow:inset 0 0 0 1px rgba(255,193,77,.46)}.cmpdroptitle{position:sticky;top:-8px;z-index:2;background:rgba(8,6,16,.94);padding:4px 2px 7px;color:var(--mut);font-family:'Press Start 2P';font-size:8px}.cmpdrop.left .cmpdroptitle{color:var(--pink)}.cmpdrop.right .cmpdroptitle{color:var(--cyan)}
-.cmpitems{display:grid;grid-template-columns:repeat(auto-fill,minmax(118px,1fr));gap:7px}.cmpempty{grid-column:1/-1;min-height:120px;display:flex;align-items:center;justify-content:center;text-align:center;color:var(--mut);font-size:17px}.cmpitem{position:relative;border:1px solid var(--ln);border-radius:7px;overflow:hidden;background:var(--b1);cursor:pointer}.cmpitem img{width:100%;height:86px;object-fit:cover;display:block}.cmpitem span{display:block;padding:4px 24px 5px 6px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;color:var(--ink);font-size:14px}.cmpitem button{position:absolute;right:4px;bottom:4px;width:20px;height:20px;border:0;border-radius:4px;background:rgba(0,0,0,.7);color:#fff;cursor:pointer}.cmpitem.sel{border-color:var(--amb);box-shadow:0 0 12px rgba(255,193,77,.35)}
-.cfs.manual .cfsgrp{border-style:dashed}.cfs.manual .cfsgrp.drag{border-color:var(--cyan);background:rgba(86,225,255,.08)}.cfschip.manual{display:grid;grid-template-columns:44px minmax(0,1fr) 20px;gap:6px;align-items:center;padding:5px}.cfschip.manual img{width:44px;height:38px;object-fit:cover;border-radius:4px}.cfschip.manual span{min-width:0;overflow:hidden;text-overflow:ellipsis}.cfschip.manual i{font-style:normal;text-align:center;color:var(--mut)}
+.cmpitems{display:grid;grid-template-columns:repeat(auto-fill,minmax(118px,1fr));gap:7px}.cmpempty{grid-column:1/-1;min-height:120px;display:flex;align-items:center;justify-content:center;text-align:center;color:var(--mut);font-size:17px}.cmpitem{position:relative;border:1px solid var(--ln);border-radius:7px;overflow:hidden;background:var(--b1);cursor:pointer}.cmpitem img,.cmpitem video{width:100%;height:86px;object-fit:cover;display:block;background:#000}.cmpitem .vbadge{position:absolute;left:4px;top:4px;padding:1px 5px;border-radius:4px;background:rgba(0,0,0,.72);color:var(--cyan);font-size:12px;pointer-events:none}.cmpitem span{display:block;padding:4px 24px 5px 6px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;color:var(--ink);font-size:14px}.cmpitem button{position:absolute;right:4px;bottom:4px;width:20px;height:20px;border:0;border-radius:4px;background:rgba(0,0,0,.7);color:#fff;cursor:pointer}.cmpitem.sel{border-color:var(--amb);box-shadow:0 0 12px rgba(255,193,77,.35)}
+.cfs.manual .cfsgrp{border-style:dashed}.cfs.manual .cfsgrp.drag{border-color:var(--cyan);background:rgba(86,225,255,.08)}.cfschip.manual{display:grid;grid-template-columns:44px minmax(0,1fr) 20px;gap:6px;align-items:center;padding:5px}.cfschip.manual img,.cfschip.manual video{width:44px;height:38px;object-fit:cover;border-radius:4px;background:#000}.cfschip.manual span{min-width:0;overflow:hidden;text-overflow:ellipsis}.cfschip.manual i{font-style:normal;text-align:center;color:var(--mut)}
 body.cmpbenchopen{padding-bottom:296px}
 .cfs{display:none;position:fixed;inset:0;background:rgba(4,3,10,.98);z-index:70;flex-direction:column}
 .cfs.on{display:flex}
@@ -2965,8 +2981,15 @@ body.cmpbenchopen{padding-bottom:296px}
 .cfsstage{position:relative;flex:1;overflow:hidden;cursor:crosshair}
 .cfsstage.panning{cursor:grabbing}
 .cfszoom{position:absolute;inset:0;transform-origin:50% 50%}
-.cfszoom img{position:absolute;inset:0;width:100%;height:100%;object-fit:contain;pointer-events:none;user-select:none;-webkit-user-drag:none}
+.cfszoom img,.cfszoom video{position:absolute;inset:0;width:100%;height:100%;object-fit:contain;pointer-events:none;user-select:none;-webkit-user-drag:none}
 .cfsdiv{position:absolute;top:0;bottom:0;width:2px;margin-left:-1px;background:var(--pink);box-shadow:0 0 12px rgba(255,93,143,.85);pointer-events:none;z-index:2}
+.cfsvbar{display:none;align-items:center;gap:10px;padding:8px 14px;border-top:1px solid var(--ln);background:rgba(10,8,20,.9);flex:none}
+.cfs.videocmp .cfsvbar{display:flex}
+.cfsvbar button{background:rgba(13,11,22,.7);border:1px solid var(--ln);color:var(--ink);border-radius:6px;min-width:36px;height:30px;cursor:pointer;font-size:15px}
+.cfsvbar button:hover{border-color:var(--cyan);color:var(--cyan)}
+.cfsvbar button.on{border-color:var(--amb);color:var(--amb)}
+.cfsvbar .t{font-family:'VT323',monospace;font-size:17px;color:var(--mut);min-width:54px;text-align:center}
+.cfsvbar input[type=range]{flex:1;accent-color:var(--pink);cursor:pointer}
 .cfslab{position:absolute;top:12px;font-family:'Press Start 2P',monospace;font-size:10px;padding:7px 10px;border-radius:6px;background:rgba(10,8,20,.82);pointer-events:none;line-height:1.5;z-index:6}
 .cfslab.la{left:258px;color:var(--pink)}.cfslab.rb{right:258px;color:var(--cyan);text-align:right}
 .cfslab .dim{display:block;margin-top:2px}.cfslab.la .dim{color:var(--pink)}.cfslab.rb .dim{color:var(--cyan)}
@@ -2976,7 +2999,7 @@ body.cmpbenchopen{padding-bottom:296px}
   <div class="stat pix"><span id="lanurl" class="lanurl" title="LAN address"></span><span id="hbox"></span><span><span class="dot" id="dot"></span> <span id="hstate">…</span></span></div>
 </div>
 <div class="genbar">
-  <select id="mode" class="msel" onchange="modeChg()"><option value="image">이미지</option><option value="video">영상</option><option value="song">음악</option><option value="klein">인물합성</option><option value="faceswap">페이스스왑</option></select>
+  <select id="mode" class="msel" onchange="modeChg()"><option value="image">이미지</option><option value="video">영상</option><option value="song">음악</option><option value="song_reference">참고곡 음악</option><option value="klein">인물합성</option><option value="faceswap">페이스스왑</option></select>
   <textarea id="prompt" class="gi promptbox" rows="2" placeholder="무엇을 만들까요? /레크2 프롬프트"></textarea>
   <button class="up" id="up" style="display:none" onclick="document.getElementById('files').click()">📷 사진</button>
   <input type="file" id="files" accept="image/*" multiple style="display:none" onchange="filePick()">
@@ -3082,7 +3105,7 @@ body.cmpbenchopen{padding-bottom:296px}
   </a>
 </aside></div></div>
 <div class="cmpbench" id="cmpbench">
-  <div class="cmpbenchbar"><b>MANUAL COMPARE</b><span class="sp">갤러리·탐색기 드롭 또는 스크린샷 Ctrl+V · 원본 bundle은 변경되지 않아요</span><button id="mcpaste" onclick="toggleMcPasteSide()">붙여넣기: LEFT</button><button onclick="document.getElementById('mcfiles').click()">파일 추가</button><input id="mcfiles" type="file" accept="image/*" multiple hidden><button onclick="clearManualBench()">비우기</button><button class="go" onclick="openManualCompare()">비교 열기</button><button onclick="toggleManualBench(false)">✕</button></div>
+  <div class="cmpbenchbar"><b>MANUAL COMPARE</b><span class="sp">갤러리 이미지·영상, 탐색기 드롭 또는 스크린샷 Ctrl+V · 원본 bundle은 변경되지 않아요</span><button id="mcpaste" onclick="toggleMcPasteSide()">붙여넣기: LEFT</button><button onclick="document.getElementById('mcfiles').click()">파일 추가</button><input id="mcfiles" type="file" accept="image/*,video/*" multiple hidden><button onclick="clearManualBench()">비우기</button><button class="go" onclick="openManualCompare()">비교 열기</button><button onclick="toggleManualBench(false)">✕</button></div>
   <div class="cmpbenchbody">
     <div class="cmpdrop left" id="mcdropL"><div class="cmpdroptitle">◀ LEFT SET</div><div class="cmpitems" id="mcitemsL"></div></div>
     <div class="cmpdrop right" id="mcdropR"><div class="cmpdroptitle">RIGHT SET ▶</div><div class="cmpitems" id="mcitemsR"></div></div>
@@ -3098,10 +3121,18 @@ body.cmpbenchopen{padding-bottom:296px}
   <div class="cfsstage" id="cfsstage">
     <div class="cfsgrp lft" id="cfsL"><span class="sk">◀ LEFT</span></div>
     <div class="cfsgrp rgt" id="cfsR"><span class="sk">RIGHT ▶</span></div>
-    <div class="cfszoom" id="cfszoom"><img id="cfsRimg" alt=""><img id="cfsLimg" alt=""></div>
+    <div class="cfszoom" id="cfszoom"><img id="cfsRimg" alt=""><video id="cfsRvid" muted playsinline preload="auto" style="display:none"></video><img id="cfsLimg" alt=""><video id="cfsLvid" muted playsinline preload="auto" style="display:none"></video></div>
     <div class="cfsdiv" id="cfsdiv"></div>
     <span class="cfslab la" id="cfslabL"></span>
     <span class="cfslab rb" id="cfslabR"></span>
+  </div>
+  <div class="cfsvbar" id="cfsvbar">
+    <button id="cfsplay" onclick="cmpTogglePlay()" title="재생/일시정지 (Space)">▶</button>
+    <span class="t" id="cfsvtime">0:00.0</span>
+    <input type="range" id="cfsseek" min="0" max="1000" value="0">
+    <span class="t" id="cfsvdur">0:00.0</span>
+    <button id="cfsloop" class="on" onclick="cmpToggleLoop()" title="반복 재생">∞</button>
+    <button id="cfsmute" onclick="cmpToggleMute()" title="소리 켜기/끄기">🔇</button>
   </div>
 </div>
 <script>
@@ -3348,9 +3379,14 @@ function addImgCard(g,it,i){var c=el('div','card');
 (function(){var grid=document.getElementById('grid'),box=document.getElementById('multilasso');grid.addEventListener('mousedown',function(e){if(!MULTI||e.button!==0||e.target.closest('.tools,button'))return;e.preventDefault();var keep=e.ctrlKey||e.shiftKey,base=keep?Object.assign({},MSEL):{},startCard=e.target.closest('.card');LASSO={x:e.clientX,y:e.clientY,base:base,startCard:startCard,wasSelected:startCard?!!MSEL[startCard._selKey]:false,moved:false};box.style.left=e.clientX+'px';box.style.top=e.clientY+'px';box.style.width='0';box.style.height='0';box.classList.add('on')});document.addEventListener('mousemove',function(e){if(!LASSO)return;var x=Math.min(LASSO.x,e.clientX),y=Math.min(LASSO.y,e.clientY),w=Math.abs(e.clientX-LASSO.x),h=Math.abs(e.clientY-LASSO.y);if(w+h>5)LASSO.moved=true;box.style.left=x+'px';box.style.top=y+'px';box.style.width=w+'px';box.style.height=h+'px';if(!LASSO.moved)return;var next=Object.assign({},LASSO.base),right=x+w,bottom=y+h;Array.prototype.forEach.call(grid.querySelectorAll('.card'),function(c){var r=c.getBoundingClientRect(),hit=r.right>=x&&r.left<=right&&r.bottom>=y&&r.top<=bottom;if(hit)next[c._selKey]=c._deleteRels.slice()});MSEL=next;updateMultiUI()});document.addEventListener('mouseup',function(){if(!LASSO)return;if(!LASSO.moved){MSEL=Object.assign({},LASSO.base);if(LASSO.startCard){if(LASSO.wasSelected)delete MSEL[LASSO.startCard._selKey];else MSEL[LASSO.startCard._selKey]=LASSO.startCard._deleteRels.slice()}updateMultiUI()}box.classList.remove('on');LASSO=null;SUPPRESS_CARD_CLICK=true;setTimeout(function(){SUPPRESS_CARD_CLICK=false},0)})})();
 function renderVids(){var v=document.getElementById('vrows');v.innerHTML='';
   VIDS.forEach(function(it){var r=el('div','vrow pix');
-    r.innerHTML='<span class="tg">MP4</span><span class="nm">'+it.name+'</span><button class="tbtn">🗑</button>';
+    r.innerHTML='<span class="tg">MP4</span><span class="nm">'+it.name+'</span><button class="tbtn" title="직접비교 LEFT에 추가">L</button><button class="tbtn" title="직접비교 RIGHT에 추가">R</button><button class="tbtn">🗑</button>';
+    r.draggable=true;
+    r.ondragstart=function(e){e.dataTransfer.setData('application/x-pingpong-gallery',JSON.stringify({kind:'video',name:it.name,url:it.url,rel:it.rel}));e.dataTransfer.effectAllowed='copy'};
     r.querySelector('.nm').onclick=function(){var m=document.getElementById('mon');m.src=it.url;m.play();document.getElementById('now').textContent='NOW PLAYING — '+it.name};
-    r.querySelector('.tbtn').onclick=function(){if(confirm('삭제할까요?'))api('/api/delete',{rel:it.rel}).then(load)};
+    var b=r.querySelectorAll('.tbtn');
+    b[0].onclick=function(e){e.stopPropagation();mcAdd('L',it,'video')};
+    b[1].onclick=function(e){e.stopPropagation();mcAdd('R',it,'video')};
+    b[2].onclick=function(){if(confirm('삭제할까요?'))api('/api/delete',{rel:it.rel}).then(load)};
     v.appendChild(r)});
   if(VIDS.length){var m=document.getElementById('mon');if(!m.src){m.src=VIDS[0].url;document.getElementById('now').textContent='NOW PLAYING — '+VIDS[0].name}}}
 function renderAuds(){var a=document.getElementById('aud');
@@ -3454,22 +3490,24 @@ function unhideAll(){api('/api/unhide_all',{}).then(load)}
 
 /* ---------- 직접 드롭 비교 작업대 ---------- */
 var MC={L:[],R:[],li:0,ri:0,pasteSide:'L'},MC_KEY='pingpong.manual_compare.v1',MC_LOADED=false;
-function mcLoad(){try{var d=JSON.parse(localStorage.getItem(MC_KEY)||'{}');MC.L=(Array.isArray(d.L)?d.L:[]).filter(function(x){return !x.external});MC.R=(Array.isArray(d.R)?d.R:[]).filter(function(x){return !x.external});MC.li=Math.max(0,Math.min(MC.L.length-1,Number(d.li)||0));MC.ri=Math.max(0,Math.min(MC.R.length-1,Number(d.ri)||0));MC.pasteSide=d.pasteSide==='R'?'R':'L'}catch(e){MC={L:[],R:[],li:0,ri:0,pasteSide:'L'}}MC_LOADED=true}
+function mcOriginalUrl(it){if(!it)return'';if(it.external)return it.url||'';var rel=String(it.rel||'');if(rel)return'/media/'+rel.split('/').map(encodeURIComponent).join('/');var url=String(it.url||'');if(url.indexOf('/thumb/')===0)return'/media/'+url.slice(7);return url}
+function mcNormalize(it){if(!it||typeof it!=='object')return it;var out=Object.assign({},it);out.url=mcOriginalUrl(out);return out}
+function mcLoad(){try{var d=JSON.parse(localStorage.getItem(MC_KEY)||'{}');MC.L=(Array.isArray(d.L)?d.L:[]).filter(function(x){return !x.external}).map(mcNormalize);MC.R=(Array.isArray(d.R)?d.R:[]).filter(function(x){return !x.external}).map(mcNormalize);MC.li=Math.max(0,Math.min(MC.L.length-1,Number(d.li)||0));MC.ri=Math.max(0,Math.min(MC.R.length-1,Number(d.ri)||0));MC.pasteSide=d.pasteSide==='R'?'R':'L'}catch(e){MC={L:[],R:[],li:0,ri:0,pasteSide:'L'}}MC_LOADED=true;mcSave()}
 function mcSave(){try{var saved={L:MC.L.filter(function(x){return !x.external}),R:MC.R.filter(function(x){return !x.external}),li:0,ri:0,pasteSide:MC.pasteSide};localStorage.setItem(MC_KEY,JSON.stringify(saved))}catch(e){}}
 function toggleManualBench(force){var box=document.getElementById('cmpbench'),on=(force===undefined?!box.classList.contains('on'):!!force);box.classList.toggle('on',on);document.body.classList.toggle('cmpbenchopen',on);if(on){if(!MC_LOADED)mcLoad();renderManualBench()}}
-function mcItemHtml(side,it,i){var sel=(side==='L'?MC.li:MC.ri)===i;return '<div class="cmpitem'+(sel?' sel':'')+'" onclick="mcSelect(\''+side+'\','+i+')"><img src="'+esc(it.url)+'"><span title="'+esc(it.name)+'">'+esc(it.name||it.rel||'image')+'</span><button title="제거" onclick="event.stopPropagation();mcRemove(\''+side+'\','+i+')">×</button></div>'}
-function renderManualBench(){['L','R'].forEach(function(side){var arr=MC[side],box=document.getElementById('mcitems'+side),zone=document.getElementById('mcdrop'+side);zone.classList.toggle('paste',MC.pasteSide===side);box.innerHTML=arr.length?arr.map(function(it,i){return mcItemHtml(side,it,i)}).join(''):'<div class="cmpempty">갤러리나 탐색기 이미지를 드롭하세요<br>스크린샷 Ctrl+V · 여러 장 가능</div>'});var pb=document.getElementById('mcpaste');if(pb)pb.textContent='붙여넣기: '+(MC.pasteSide==='R'?'RIGHT':'LEFT')}
+function mcItemHtml(side,it,i){var sel=(side==='L'?MC.li:MC.ri)===i;var media=it.kind==='video'?'<video preload="metadata" muted src="'+esc(it.url)+'"></video><span class="vbadge">▶ VIDEO</span>':'<img src="'+esc(it.url)+'">';return '<div class="cmpitem'+(sel?' sel':'')+'" onclick="mcSelect(\''+side+'\','+i+')">'+media+'<span title="'+esc(it.name)+'">'+esc(it.name||it.rel||'media')+'</span><button title="제거" onclick="event.stopPropagation();mcRemove(\''+side+'\','+i+')">×</button></div>'}
+function renderManualBench(){['L','R'].forEach(function(side){var arr=MC[side],box=document.getElementById('mcitems'+side),zone=document.getElementById('mcdrop'+side);zone.classList.toggle('paste',MC.pasteSide===side);box.innerHTML=arr.length?arr.map(function(it,i){return mcItemHtml(side,it,i)}).join(''):'<div class="cmpempty">갤러리 이미지·영상을 드롭하세요<br>스크린샷 Ctrl+V · 여러 개 가능</div>'});var pb=document.getElementById('mcpaste');if(pb)pb.textContent='붙여넣기: '+(MC.pasteSide==='R'?'RIGHT':'LEFT')}
 function setMcPasteSide(side){MC.pasteSide=side==='R'?'R':'L';mcSave();renderManualBench()}
 function toggleMcPasteSide(){setMcPasteSide(MC.pasteSide==='L'?'R':'L')}
 function mcSelect(side,i){if(i<0||i>=MC[side].length)return;if(side==='L')MC.li=i;else MC.ri=i;mcSave();renderManualBench()}
-function mcAdd(side,it){var arr=MC[side],key=it.rel||it.url;if(!arr.some(function(x){return (x.rel||x.url)===key}))arr.push({kind:'image',name:it.name||'image',url:it.url,rel:it.rel||''});if(side==='L')MC.li=arr.length-1;else MC.ri=arr.length-1;mcSave();toggleManualBench(true);renderManualBench()}
+function mcAdd(side,it,kind){var arr=MC[side],key=it.rel||it.url;if(!arr.some(function(x){return (x.rel||x.url)===key}))arr.push(mcNormalize({kind:kind||it.kind||'image',name:it.name||'media',url:it.url,rel:it.rel||''}));if(side==='L')MC.li=arr.length-1;else MC.ri=arr.length-1;mcSave();toggleManualBench(true);renderManualBench()}
 function mcRemove(side,i){var old=MC[side][i];if(old&&old.external&&String(old.url).indexOf('blob:')===0)URL.revokeObjectURL(old.url);MC[side].splice(i,1);if(side==='L')MC.li=Math.max(0,Math.min(MC.li,MC.L.length-1));else MC.ri=Math.max(0,Math.min(MC.ri,MC.R.length-1));mcSave();renderManualBench()}
 function clearManualBench(){MC.L.concat(MC.R).forEach(function(x){if(x.external&&String(x.url).indexOf('blob:')===0)URL.revokeObjectURL(x.url)});MC={L:[],R:[],li:0,ri:0,pasteSide:MC.pasteSide||'L'};mcSave();renderManualBench()}
-async function mcAddBlob(side,blob,name){try{var data=URL.createObjectURL(blob),arr=MC[side];arr.push({kind:'image',name:name||('clipboard-'+Date.now()),url:data,rel:'',external:true,bytes:blob.size||0,mime:blob.type||''});if(side==='L')MC.li=arr.length-1;else MC.ri=arr.length-1;MC.pasteSide=side;mcSave();renderManualBench()}catch(e){console.warn('manual compare image add failed',e)}}
-async function mcDrop(side,e){e.preventDefault();var zone=document.getElementById('mcdrop'+side);zone.classList.remove('drag');MC.pasteSide=side;var files=Array.prototype.filter.call(e.dataTransfer.files||[],function(f){return f.type.indexOf('image/')===0});if(files.length){for(var fi=0;fi<files.length;fi++)await mcAddBlob(side,files[fi],files[fi].name);return}var raw=e.dataTransfer.getData('application/x-pingpong-gallery'),it;try{it=JSON.parse(raw)}catch(_){return}if(!it||it.kind!=='image')return;var arr=MC[side],key=it.rel||it.url;if(!arr.some(function(x){return (x.rel||x.url)===key}))arr.push({kind:'image',name:it.name||'image',url:it.url,rel:it.rel||''});if(side==='L')MC.li=arr.length-1;else MC.ri=arr.length-1;mcSave();renderManualBench()}
+async function mcAddBlob(side,blob,name){try{var data=URL.createObjectURL(blob),arr=MC[side],kind=(blob.type||'').indexOf('video/')===0?'video':'image';arr.push({kind:kind,name:name||('clipboard-'+Date.now()),url:data,rel:'',external:true,bytes:blob.size||0,mime:blob.type||''});if(side==='L')MC.li=arr.length-1;else MC.ri=arr.length-1;MC.pasteSide=side;mcSave();renderManualBench()}catch(e){console.warn('manual compare image add failed',e)}}
+async function mcDrop(side,e){e.preventDefault();var zone=document.getElementById('mcdrop'+side);zone.classList.remove('drag');MC.pasteSide=side;var files=Array.prototype.filter.call(e.dataTransfer.files||[],function(f){return f.type.indexOf('image/')===0||f.type.indexOf('video/')===0});if(files.length){for(var fi=0;fi<files.length;fi++)await mcAddBlob(side,files[fi],files[fi].name);return}var raw=e.dataTransfer.getData('application/x-pingpong-gallery'),it;try{it=JSON.parse(raw)}catch(_){return}if(!it||(it.kind!=='image'&&it.kind!=='video'))return;var arr=MC[side],key=it.rel||it.url;if(!arr.some(function(x){return (x.rel||x.url)===key}))arr.push(mcNormalize({kind:it.kind,name:it.name||'media',url:it.url,rel:it.rel||''}));if(side==='L')MC.li=arr.length-1;else MC.ri=arr.length-1;mcSave();renderManualBench()}
 function mcDragOver(side,e){var types=Array.prototype.slice.call(e.dataTransfer.types||[]);if(types.indexOf('application/x-pingpong-gallery')<0&&types.indexOf('Files')<0)return;e.preventDefault();document.getElementById('mcdrop'+side).classList.add('drag');e.dataTransfer.dropEffect='copy'}
-function openManualCompare(){if(!MC.L.length||!MC.R.length){alert('LEFT와 RIGHT에 이미지를 한 장 이상 넣어주세요');return}CMP.manual=true;CMP.Litems=MC.L.slice();CMP.Ritems=MC.R.slice();CMP.L=Math.min(MC.li,CMP.Litems.length-1);CMP.R=Math.min(MC.ri,CMP.Ritems.length-1);CMP.orig=null;CMP.scale=1;CMP.tx=0;CMP.ty=0;CMP.wipe=50;document.getElementById('cfs').classList.add('on','manual');document.body.classList.add('modalopen');renderCmpChips();applyCmpImgs();applyCmpView()}
-(function(){['L','R'].forEach(function(side){var zone=document.getElementById('mcdrop'+side);zone.addEventListener('click',function(){setMcPasteSide(side)});zone.addEventListener('dragover',function(e){mcDragOver(side,e)});zone.addEventListener('dragleave',function(){zone.classList.remove('drag')});zone.addEventListener('drop',function(e){mcDrop(side,e)})});document.getElementById('mcfiles').addEventListener('change',async function(){var files=Array.prototype.filter.call(this.files||[],function(f){return f.type.indexOf('image/')===0}),side=MC.pasteSide;this.value='';for(var i=0;i<files.length;i++)await mcAddBlob(side,files[i],files[i].name)});document.addEventListener('paste',async function(e){if(!document.getElementById('cmpbench').classList.contains('on')||typingTarget(e))return;var files=Array.prototype.map.call(e.clipboardData&&e.clipboardData.items||[],function(it){return it.type.indexOf('image/')===0?it.getAsFile():null}).filter(Boolean);if(!files.length)return;e.preventDefault();for(var i=0;i<files.length;i++)await mcAddBlob(MC.pasteSide,files[i],'screenshot-'+new Date().toISOString().replace(/[:.]/g,'-')+'.png')});mcLoad()})();
+function openManualCompare(){if(!MC.L.length||!MC.R.length){alert('LEFT와 RIGHT에 이미지/영상을 하나 이상 넣어주세요');return}MC.L=MC.L.map(mcNormalize);MC.R=MC.R.map(mcNormalize);mcSave();CMP.manual=true;CMP.Litems=MC.L.slice();CMP.Ritems=MC.R.slice();CMP.L=Math.min(MC.li,CMP.Litems.length-1);CMP.R=Math.min(MC.ri,CMP.Ritems.length-1);CMP.orig=null;CMP.scale=1;CMP.tx=0;CMP.ty=0;CMP.wipe=50;CMPV.wasTime=0;CMPV.playing=true;document.getElementById('cfs').classList.add('on','manual');document.body.classList.add('modalopen');renderCmpChips();applyCmpImgs();applyCmpView()}
+(function(){['L','R'].forEach(function(side){var zone=document.getElementById('mcdrop'+side);zone.addEventListener('click',function(){setMcPasteSide(side)});zone.addEventListener('dragover',function(e){mcDragOver(side,e)});zone.addEventListener('dragleave',function(){zone.classList.remove('drag')});zone.addEventListener('drop',function(e){mcDrop(side,e)})});document.getElementById('mcfiles').addEventListener('change',async function(){var files=Array.prototype.filter.call(this.files||[],function(f){return f.type.indexOf('image/')===0||f.type.indexOf('video/')===0}),side=MC.pasteSide;this.value='';for(var i=0;i<files.length;i++)await mcAddBlob(side,files[i],files[i].name)});document.addEventListener('paste',async function(e){if(!document.getElementById('cmpbench').classList.contains('on')||typingTarget(e))return;var files=Array.prototype.map.call(e.clipboardData&&e.clipboardData.items||[],function(it){return it.type.indexOf('image/')===0?it.getAsFile():null}).filter(Boolean);if(!files.length)return;e.preventDefault();for(var i=0;i<files.length;i++)await mcAddBlob(MC.pasteSide,files[i],'screenshot-'+new Date().toISOString().replace(/[:.]/g,'-')+'.png')});mcLoad()})();
 
 /* ---------- 묶음/직접 A/B/C 와이프 비교 뷰어 ---------- */
 var CMP={items:[],Litems:[],Ritems:[],manual:false,L:0,R:0,orig:null,scale:1,tx:0,ty:0,wipe:50,drag:null};
@@ -3480,11 +3518,11 @@ function openCmp(key){var ms=BUNDLES[key];if(!ms||(!ms.length)||((ms.length<2)&&
   for(var oi=0;oi<ms.length;oi++){if(ms[oi].orig_url){CMP.orig={url:ms[oi].orig_url,rel:ms[oi].orig||'',label:'CONTROL SOURCE'};break}}
   document.getElementById('cfs').classList.add('on');document.body.classList.add('modalopen');
   renderCmpChips();applyCmpImgs();applyCmpView()}
-function closeCmp(){document.getElementById('cfs').classList.remove('on','manual');if(!document.getElementById('lb').classList.contains('open'))document.body.classList.remove('modalopen')}
+function closeCmp(){cmpPause();cmpStopRaf();['cfsLvid','cfsRvid'].forEach(function(id){var v=document.getElementById(id);if(v&&v.src){v.pause();v.removeAttribute('src');v.load()}});document.getElementById('cfs').classList.remove('on','manual','videocmp');if(!document.getElementById('lb').classList.contains('open'))document.body.classList.remove('modalopen')}
 function renderCmpChips(){
   [['L','cfsL'],['R','cfsR']].forEach(function(p){
     var side=p[0],box=document.getElementById(p[1]),skEl=box.querySelector('.sk'),sk=skEl?skEl.outerHTML:'';
-    if(CMP.manual){var arr=side==='L'?CMP.Litems:CMP.Ritems,cur=side==='L'?CMP.L:CMP.R;box.innerHTML=sk+arr.map(function(it,i){return '<button class="cfschip manual'+(cur===i?' on':'')+'" onclick="setCmpSide(\''+side+'\','+i+')"><img src="'+esc(it.url)+'"><span>'+esc(it.name||it.rel||('이미지 '+(i+1)))+'</span><i>'+cmpLetter(i)+'</i></button>'}).join('');return}
+    if(CMP.manual){var arr=side==='L'?CMP.Litems:CMP.Ritems,cur=side==='L'?CMP.L:CMP.R;box.innerHTML=sk+arr.map(function(it,i){var th=it.kind==='video'?'<video preload="metadata" muted src="'+esc(it.url)+'"></video>':'<img src="'+esc(it.url)+'">';return '<button class="cfschip manual'+(cur===i?' on':'')+'" onclick="setCmpSide(\''+side+'\','+i+')">'+th+'<span>'+esc(it.name||it.rel||('미디어 '+(i+1)))+'</span><i>'+cmpLetter(i)+'</i></button>'}).join('');return}
     if(side==='L'&&CMP.orig){
       var curOrig=cmpOrigFor(CMP.R)||CMP.orig;
       box.innerHTML=sk+'<button class="cfschip on" title="'+esc(curOrig.rel)+'">CONTROL SOURCE<br>'+esc((curOrig.rel||'control image').split('/').pop())+'</button>';
@@ -3499,35 +3537,100 @@ function renderCmpChips(){
   })
 }
 function setCmpSide(side,i){var arr=CMP.manual?(side==='L'?CMP.Litems:CMP.Ritems):CMP.items;if(i<0||i>=arr.length)return;if(side==='L'&&CMP.orig&&!CMP.manual)return;if(side==='L'){CMP.L=i;if(CMP.manual)MC.li=i}else{CMP.R=i;if(CMP.manual)MC.ri=i}if(CMP.manual)mcSave();renderCmpChips();applyCmpImgs()}
+function cmpSideItem(side){
+  if(CMP.manual)return side==='L'?CMP.Litems[CMP.L]:CMP.Ritems[CMP.R];
+  if(side==='L'){var o=cmpOrigFor(CMP.R);return o?{url:o.url,kind:'image'}:CMP.items[CMP.L]}
+  return CMP.items[CMP.R];
+}
+function cmpKind(it){return (it&&it.kind==='video')?'video':'image'}
+function cmpActive(side){return document.getElementById('cfs'+side+(cmpKind(cmpSideItem(side))==='video'?'vid':'img'))}
 function applyCmpImgs(){
-  var L=document.getElementById('cfsLimg'),R=document.getElementById('cfsRimg');
-  L.onload=R.onload=updateCmpLabels;
-  if(CMP.manual){L.src=CMP.Litems[CMP.L].url;R.src=CMP.Ritems[CMP.R].url;updateCmpLabels();return}
-  var curOrig=cmpOrigFor(CMP.R);
-  L.src=curOrig?curOrig.url:CMP.items[CMP.L].url;R.src=CMP.items[CMP.R].url;
+  ['L','R'].forEach(function(side){
+    var it=cmpSideItem(side)||{},img=document.getElementById('cfs'+side+'img'),vid=document.getElementById('cfs'+side+'vid');
+    if(cmpKind(it)==='video'){
+      img.style.display='none';img.removeAttribute('src');
+      vid.style.display='';
+      if(vid.getAttribute('src')!==it.url){vid.src=it.url}
+    }else{
+      vid.style.display='none';if(vid.src){vid.pause();vid.removeAttribute('src');vid.load()}
+      img.style.display='';img.onload=updateCmpLabels;img.src=it.url;
+    }
+  });
+  cmpVideoSetup();
+  applyCmpWipe();
   updateCmpLabels();
 }
-function cmpDim(img){return img.naturalWidth?(img.naturalWidth+'×'+img.naturalHeight):''}
+/* ---------- 영상 동기 재생 엔진 ---------- */
+var CMPV={playing:false,loop:true,muted:true,scrub:false,raf:0,wasTime:0};
+function cmpVids(){var out=[];['L','R'].forEach(function(s){if(cmpKind(cmpSideItem(s))==='video')out.push(document.getElementById('cfs'+s+'vid'))});return out}
+function cmpMaster(){var v=cmpVids();return v.length?v[v.length-1]:null}
+function cmpVideoSetup(){
+  var vids=cmpVids();
+  document.getElementById('cfs').classList.toggle('videocmp',vids.length>0);
+  if(!vids.length){cmpStopRaf();CMPV.playing=false;return}
+  var t=CMPV.wasTime||0;
+  vids.forEach(function(v,i){
+    v.loop=false;v.muted=CMPV.muted||i<vids.length-1;
+    var seek=function(){try{if(t>0&&v.duration&&t<v.duration)v.currentTime=t}catch(e){}};
+    if(v.readyState>=1){seek()}else{v.onloadedmetadata=function(){seek();updateCmpLabels()}}
+  });
+  if(CMPV.playing)cmpPlay();else cmpPause();
+  cmpStartRaf();
+}
+function cmpPlay(){var vids=cmpVids();if(!vids.length)return;CMPV.playing=true;vids.forEach(function(v){v.play().catch(function(){})});document.getElementById('cfsplay').textContent='⏸';cmpStartRaf()}
+function cmpPause(){cmpVids().forEach(function(v){v.pause()});CMPV.playing=false;var b=document.getElementById('cfsplay');if(b)b.textContent='▶'}
+function cmpTogglePlay(){if(CMPV.playing)cmpPause();else cmpPlay()}
+function cmpSeekTo(t){cmpVids().forEach(function(v){try{v.currentTime=Math.max(0,Math.min(t,v.duration||t))}catch(e){}})}
+function cmpStep(dt){var m=cmpMaster();if(!m)return;cmpPause();cmpSeekTo((m.currentTime||0)+dt)}
+function cmpToggleLoop(){CMPV.loop=!CMPV.loop;document.getElementById('cfsloop').classList.toggle('on',CMPV.loop)}
+function cmpToggleMute(){CMPV.muted=!CMPV.muted;var vids=cmpVids();vids.forEach(function(v,i){v.muted=CMPV.muted||i<vids.length-1});var b=document.getElementById('cfsmute');b.textContent=CMPV.muted?'🔇':'🔊';b.classList.toggle('on',!CMPV.muted)}
+function fmtCmpT(s){if(!isFinite(s)||s<0)s=0;return Math.floor(s/60)+':'+String(Math.floor(s%60)).padStart(2,'0')+'.'+Math.floor(s*10%10)}
+function cmpStartRaf(){
+  cmpStopRaf();
+  CMPV.raf=setInterval(function(){
+    var vids=cmpVids();
+    if(!document.getElementById('cfs').classList.contains('on')||!vids.length){cmpStopRaf();return}
+    var m=vids[vids.length-1];
+    CMPV.wasTime=m.currentTime||0;
+    if(vids.length>1){var s=vids[0];if(Math.abs((s.currentTime||0)-(m.currentTime||0))>0.08){try{s.currentTime=m.currentTime}catch(e){}}}
+    if(CMPV.playing&&m.duration&&m.currentTime>=m.duration-0.05){
+      if(CMPV.loop){cmpSeekTo(0);vids.forEach(function(v){v.play().catch(function(){})})}else cmpPause()
+    }
+    var seek=document.getElementById('cfsseek');
+    if(seek&&!CMPV.scrub&&m.duration)seek.value=Math.round((m.currentTime||0)/m.duration*1000);
+    document.getElementById('cfsvtime').textContent=fmtCmpT(m.currentTime||0);
+    document.getElementById('cfsvdur').textContent=fmtCmpT(m.duration||0);
+  },100);
+}
+function cmpStopRaf(){if(CMPV.raf){clearInterval(CMPV.raf);CMPV.raf=0}}
+(function(){
+  var seek=document.getElementById('cfsseek');if(!seek)return;
+  seek.addEventListener('input',function(){var m=cmpMaster();if(!m||!m.duration)return;CMPV.scrub=true;cmpSeekTo(seek.value/1000*m.duration)});
+  ['change','mouseup','touchend'].forEach(function(ev){seek.addEventListener(ev,function(){CMPV.scrub=false})});
+  ['mousedown','mousemove','dblclick','wheel'].forEach(function(ev){document.getElementById('cfsvbar').addEventListener(ev,function(e){e.stopPropagation()},{passive:ev==='wheel'})});
+})();
+function cmpDim(el){var w=el?(el.naturalWidth||el.videoWidth||0):0,h=el?(el.naturalHeight||el.videoHeight||0):0;return w?(w+'×'+h):''}
 function updateCmpLabels(){
-  var L=document.getElementById('cfsLimg'),R=document.getElementById('cfsRimg');
+  var L=cmpActive('L'),R=cmpActive('R');
   if(CMP.manual){document.getElementById('cfslabL').innerHTML='LEFT · '+esc(CMP.Litems[CMP.L].name||'')+(cmpDim(L)?'<span class="dim">'+esc(cmpDim(L))+'</span>':'');document.getElementById('cfslabR').innerHTML='RIGHT · '+esc(CMP.Ritems[CMP.R].name||'')+(cmpDim(R)?'<span class="dim">'+esc(cmpDim(R))+'</span>':'');updateCmpInfo();return}
   var curOrig=cmpOrigFor(CMP.R);
   document.getElementById('cfslabL').innerHTML=(curOrig?'CONTROL SOURCE':(cmpLetter(CMP.L)+' '+esc(CMP.items[CMP.L].stage||'')))+(cmpDim(L)?'<span class="dim">'+esc(cmpDim(L))+'</span>':'');
   document.getElementById('cfslabR').innerHTML=cmpLetter(CMP.R)+' '+esc(CMP.items[CMP.R].stage||'')+(cmpDim(R)?'<span class="dim">'+esc(cmpDim(R))+'</span>':'');
   updateCmpInfo();
 }
-function updateCmpInfo(){document.getElementById('cfsinfo').innerHTML=(CMP.manual?'직접 선택 비교 · ':CMP.orig?'왼쪽=컨트롤 재료 고정 · 오른쪽=강도 선택 · ':'마우스 좌우=와이프 · ')+'휠=줌 <b>'+Math.round(CMP.scale*100)+'%</b> · 1:1/N=실제픽셀 · 최대 32× · 드래그=이동 · 더블클릭=맞춤 · '+(CMP.orig&&!CMP.manual?'키 1~9=오른쪽':'키 1~9=왼쪽 · Shift+1~9=오른쪽')+' · ESC 닫기'}
+function updateCmpInfo(){var vhint=document.getElementById('cfs').classList.contains('videocmp')?'Space=재생/멈춤 · ←→=프레임(Shift=1초) · ':'';document.getElementById('cfsinfo').innerHTML=(CMP.manual?'직접 선택 비교 · ':CMP.orig?'왼쪽=컨트롤 재료 고정 · 오른쪽=강도 선택 · ':'마우스 좌우=와이프 · ')+vhint+'휠=줌 <b>'+Math.round(CMP.scale*100)+'%</b> · 1:1/N=실제픽셀 · 최대 32× · 드래그=이동 · 더블클릭=맞춤 · '+(CMP.orig&&!CMP.manual?'키 1~9=오른쪽':'키 1~9=왼쪽 · Shift+1~9=오른쪽')+' · ESC 닫기'}
 function applyCmpView(){
   document.getElementById('cfszoom').style.transform='translate('+CMP.tx+'px,'+CMP.ty+'px) scale('+CMP.scale+')';
   applyCmpWipe();updateCmpInfo();
 }
-function nativeCmpView(){var st=document.getElementById('cfsstage'),r=st.getBoundingClientRect(),imgs=[document.getElementById('cfsLimg'),document.getElementById('cfsRimg')],scales=imgs.map(function(img){if(!img.naturalWidth||!img.naturalHeight)return 1;var fit=Math.min(r.width/img.naturalWidth,r.height/img.naturalHeight);return fit>0?1/fit:1});CMP.scale=Math.max(1,Math.min(32,Math.max.apply(Math,scales)));CMP.tx=0;CMP.ty=0;applyCmpView()}
+function nativeCmpView(){var st=document.getElementById('cfsstage'),r=st.getBoundingClientRect(),els=[cmpActive('L'),cmpActive('R')],scales=els.map(function(el){var w=el?(el.naturalWidth||el.videoWidth||0):0,h=el?(el.naturalHeight||el.videoHeight||0):0;if(!w||!h)return 1;var fit=Math.min(r.width/w,r.height/h);return fit>0?1/fit:1});CMP.scale=Math.max(1,Math.min(32,Math.max.apply(Math,scales)));CMP.tx=0;CMP.ty=0;applyCmpView()}
 function applyCmpWipe(){
   var st=document.getElementById('cfsstage'),z=document.getElementById('cfszoom');
   var sr=st.getBoundingClientRect(),zr=z.getBoundingClientRect();
   var x=sr.left+sr.width*CMP.wipe/100;
   var p=Math.max(0,Math.min(100,(x-zr.left)/Math.max(1,zr.width)*100));
   document.getElementById('cfsLimg').style.clipPath='inset(0 '+(100-p)+'% 0 0)';
+  document.getElementById('cfsLvid').style.clipPath='inset(0 '+(100-p)+'% 0 0)';
   document.getElementById('cfsdiv').style.left=CMP.wipe+'%';
 }
 (function(){
@@ -3559,10 +3662,12 @@ function applyCmpWipe(){
 })();
 
 document.addEventListener('keydown',function(e){
-  if(e.code==='Space'&&!typingTarget(e)){e.preventDefault();aplay();return}
-  if(document.getElementById('cfs').classList.contains('on')){
+  var cfsEl=document.getElementById('cfs'),cfsVideo=cfsEl.classList.contains('on')&&cfsEl.classList.contains('videocmp');
+  if(e.code==='Space'&&!typingTarget(e)){e.preventDefault();if(cfsVideo)cmpTogglePlay();else aplay();return}
+  if(cfsEl.classList.contains('on')){
     if(e.key==='Escape'){closeCmp();return}
     if(e.key.toLowerCase()==='n'&&!typingTarget(e)){e.preventDefault();nativeCmpView();return}
+    if(cfsVideo&&(e.key==='ArrowLeft'||e.key==='ArrowRight')&&!typingTarget(e)){e.preventDefault();cmpStep((e.key==='ArrowRight'?1:-1)*(e.shiftKey?1:1/24));return}
     var m=(e.code||'').match(/^Digit([1-9])$/);
     if(m&&!typingTarget(e)){setCmpSide((CMP.orig||e.shiftKey)?'R':'L',parseInt(m[1],10)-1);return}
     return;
@@ -3580,7 +3685,7 @@ function usesRoleBoard(m){return m==='klein'||m==='faceswap'}
 function modeChg(){var m=document.getElementById('mode').value,p=document.getElementById('prompt'),u=document.getElementById('up'),d=document.getElementById('director'),rb=document.getElementById('refboard'),ob=document.getElementById('optbar'),io=document.getElementById('imgopts'),eo=document.getElementById('editopts'),vo=document.getElementById('vidopts');
   document.body.classList.toggle('videoMode',m==='video');
   MODELPANEL=false;
-  var ph={image:'무엇을 그릴까요? 예: 노을 지는 바닷가',video:'어떤 영상? 대사는 "따옴표"',song:'어떤 음악? 예: 신나는 EDM',klein:'바꿀 장면 설명 (+ 사진 1장)',faceswap:'장면(선택) + 사진 2장(몸→얼굴)'};
+  var ph={image:'무엇을 그릴까요? 예: 노을 지는 바닷가',video:'어떤 영상? 대사는 "따옴표"',song:'어떤 음악? 예: 신나는 EDM',song_reference:'참고곡의 질감으로 어떤 새 곡을 만들까요?',klein:'바꿀 장면 설명 (+ 사진 1장)',faceswap:'장면(선택) + 사진 2장(몸→얼굴)'};
   var c=CUSTOMS.find(function(x){return x.mode===m});
   p.placeholder=c?('무엇을 만들까요? '+c.trigger+' 프롬프트'):ph[m];
   d.classList.toggle('on',m==='video');
@@ -3611,9 +3716,9 @@ function modeChg(){var m=document.getElementById('mode').value,p=document.getEle
   renderModeHint(m);
   loadModelFields();
   pickRole='';
-  var useBoard=needsReferenceBoard(m,c);
-  u.style.display=useBoard?'block':'none';u.textContent='📌 보드';u.onclick=openReferenceBoard;
-  document.getElementById('files').accept=m==='video'?'image/*,video/*,audio/*':'image/*,audio/*';
+  var useBoard=needsReferenceBoard(m,c),useAudioRef=m==='song_reference';
+  u.style.display=(useBoard||useAudioRef)?'block':'none';u.textContent=useAudioRef?'🎧 참고곡':'📌 보드';u.onclick=useAudioRef?function(){openPicker('audio')}:openReferenceBoard;
+  document.getElementById('files').accept=m==='video'?'image/*,video/*,audio/*':(useAudioRef?'audio/*':'image/*,audio/*');
   renderAssets();document.getElementById('upinfo').textContent=''}
 var picked=[];
 function kindOf(f){return f.type.indexOf('image/')===0?'image':(f.type.indexOf('video/')===0?'video':(f.type.indexOf('audio/')===0?'audio':'file'))}
@@ -3739,7 +3844,7 @@ function renderAssets(){var box=document.getElementById('assets'),m=document.get
   if(boardMode&&roleBoard){var add=el('div','asset');add.innerHTML='<b>LORA</b>'+loraSelect('loraAddSel','','')+'<button onclick="addLoraCard()">+ ADD</button>';box.appendChild(add);box.classList.add('on')}
   renderDirectorTimeline();
   renderReferenceBoard();
-  document.getElementById('upinfo').textContent=picked.length?(m==='video'?'Director 자료 '+picked.length+'개':'사진 '+picked.length+'장 첨부됨'):''
+  document.getElementById('upinfo').textContent=picked.length?(m==='video'?'Director 자료 '+picked.length+'개':(m==='song_reference'?'참고곡 '+picked.filter(function(a){return a&&a.kind==='audio'}).length+'개 첨부됨':'사진 '+picked.length+'장 첨부됨')):''
 }
 function filePick(){var fs=document.getElementById('files').files,done=0;
   addPickedFiles(fs,pickRole);
@@ -3750,10 +3855,11 @@ function gen(){var m=document.getElementById('mode').value,p=document.getElement
   if((gb&&gb.disabled)||missing.length){alert('준비되지 않은 기능이에요.\n'+missing.join('\n'));return}
   saveTextDraft();
   var hasSegs=(m==='video')&&picked.some(function(a){return a&&a.kind==='text'&&(a.prompt||'').trim()});
-  if((m==='image'||m==='video'||m==='song'||m.indexOf('custom:')===0)&&!t&&!hasSegs){p.classList.add('shake');setTimeout(function(){p.classList.remove('shake')},300);return}
+  if((m==='image'||m==='video'||m==='song'||m==='song_reference'||m.indexOf('custom:')===0)&&!t&&!hasSegs){p.classList.add('shake');setTimeout(function(){p.classList.remove('shake')},300);return}
   var imageData=picked.filter(function(x){return x&&x.kind==='image'&&x.enabled!==false}).map(function(x){return x.data});
   if(m==='klein'&&imageData.length<1){alert('사진 1장을 첨부하세요');return}
   if(m==='faceswap'&&imageData.length<2){alert('사진 2장(몸→얼굴)을 첨부하세요');return}
+  if(m==='song_reference'&&!picked.some(function(a){return a&&a.kind==='audio'})){alert('참고할 음악 파일 1개를 추가하세요');return}
   var custom=CUSTOMS.find(function(x){return x.mode===m});
   var assetImageCount=picked.filter(function(a){return a&&a.kind==='image'&&a.enabled!==false}).length;
   if(custom&&custom.image_inputs&&(imageData.length+assetImageCount)<custom.image_inputs){alert('image ' + custom.image_inputs + ' required');return}

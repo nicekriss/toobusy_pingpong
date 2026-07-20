@@ -118,6 +118,15 @@
 - `선택 삭제` asks for confirmation and moves all unique selected image files through the existing `.trash` delete API.
 - Verified a marquee over three cards yields `3개 카드 · 3개 파일` and enables the delete button; no user files were deleted during testing.
 
+## 2026-07-14 참고곡 기반 음악 생성
+
+- 텔레그램 음원(audio/voice/audio document)을 ACE Step 1.5 전역 timbre reference로 연결
+- `🎧 참고곡 음악` 메뉴와 `.음악참고`, `.참고음악`, `.musicref` 명령 추가
+- 음원+캡션 한 번 전송 또는 음원→설명 순차 입력 지원
+- 원곡 구조를 복제하는 cover 대신 음색·믹싱·연주 질감만 참고하고 새 멜로디/가사를 생성
+- 참고 음원은 ComfyUI input의 `pingpong_audio_refs/`에 보존하고 생성 메타데이터에 기록
+- 대시보드에 `참고곡 음악` 모드와 `🎧 참고곡` 파일 입력을 추가하고 동일 생성기로 연결
+
 ## 2026-07-16
 
 ### 오늘 한 일
@@ -126,3 +135,13 @@
   - 영상이 많아지면 VIDEO LIST가 무한정 길어져 옆 플레이어(.crt)까지 같이 늘어나며 레이아웃이 무너지던 문제
   - `#vrows`를 `.vlist` 안에서 absolute + overflow-y:auto로 바꿔 리스트가 항상 플레이어 높이에 맞춰 내부 스크롤되게 함
   - 영상 생성 모드(.videoMode)의 기존 그리드(132px) 레이아웃은 position:static으로 유지
+
+## 2026-07-20 직접비교 와이프 뷰어 영상 지원
+
+- 직접비교(MANUAL COMPARE)에서 영상끼리도 와이프 비교 가능 (예: 왼쪽 저화질 원본 vs 오른쪽 업스케일)
+- VIDEO LIST 각 행에 `L`/`R` 버튼 추가 + 드래그로 작업대에 영상 드롭 가능, 탐색기 영상 파일·`파일 추가`도 지원
+- 와이프 뷰어에 `<video>` 쌍을 추가하고 좌측 영상에 동일한 clipPath 와이프 적용, 줌/팬/1:1도 videoWidth 기준으로 동작
+- 동기 재생 엔진: 재생/일시정지(Space), 시크바, 반복(∞), 소리 토글, ←→ 프레임 스텝(Shift=1초), 100ms 인터벌로 드리프트 0.08초 이상이면 좌측을 우측(마스터)에 맞춤
+- rAF 대신 setInterval을 써서 탭이 가려져도 동기화 루프가 멈추지 않게 함
+- 변형(칩) 교체 시 현재 재생 위치를 유지한 채 이어서 비교
+- 이미지 비교·번들 비교·CONTROL SOURCE 기존 동작은 그대로 유지 (실서버에서 이미지/영상 양쪽 회귀 확인)
