@@ -105,7 +105,7 @@ def has_model(expected, options):
 FEATURE_CHECKS = [
     ("이미지 ZIT", ["ToobusyZImageTurbo", "ToobusyHiresUpscale"], "ToobusyZImageTurbo", "model_name", "zit"),
     ("영상 LTX Director", ["LTXDirector", "UnetLoaderGGUF", "VAEDecodeTiled"], "UnetLoaderGGUF", "unet_name", "ltx_gguf"),
-    ("음악 ACE", ["TextEncodeAceStepAudio1.5"], "UNETLoader", "unet_name", "ace"),
+    ("음악 ACE", ["TextEncodeAceStepAudio1.5", "LoadAudio", "VAEEncodeAudio", "ReferenceTimbreAudio"], "UNETLoader", "unet_name", "ace"),
     ("Flux2 Klein 보드", ["ToobusyFlux2Klein", "ToobusyReferenceBoard"], "ToobusyFlux2Klein", "model_name", "klein"),
 ]
 

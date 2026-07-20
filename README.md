@@ -37,7 +37,7 @@ ComfyUI Manager 등으로 설치. **봇을 켜면 사전점검이 "뭐가 없는
 - **이미지(ZIT):** `ToobusyZImageTurbo`, `ToobusyHiresUpscale`
 - **인물합성/스왑(Klein):** `ToobusyFlux2Klein`, `ToobusyFlux2KleinPromptDirector`, `ToobusyReferenceBoard`
 - **영상(LTX 2.3):** `LTXDirector` 계열, `UnetLoaderGGUF`(ComfyUI-GGUF), `VAEDecodeTiled`, KJNodes(`VAELoaderKJ` 등)
-- **음악(ACE Step 1.5):** `TextEncodeAceStepAudio1.5`, `EmptyAceStep1.5LatentAudio` 등
+- **음악(ACE Step 1.5):** `TextEncodeAceStepAudio1.5`, `EmptyAceStep1.5LatentAudio`, `ReferenceTimbreAudio`, `VAEEncodeAudio` 등
 
 ---
 
@@ -94,6 +94,10 @@ LAN 공개 상태에서는 삭제/정지/재시작/모델 변경/모델 다운�
 
 하단 버튼 또는 번호로 선택:
 - **1️⃣ 이미지** / **2️⃣ 영상** / **3️⃣ 음악** → 버튼 누르면 설명을 물어봄
+- **🎧 참고곡 음악** → MP3/WAV/M4A/FLAC/OGG 등을 보내고 새 곡의 분위기·주제를 설명
+- 음원 캡션에 **`.음악참고 새 곡 설명`**을 적어 한 번에 실행할 수도 있음
+  - 참고곡의 음색·믹싱·연주 질감을 반영하되 새 멜로디와 새 가사를 생성하는 모드
+- 대시보드에서는 생성 모드 **`참고곡 음악`** 선택 → **`🎧 참고곡`** 버튼으로 음원 추가 → 설명 입력 → 생성
 - **4️⃣ 인물합성/편집** → 사진 1장 (+ 원하는 장면)
 - **5️⃣ 페이스스왑** → 사진 2장 (몸 → 얼굴 순서)
 - 사진을 그냥 보내면 → "뭘 할까요?" 물어봄

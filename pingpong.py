@@ -204,6 +204,8 @@ def run_job(job):
         do_compare(job)
     elif m == "score":
         do_score(job)
+    elif m == "song_reference":
+        do_song_reference_rel(txt, job["reference_audio"])
     elif m in ("image", "video", "song"):
         assets = job.get("director_assets") or []
         has_seg = m == "video" and any(
@@ -315,8 +317,10 @@ HELP = (
     "1️⃣ 이미지   2️⃣ 영상   3️⃣ 음악\n"
     "4️⃣ 인물합성(사진1장)\n"
     "5️⃣ 페이스스왑(사진2장)\n"
+    "🎧 참고곡 음악(음원1개+설명)\n"
     "▰▰▰▰▰▰▰▰▰▰▰▰▰▰\n"
     "✧ 버튼 누르면 뭐 필요한지 물어봐요\n"
+    "✧ 음원에 .음악참고 설명을 붙이면 새 곡 생성 🎧\n"
     "✧ 그냥 글만 보내도 → 이미지 ✏️\n"
     "✧ 언제든 취소: .취소  (/취소도 가능)\n"
     "🦗 너무바쁜베짱이 · 코다 & 크룩스"
@@ -386,8 +390,9 @@ def start_dashboard():
 
 # ---------- Telegram ----------
 MENU_KB = {"keyboard": [["1️⃣ 이미지", "2️⃣ 영상"],
-                        ["3️⃣ 음악", "4️⃣ 인물합성"],
-                        ["5️⃣ 페이스스왑", "❓ 도움말"],
+                        ["3️⃣ 음악", "🎧 참고곡 음악"],
+                        ["4️⃣ 인물합성", "5️⃣ 페이스스왑"],
+                        ["❓ 도움말"],
                         ["⚔️ 모델대결"]],
            "resize_keyboard": True}
 
@@ -426,6 +431,7 @@ def tg_download(file_id, dest):
     os.makedirs(os.path.dirname(dest), exist_ok=True)
     with open(dest, "wb") as f:
         f.write(data)
+    return dest
 
 # ---------- LM Studio (LLM) ----------
 def lms(*args):
@@ -1772,10 +1778,29 @@ def inject_ltx(prompt, director_assets=None, settings=None):
     wf["37"]["inputs"]["filename_prefix"] = f"pingpong/vid_{tag}"
     return wf, "37"
 
-def inject_ace(tags, lyrics, title_text=""):
+def inject_ace(tags, lyrics, title_text="", reference_audio=""):
     wf = load_wf("audio_ace_step1_5_xl_turbo_API.json"); tag = tag_now()
     wf["94"]["inputs"]["tags"] = tags
     wf["94"]["inputs"]["lyrics"] = lyrics
+    if reference_audio:
+        # 전역 timbre reference: 곡 구조 대신 음색/믹싱/연주 질감을 참고한다.
+        wf["94"]["inputs"]["generate_audio_codes"] = False
+        wf["110"] = {
+            "inputs": {"audio": reference_audio},
+            "class_type": "LoadAudio",
+            "_meta": {"title": "Load Reference Audio"},
+        }
+        wf["111"] = {
+            "inputs": {"audio": ["110", 0], "vae": ["106", 0]},
+            "class_type": "VAEEncodeAudio",
+            "_meta": {"title": "Encode Reference Audio"},
+        }
+        wf["112"] = {
+            "inputs": {"conditioning": ["94", 0], "latent": ["111", 0]},
+            "class_type": "ReferenceTimbreAudio",
+            "_meta": {"title": "Set Reference Audio"},
+        }
+        wf["3"]["inputs"]["positive"] = ["112", 0]
     if MODELS.get("ace"):
         wf["104"]["inputs"]["unet_name"] = MODELS["ace"]
     apply_model_overrides(wf, "song", {})
@@ -2072,6 +2097,66 @@ def do_text(mode, body, director_assets=None, settings=None):
     tg_send_file(kind, files[0], caption=payload_desc)
     comfy_free()
 
+def _telegram_audio(msg):
+    """Telegram audio/voice 또는 audio 문서를 하나의 메타 형식으로 반환."""
+    for field in ("audio", "voice"):
+        item = msg.get(field)
+        if isinstance(item, dict) and item.get("file_id"):
+            return item
+    doc = msg.get("document")
+    if isinstance(doc, dict) and str(doc.get("mime_type") or "").lower().startswith("audio/"):
+        return doc
+    return None
+
+def _audio_extension(item):
+    name = os.path.basename(str((item or {}).get("file_name") or ""))
+    ext = os.path.splitext(name)[1].lower()
+    allowed = {".mp3", ".wav", ".flac", ".m4a", ".aac", ".ogg", ".opus", ".webm", ".mp4"}
+    if ext in allowed:
+        return ext
+    mime = str((item or {}).get("mime_type") or "").lower()
+    return {
+        "audio/mpeg": ".mp3", "audio/wav": ".wav", "audio/x-wav": ".wav",
+        "audio/flac": ".flac", "audio/mp4": ".m4a", "audio/aac": ".aac",
+        "audio/ogg": ".ogg", "audio/opus": ".opus", "audio/webm": ".webm",
+    }.get(mime, ".ogg")
+
+def download_audio_ref(item):
+    """참고 음원을 ComfyUI input 폴더에 보존하고 LoadAudio용 상대경로 반환."""
+    if not item or not item.get("file_id"):
+        raise ValueError("참고 음원 file_id가 없습니다")
+    tag = tag_now() + f"_{random.randint(100,999)}"
+    filename = f"pp_music_ref_{tag}{_audio_extension(item)}"
+    rel = f"pingpong_audio_refs/{filename}"
+    tg_download(item["file_id"], os.path.join(INPUTDIR, "pingpong_audio_refs", filename))
+    return rel
+
+def do_song_reference_rel(body, ref_rel):
+    """ComfyUI input의 참고 음원을 조건으로 새 멜로디/가사의 곡을 생성."""
+    body = (body or "참고곡의 분위기와 질감을 살린 새로운 곡").strip()
+    tg_send(f"🎧▸ 참고곡 접수! 새 멜로디와 가사를 구상 중...\n> {body}")
+    comfy_free()
+    mid = llm_up()
+    try:
+        tags, lyrics = llm_song(mid, body)
+    finally:
+        llm_down()
+    payload_desc = f"🎵 태그: {tags}"
+    log("REFERENCE SONG PAYLOAD:", payload_desc[:200], "ref=", ref_rel)
+    wf, save = inject_ace(tags, lyrics, body, reference_audio=ref_rel)
+    tg_send(f"🎼▸ 참고곡 분위기로 작곡 중 ░▒▓█▓▒░ ♪♬\n{payload_desc}")
+    files = comfy_run(wf, save)
+    write_generation_meta(
+        files, "song_reference", body, f"TAGS:\n{tags}\n\nLYRICS:\n{lyrics}",
+        extra={"reference_audio": ref_rel, "reference_mode": "timbre"},
+    )
+    tg_send_file("audio", files[0], caption=("🎧 참고곡 분위기 반영 · 새 멜로디/가사\n" + payload_desc)[:1000])
+    comfy_free()
+
+def do_song_reference(body, audio_item):
+    """Telegram 참고 음원을 저장한 뒤 공통 참고곡 생성기로 전달."""
+    do_song_reference_rel(body, download_audio_ref(audio_item))
+
 def download_ref(file_id):
     """텔레그램 사진을 ComfyUI input 폴더에 저장하고 상대경로 반환."""
     tag = tag_now() + f"_{random.randint(100,999)}"
@@ -2127,9 +2212,11 @@ def do_klein_board(reference_assets, goal, settings=None, flags=None):
 
 # 단계별 대화 상태 (단일 사용자 가정)
 STATE = {"flow": None, "goal": "", "char_rel": None, "pending_photo": None, "pending_cap": "",
+         "pending_audio": None,
          "cmp_a": None, "cmp_b": None, "cmp_enhance": False}
 def reset_state():
     STATE.update({"flow": None, "goal": "", "char_rel": None, "pending_photo": None, "pending_cap": "",
+                  "pending_audio": None,
                   "cmp_a": None, "cmp_b": None, "cmp_enhance": False})
 
 SWAP_KW = ("/페이스스왑", "/faceswap", "/얼굴바꾸기", "/얼굴")
@@ -2139,7 +2226,7 @@ def menu_pick(text):
     t = text.strip()
     if t and t[0] in "12345" and len(t) <= 2:   # "1" ~ "5" (이모지 숫자 키 제외)
         return {"1": "image", "2": "video", "3": "song", "4": "klein", "5": "faceswap"}[t[0]]
-    for kw, m in (("모델대결", "compare"), ("이미지", "image"), ("영상", "video"), ("음악", "song"),
+    for kw, m in (("참고곡 음악", "song_ref"), ("모델대결", "compare"), ("이미지", "image"), ("영상", "video"), ("음악", "song"),
                   ("인물합성", "klein"), ("페이스스왑", "faceswap"), ("도움말", "help")):
         if kw in t:
             return m
@@ -2153,6 +2240,9 @@ def start_mode(mode):
         STATE["flow"] = "await_video"; tg_send("🎬 어떤 영상? 설명을 보내주세요. (대사는 \"따옴표\")")
     elif mode == "song":
         STATE["flow"] = "await_song"; tg_send("🎵 어떤 음악? 주제/분위기를 보내주세요.")
+    elif mode == "song_ref":
+        STATE["flow"] = "await_song_ref_audio"
+        tg_send("🎧 참고할 음악 파일을 보내주세요.\n캡션에 원하는 새 곡 설명을 같이 적어도 돼요.\n예: 따뜻한 새벽 감성의 한국어 여성 보컬곡")
     elif mode == "klein":
         STATE["flow"] = "await_klein"; tg_send("🎭 인물 사진 1장을 보내주세요. (캡션에 원하는 장면)")
     elif mode == "faceswap":
@@ -2170,6 +2260,7 @@ def handle_message(msg):
     low = text.lower()
     command_low = _slash_command(low)
     photo = msg.get("photo")
+    audio = _telegram_audio(msg)
     f = STATE["flow"]
 
     # 취소
@@ -2179,6 +2270,34 @@ def handle_message(msg):
     # 메뉴/도움말
     if command_low in ("/start", "/메뉴", "/menu", "메뉴"):
         send_menu("🏓 핑퐁 봇\n" + help_text()); return
+
+    # `.음악참고 설명` + 음원, 또는 명령 후 음원/설명을 차례로 입력.
+    ref_commands = ("/음악참고", "/참고음악", "/musicref")
+    ref_command = next((k for k in ref_commands if command_low.startswith(k)), None)
+    if ref_command:
+        body = text[len(ref_command):].strip()
+        if audio:
+            reset_state(); do_song_reference(body, audio)
+            send_menu("✦･ﾟ: 참고곡 음악 완성! :ﾟ･✦  다음은?"); return
+        STATE["flow"] = "await_song_ref_audio"; STATE["goal"] = body
+        tg_send("🎧 참고할 음악 파일을 보내주세요." + ("\n요청: " + body if body else "\n파일 뒤에 원하는 새 곡 설명도 이어서 받을게요.")); return
+
+    if f == "await_song_ref_audio":
+        if not audio:
+            tg_send("🎧 MP3/WAV/M4A/FLAC/OGG 같은 음악 파일을 보내주세요. (취소: .취소)"); return
+        body = text.strip() or STATE.get("goal", "").strip()
+        if body:
+            reset_state(); do_song_reference(body, audio)
+            send_menu("✦･ﾟ: 참고곡 음악 완성! :ﾟ･✦  다음은?"); return
+        STATE["pending_audio"] = audio; STATE["flow"] = "await_song_ref_prompt"
+        tg_send("✅ 참고곡 접수! 어떤 새 곡으로 만들까요?\n예: 비 오는 새벽의 몽환적인 한국어 여성 보컬곡"); return
+
+    if f == "await_song_ref_prompt":
+        if not text:
+            tg_send("✏️ 원하는 새 곡의 주제나 분위기를 글로 보내주세요. (취소: .취소)"); return
+        item = STATE.get("pending_audio"); reset_state()
+        do_song_reference(text, item)
+        send_menu("✦･ﾟ: 참고곡 음악 완성! :ﾟ･✦  다음은?"); return
 
     # 사진을 받고 '뭘 할지' 고르는 단계 (메뉴매칭보다 먼저 처리)
     if f == "photo_action":
@@ -2265,7 +2384,7 @@ def handle_message(msg):
         return
 
     # 메뉴 버튼/숫자 선택 (사진 없는 순수 텍스트)
-    if not photo:
+    if not photo and not audio:
         picked = menu_pick(text)
         if picked == "help":
             send_menu("🏓 핑퐁 봇\n" + help_text()); return
@@ -2326,6 +2445,9 @@ def handle_message(msg):
         STATE["flow"] = "photo_action"
         STATE["pending_photo"] = photo[-1]["file_id"]; STATE["pending_cap"] = text
         tg_send("📷✨ 사진 접수! 이걸로 뭘 할까요? ✨", PHOTO_KB); return
+    if audio:
+        STATE["pending_audio"] = audio; STATE["flow"] = "await_song_ref_prompt"
+        tg_send("🎧 참고곡으로 사용할게요. 어떤 새 곡으로 만들까요?\n예: 이 질감의 몽환적인 한국어 여성 보컬곡\n(취소: .취소)"); return
     mode, body = detect_mode(text)
     do_text(mode, body)
 
@@ -2363,7 +2485,7 @@ def _has(filename, available):
 FEATURE_CHECKS = [
     ("이미지(ZIT)", ["ToobusyZImageTurbo", "ToobusyHiresUpscale"], "ToobusyZImageTurbo", "model_name", "zit"),
     ("영상(LTX)", ["LTXDirector", "UnetLoaderGGUF", "VAEDecodeTiled"], "UnetLoaderGGUF", "unet_name", "ltx_gguf"),
-    ("음악(ACE)", ["TextEncodeAceStepAudio1.5"], "UNETLoader", "unet_name", "ace"),
+    ("음악(ACE)", ["TextEncodeAceStepAudio1.5", "LoadAudio", "VAEEncodeAudio", "ReferenceTimbreAudio"], "UNETLoader", "unet_name", "ace"),
     ("인물합성/스왑(Klein)", ["ToobusyFlux2Klein", "ToobusyReferenceBoard"], "ToobusyFlux2Klein", "model_name", "klein"),
 ]
 
@@ -2424,7 +2546,7 @@ def main():
                 msg = upd.get("message") or {}
                 if msg.get("chat", {}).get("id") != CHAT:
                     continue
-                if not (msg.get("text") or msg.get("photo")):
+                if not (msg.get("text") or msg.get("photo") or msg.get("audio") or msg.get("voice") or msg.get("document")):
                     continue
                 try:
                     handle_message(msg)
