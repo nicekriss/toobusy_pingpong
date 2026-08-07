@@ -765,7 +765,9 @@ def llm_up(model=None):
     model = model or current_llm_model()
     lms("server", "start")
     log("lms load", model)
-    r = lms("load", model, "-y", "--gpu", "max")
+    # context-length를 제한하지 않으면 모델 기본값(예: 12만 토큰)의 KV캐시가 VRAM을
+    # 넘치게 해 프롬프트 처리가 수십 배 느려질 수 있다 (2026-07-07 확인)
+    r = lms("load", model, "-y", "--gpu", "max", "--context-length", "8192")
     if r.returncode != 0:
         raise RuntimeError(f"lms load failed: {r.stderr or r.stdout}")
     for _ in range(30):

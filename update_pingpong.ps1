@@ -22,6 +22,33 @@ function Invoke-Git {
     }
 }
 
+function Get-DefaultBranch {
+    # The updater has to follow the repo's release branch, not whichever branch
+    # this folder happens to be sitting on. A stale feature branch has nothing
+    # new to pull, so tracking "current branch" reports "already up to date"
+    # forever while the real branch moves ahead.
+    $ref = & git -C $Repo symbolic-ref --quiet refs/remotes/origin/HEAD
+    if ($LASTEXITCODE -eq 0 -and $ref) {
+        return ($ref -join "").Trim() -replace '^refs/remotes/origin/', ''
+    }
+    # origin/HEAD is missing on some clones; ask the remote itself.
+    $lines = & git -C $Repo ls-remote --symref origin HEAD
+    if ($LASTEXITCODE -eq 0) {
+        foreach ($line in $lines) {
+            if ($line -match '^ref:\s+refs/heads/(\S+)\s+HEAD') { return $Matches[1] }
+        }
+    }
+    return "main"
+}
+
+function Get-CommitCount([string]$Range) {
+    $raw = (& git -C $Repo rev-list --count $Range) -join ""
+    if ($LASTEXITCODE -ne 0) {
+        throw "커밋 수를 확인하지 못했습니다: $Range"
+    }
+    return [int]$raw.Trim()
+}
+
 try {
     Write-Host ""
     Write-Host "==========================================" -ForegroundColor DarkGreen
@@ -38,39 +65,53 @@ try {
     Write-Step "새 버전을 확인합니다..."
     Invoke-Git fetch --prune origin
 
-    $Branch = (& git -C $Repo branch --show-current).Trim()
-    if ($LASTEXITCODE -ne 0 -or -not $Branch) {
-        throw "현재 Git 브랜치를 확인할 수 없습니다."
-    }
+    $Target = Get-DefaultBranch
     $OldHead = (& git -C $Repo rev-parse HEAD).Trim()
 
-    & git -C $Repo show-ref --verify --quiet "refs/remotes/origin/$Branch"
+    & git -C $Repo show-ref --verify --quiet "refs/remotes/origin/$Target"
     if ($LASTEXITCODE -ne 0) {
-        throw "원격 저장소에 '$Branch' 브랜치가 없습니다. 일반 사용자는 main 브랜치에서 실행해 주세요."
+        throw "원격 저장소에서 '$Target' 브랜치를 찾을 수 없습니다. 인터넷 연결을 확인해 주세요."
     }
 
-    $Behind = [int]((& git -C $Repo rev-list --count "HEAD..origin/$Branch").Trim())
-    $Ahead = [int]((& git -C $Repo rev-list --count "origin/$Branch..HEAD").Trim())
+    # Empty on a detached HEAD, so don't call .Trim() on it blindly.
+    $Branch = (& git -C $Repo branch --show-current) -join ""
+    $Branch = $Branch.Trim()
+
+    $Ahead = Get-CommitCount "origin/$Target..HEAD"
     if ($Ahead -gt 0) {
-        throw "이 폴더에는 배포본에 없는 로컬 커밋이 $Ahead개 있습니다. 제작자에게 문의해 수동으로 병합해 주세요."
+        # Hangul is a valid identifier character, so "$Ahead개" parses as a
+        # variable named "Ahead개" and silently interpolates to nothing.
+        throw "이 폴더에는 배포본에 없는 로컬 커밋이 $($Ahead)개 있습니다. 제작자에게 문의해 수동으로 병합해 주세요."
     }
-    if ($Behind -eq 0) {
+
+    $Behind = Get-CommitCount "HEAD..origin/$Target"
+    $OnTarget = ($Branch -eq $Target)
+
+    if ($Behind -eq 0 -and $OnTarget) {
         Write-Host "`n이미 최신 버전입니다." -ForegroundColor Green
         exit 0
     }
 
-    if (-not $CheckOnly -and -not $AcceptedFromApp) {
+    if (-not $OnTarget) {
+        if ($Branch) {
+            Write-Host "현재 '$Branch' 브랜치에 있습니다. 배포 브랜치 '$Target'으로 되돌립니다." -ForegroundColor Yellow
+        } else {
+            Write-Host "현재 브랜치가 분리된 상태입니다. 배포 브랜치 '$Target'으로 되돌립니다." -ForegroundColor Yellow
+        }
+    }
+    if ($Behind -gt 0) {
+        Write-Host "새 커밋 $($Behind)개가 있습니다."
+    }
+    if ($CheckOnly) {
+        Write-Host "확인 모드이므로 파일은 변경하지 않았습니다." -ForegroundColor Yellow
+        exit 0
+    }
+    if (-not $AcceptedFromApp) {
         $Answer = Read-Host "이 패치를 적용할까요? (y/N)"
         if ($Answer -notin @("y", "Y", "yes", "YES")) {
             Write-Host "사용자가 패치를 취소했습니다." -ForegroundColor Yellow
             exit 0
         }
-    }
-
-    Write-Host "새 커밋 $Behind개가 있습니다."
-    if ($CheckOnly) {
-        Write-Host "확인 모드이므로 파일은 변경하지 않았습니다." -ForegroundColor Yellow
-        exit 0
     }
 
     $OldRequirements = $null
@@ -86,8 +127,13 @@ try {
         $DidStash = $true
     }
 
+    if (-not $OnTarget) {
+        Write-Step "'$Target' 브랜치로 전환합니다..."
+        Invoke-Git checkout $Target
+    }
+
     Write-Step "프로그램 파일을 받습니다..."
-    Invoke-Git merge --ff-only "origin/$Branch"
+    Invoke-Git merge --ff-only "origin/$Target"
 
     if ($DidStash) {
         Write-Step "기존 로컬 파일을 복원합니다..."
