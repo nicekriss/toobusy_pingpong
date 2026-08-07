@@ -1,5 +1,28 @@
 # 작업일지
 
+## 2026-07-07
+
+### 오늘 한 일
+
+- RedCraft(Krea2 GGUF) 2스테이지 워크플로 등록
+  - `workflows/image_redcraft_2stage_API.json` 추가 (베이스 1024 → 4x-UltraSharp 하이레즈 → FaceDetailer, ImpactSwitch 스위치 2개 포함)
+  - `/레드` (풀 파이프라인), `/레드기본` (스위치 꺼서 베이스만, set_nodes로 select=1 주입) 두 트리거 등록
+  - 필요 노드(ComfyUI-GGUF, Impact Pack/Subpack)와 모델(face_yolov8m, 4x-UltraSharp, RedCraft GGUF)은 C:\comfy ComfyUI 쪽에 설치·배치 완료
+
+- 프롬프트 LLM을 무검열 모델로 교체
+  - `llm_model`: google/gemma-4-e4b → cognitivecomputations_dolphin-mistral-24b-venice-edition (Q4_K_S 12.6GB, 1.5초 응답 확인)
+  - qwen3.5-35b-a3b-uncensored는 /no_think 무시하고 사고 토큰만 소모해 부적합 판정
+  - 주의: dolphin은 텍스트 전용이라 `refsheet_video`(비전) 계열은 이 모델로 동작 안 함
+
+- `llm_up()`에 `--context-length 8192` 추가
+  - 모델 기본 컨텍스트(예: 12만)로 로드되면 KV캐시가 VRAM을 넘쳐 프롬프트 처리가 수십 배 느려지는 문제 방지 (16GB GPU에서 재현·확인)
+
+### 검증
+
+- config.json 파싱 + 노드 매핑(프롬프트 4, 시드 7/13/16, prefix 17, 스위치 18/19) 실파일 대조 확인
+- healthcheck.py 통과 (redcraft 워크플로 누락 노드 없음)
+- dolphin 모델로 봇과 동일한 형식(system+user)의 프롬프트 생성 호출 1.5초 확인
+
 ## 2026-06-24
 
 ### 오늘 한 일
