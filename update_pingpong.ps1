@@ -1,5 +1,6 @@
 param(
-    [switch]$CheckOnly
+    [switch]$CheckOnly,
+    [switch]$AcceptedFromApp
 )
 
 $ErrorActionPreference = "Stop"
@@ -7,6 +8,7 @@ $Repo = Split-Path -Parent $MyInvocation.MyCommand.Path
 $Stamp = Get-Date -Format "yyyyMMdd-HHmmss"
 $StashMessage = "pingpong-auto-update-$Stamp"
 $DidStash = $false
+$OldHead = $null
 
 function Write-Step([string]$Message) {
     Write-Host "`n[업데이트] $Message" -ForegroundColor Cyan
@@ -40,6 +42,7 @@ try {
     if ($LASTEXITCODE -ne 0 -or -not $Branch) {
         throw "현재 Git 브랜치를 확인할 수 없습니다."
     }
+    $OldHead = (& git -C $Repo rev-parse HEAD).Trim()
 
     & git -C $Repo show-ref --verify --quiet "refs/remotes/origin/$Branch"
     if ($LASTEXITCODE -ne 0) {
@@ -54,6 +57,14 @@ try {
     if ($Behind -eq 0) {
         Write-Host "`n이미 최신 버전입니다." -ForegroundColor Green
         exit 0
+    }
+
+    if (-not $CheckOnly -and -not $AcceptedFromApp) {
+        $Answer = Read-Host "이 패치를 적용할까요? (y/N)"
+        if ($Answer -notin @("y", "Y", "yes", "YES")) {
+            Write-Host "사용자가 패치를 취소했습니다." -ForegroundColor Yellow
+            exit 0
+        }
     }
 
     Write-Host "새 커밋 $Behind개가 있습니다."
@@ -86,8 +97,9 @@ try {
             Write-Host "업데이트는 완료됐지만 로컬 수정 파일을 자동으로 합치지 못했습니다." -ForegroundColor Yellow
             Write-Host "파일은 삭제되지 않았습니다. 이 창의 내용을 제작자에게 보내 주세요." -ForegroundColor Yellow
             Write-Host "복구용 stash 이름: $StashMessage" -ForegroundColor Yellow
-            exit 2
+            throw "로컬 수정 파일 자동 복원에 실패했습니다. 원본은 Git stash에 남아 있습니다."
         }
+        $DidStash = $false
     }
 
     $NewRequirements = $null
@@ -102,11 +114,31 @@ try {
         }
     }
 
+    $MigrationScript = Join-Path $Repo "update_manager.py"
+    if (Test-Path $MigrationScript) {
+        Write-Step "개인 설정을 새 버전에 안전하게 맞춥니다..."
+        $PythonExe = Join-Path $Repo ".venv\Scripts\python.exe"
+        if (-not (Test-Path $PythonExe)) {
+            $PythonExe = (Get-Command python -ErrorAction Stop).Source
+        }
+        & $PythonExe $MigrationScript migrate
+        if ($LASTEXITCODE -ne 0) {
+            throw "프로그램은 갱신됐지만 개인 설정 마이그레이션에 실패했습니다. 백업은 그대로 보존됩니다."
+        }
+    }
+
     Write-Host "`n업데이트가 완료됐습니다. 개인 설정과 생성 파일은 그대로 유지됩니다." -ForegroundColor Green
     exit 0
 }
 catch {
     Write-Host "`n[업데이트 실패] $($_.Exception.Message)" -ForegroundColor Red
+    if ($AcceptedFromApp -and $OldHead) {
+        $CurrentHead = (& git -C $Repo rev-parse HEAD 2>$null).Trim()
+        if ($CurrentHead -and $CurrentHead -ne $OldHead) {
+            Write-Host "적용 전 프로그램 버전으로 되돌립니다..." -ForegroundColor Yellow
+            & git -C $Repo reset --hard $OldHead | Out-Host
+        }
+    }
     if ($DidStash) {
         Write-Host "로컬 파일은 Git stash에 보관되어 있습니다: $StashMessage" -ForegroundColor Yellow
     }

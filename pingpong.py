@@ -12,8 +12,25 @@ VRAM 핑퐁 오케스트레이터 (멀티모드)
 핵심: 24GB 단일 GPU에서 LLM과 ComfyUI가 번갈아 VRAM 점유.
  LLM 올리기 전 ComfyUI /free 필수(동시 상주 시 OOM). LLM은 '생각하는 순간'만 VRAM.
 """
-import os, sys, json, copy, time, random, subprocess, traceback, re, threading, unicodedata, base64, mimetypes, uuid, urllib.parse, webbrowser
+import os, sys, json, copy, time, random, subprocess, traceback, re, threading, unicodedata, base64, mimetypes, uuid, urllib.parse, webbrowser, tempfile, shutil
 import requests
+from onboarding import ensure_config
+import browser_agent
+from agent_core import (
+    build_tool_catalog,
+    format_plan,
+    is_likely_followup,
+    parse_agent_plan,
+    planner_system_prompt,
+    planner_user_prompt,
+    prepare_song_request,
+)
+from agent_controls import (
+    format_control_changes,
+    is_control_request,
+    is_settings_only_request,
+    parse_control_request,
+)
 try:
     import websocket
 except Exception:
@@ -46,23 +63,15 @@ def auto_comfy_dirs():
     return os.path.join(base, "output"), os.path.join(base, "input")
 
 
-if not os.path.exists(CFG_PATH):
-    print("=" * 52)
-    print("  ⚠️  config.json 이 없습니다.")
-    print("  먼저 '설치.bat' 을 실행해 초기 설정을 해주세요.")
-    print("  (텔레그램 토큰 입력 → 자동 설정)")
-    print("=" * 52, flush=True)
-    sys.exit(1)
-
-CFG = json.load(open(CFG_PATH, encoding="utf-8"))
+CFG, _CONFIG_CREATED = ensure_config(CFG_PATH)
 _auto_out, _auto_in = auto_comfy_dirs()
 
-TG       = f"https://api.telegram.org/bot{CFG['telegram_token']}"
-TOKEN    = CFG["telegram_token"]
-CHAT     = CFG["telegram_chat_id"]
+TOKEN    = str(CFG.get("telegram_token") or "").strip()
+CHAT     = CFG.get("telegram_chat_id") or 0
+TG       = f"https://api.telegram.org/bot{TOKEN}" if TOKEN else ""
 COMFY    = CFG.get("comfy_api", "http://127.0.0.1:8188").rstrip("/")
 LMAPI    = CFG.get("lmstudio_api", "http://127.0.0.1:1234").rstrip("/")
-MODEL    = CFG["llm_model"]
+MODEL    = CFG.get("llm_model", "")
 OUTDIR   = CFG.get("comfy_output_dir") or _auto_out
 INPUTDIR = CFG.get("comfy_input_dir") or _auto_in
 DASHBOARD_PORT = int(CFG.get("dashboard_port", 8910))
@@ -82,15 +91,25 @@ def model_of(key):
     return MODELS.get(key) or DEFAULT_MODELS[key]
 
 def reload_runtime_config():
-    global CFG, CUSTOM, MODELS
+    global CFG, CUSTOM, MODELS, TOKEN, CHAT, TG
     try:
-        latest = json.load(open(CFG_PATH, encoding="utf-8"))
+        with open(CFG_PATH, encoding="utf-8") as f:
+            latest = json.load(f)
         CFG = latest
         CUSTOM = latest.get("custom_workflows", {}) or {}
         MODELS = latest.get("models", {}) or {}
+        TOKEN = str(latest.get("telegram_token") or "").strip()
+        CHAT = latest.get("telegram_chat_id") or 0
+        TG = f"https://api.telegram.org/bot{TOKEN}" if TOKEN else ""
     except Exception as e:
         log("config reload failed:", e)
     return CFG
+
+
+def telegram_enabled():
+    cfg = reload_runtime_config()
+    # Old configs did not have this switch, so valid existing Telegram setups stay enabled.
+    return bool(cfg.get("telegram_enabled", True) and TOKEN and CHAT)
 
 def model_override_key(mode, node, field):
     return "|".join([str(mode or ""), str(node or ""), str(field or "")])
@@ -170,6 +189,101 @@ def _prompt_override():
     return None, None
 
 ALIVE_FILE = os.path.join(OUTDIR, "pingpong", ".alive")
+AGENT_SESSION_PATH = os.path.join(HERE, "agent_session.json")
+AGENT_PREFS_PATH = os.path.join(HERE, "agent_preferences.json")
+AGENT_HISTORY_PATH = os.path.join(HERE, "logs", "agent_history.jsonl")
+
+
+def load_agent_session():
+    try:
+        data = json.load(open(AGENT_SESSION_PATH, encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+AGENT_SESSION = load_agent_session()
+
+
+def load_agent_preferences():
+    try:
+        data = json.load(open(AGENT_PREFS_PATH, encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+AGENT_PREFERENCES = load_agent_preferences()
+
+
+def record_agent_preference(rating, session=None):
+    global AGENT_PREFERENCES
+    session = session or {}
+    plan = session.get("plan") or {}
+    tool = str(plan.get("tool") or "").strip()
+    if not tool:
+        return
+    scores = dict(AGENT_PREFERENCES.get("tool_scores") or {})
+    delta = 1 if rating == "good" else -1
+    scores[tool] = max(-5, min(20, int(scores.get(tool) or 0) + delta))
+    AGENT_PREFERENCES = {
+        "tool_scores": scores,
+        "last_feedback": rating,
+        "updated_at": time.time(),
+    }
+    tmp = AGENT_PREFS_PATH + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(AGENT_PREFERENCES, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, AGENT_PREFS_PATH)
+
+
+def agent_preference_context():
+    scores = AGENT_PREFERENCES.get("tool_scores") or {}
+    positive = sorted(((k, int(v)) for k, v in scores.items() if int(v) > 0), key=lambda x: -x[1])[:5]
+    if not positive:
+        return ""
+    return "Preferred tools from prior successful results (tie-breaker only): " + ", ".join(f"{k}={v}" for k, v in positive)
+
+
+def save_agent_session(plan, photos=None, audio=None, settings=None):
+    global AGENT_SESSION
+    AGENT_SESSION = {
+        "plan": dict(plan or {}),
+        "photos": list(photos or []),
+        "audio": audio if isinstance(audio, dict) else None,
+        "settings": dict(settings or {}),
+        "updated_at": time.time(),
+    }
+    tmp = AGENT_SESSION_PATH + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(AGENT_SESSION, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, AGENT_SESSION_PATH)
+
+
+def recent_agent_session(max_age=4 * 3600):
+    if not AGENT_SESSION.get("plan"):
+        return None
+    if time.time() - float(AGENT_SESSION.get("updated_at") or 0) > max_age:
+        return None
+    return AGENT_SESSION
+
+
+def agent_event(kind, **payload):
+    try:
+        os.makedirs(os.path.dirname(AGENT_HISTORY_PATH), exist_ok=True)
+        row = {"time": time.strftime("%Y-%m-%d %H:%M:%S"), "kind": kind, **payload}
+        with open(AGENT_HISTORY_PATH, "a", encoding="utf-8") as f:
+            f.write(json.dumps(row, ensure_ascii=False) + "\n")
+    except Exception as e:
+        log("agent history write failed:", e)
+
+
+def agent_default_enabled():
+    try:
+        return bool(reload_runtime_config().get("agent_default", True))
+    except Exception:
+        return True
+
 def beat_alive():
     try:
         os.makedirs(os.path.dirname(ALIVE_FILE), exist_ok=True)
@@ -192,7 +306,11 @@ def run_job(job):
     m = job.get("mode")
     txt = (job.get("text") or "").strip()
     settings = job.get("settings") or {}
-    if isinstance(m, str) and m.startswith("custom:"):
+    if m == "agent_plan_browser":
+        run_browser_agent_plan(job.get("session_id"))
+    elif m == "agent_execute_browser":
+        run_browser_agent_execute(job.get("session_id"))
+    elif isinstance(m, str) and m.startswith("custom:"):
         do_custom_text(m, txt, job.get("image_refs") or [], settings)
     elif m == "image_fanout":
         fanout_image_jobs(txt, int(job.get("count") or requested_image_count(txt)), settings)
@@ -220,6 +338,128 @@ def run_job(job):
         do_klein_board(job.get("reference_assets") or [], txt, settings, flags=["face_swap"])
     elif m == "faceswap":
         do_faceswap(job["char_rel"], job["face_rel"], txt)
+
+
+def _browser_session_image_count(session):
+    return len([
+        x for x in (session.get("reference_assets") or [])
+        if isinstance(x, dict) and x.get("rel") and x.get("type") != "lora" and x.get("kind") != "lora"
+    ])
+
+
+def _browser_session_has_audio(session):
+    return any(
+        isinstance(x, dict) and x.get("kind") == "audio" and x.get("rel")
+        for x in (session.get("director_assets") or [])
+    )
+
+
+def run_browser_agent_plan(session_id):
+    session = browser_agent.read(session_id)
+    if not session:
+        return
+    request = str(session.get("request") or "").strip()
+    previous_plan = dict(session.get("previous_plan") or {})
+    previous_settings = dict(session.get("previous_settings") or {})
+    try:
+        if previous_plan and is_settings_only_request(request):
+            tool_id = str(previous_plan.get("tool") or "")
+            current = prepare_agent_settings(tool_id, previous_settings)
+            if "seed" not in previous_settings:
+                current.pop("seed", None)
+            parsed = parse_control_request(request, current, agent_tool_capabilities(tool_id), installed_loras())
+            if parsed.errors:
+                raise ValueError(" ".join(parsed.errors))
+            plan = previous_plan
+            plan["reason"] = "직전 브라우저 작업의 생성 설정만 조정"
+            settings = prepare_agent_settings(tool_id, parsed.settings)
+            changes = parsed.changes
+        else:
+            plan_obj = make_agent_plan(
+                request,
+                _browser_session_image_count(session),
+                _browser_session_has_audio(session),
+                previous_plan=previous_plan or None,
+            )
+            plan = plan_obj.to_dict()
+            keep = previous_settings if previous_plan.get("tool") == plan_obj.tool else None
+            settings = prepare_agent_settings(plan_obj.tool, keep)
+            changes = []
+            if is_control_request(request):
+                parsed = parse_control_request(
+                    request, settings, agent_tool_capabilities(plan_obj.tool), installed_loras()
+                )
+                if parsed.errors:
+                    raise ValueError(" ".join(parsed.errors))
+                if parsed.ok:
+                    settings = prepare_agent_settings(plan_obj.tool, parsed.settings)
+                    changes = parsed.changes
+        browser_agent.update(session_id, state="planned", plan=plan, settings=settings, changes=changes, error="")
+    except Exception as e:
+        log("browser agent planning failed:", traceback.format_exc())
+        browser_agent.update(session_id, state="error", error=str(e))
+
+
+def _browser_results_since(started_at):
+    root = os.path.join(OUTDIR, "pingpong")
+    found = []
+    media_ext = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".mp4", ".webm", ".mov", ".mp3", ".wav", ".flac", ".m4a"}
+    for base, dirs, files in os.walk(root) if os.path.isdir(root) else []:
+        dirs[:] = [d for d in dirs if not d.startswith(".")]
+        for name in files:
+            path = os.path.join(base, name)
+            if os.path.splitext(name)[1].lower() not in media_ext:
+                continue
+            try:
+                if os.path.getmtime(path) + 1 >= started_at:
+                    found.append(os.path.relpath(path, root).replace("\\", "/"))
+            except OSError:
+                pass
+    return sorted(found, key=lambda rel: os.path.getmtime(os.path.join(root, *rel.split("/"))))
+
+
+def run_browser_agent_execute(session_id):
+    session = browser_agent.read(session_id)
+    if not session:
+        return
+    plan = dict(session.get("plan") or {})
+    if plan.get("missing_inputs"):
+        browser_agent.update(session_id, state="error", error="필요한 입력 자료가 아직 부족해요.")
+        return
+    tool = str(plan.get("tool") or "image")
+    request = str(plan.get("normalized_request") or plan.get("intent") or session.get("request") or "").strip()
+    settings = dict(session.get("settings") or {})
+    refs = list(session.get("reference_assets") or [])
+    director = list(session.get("director_assets") or [])
+    started = time.time()
+    browser_agent.update(session_id, state="running", started_at=started, error="")
+    try:
+        if tool.startswith("custom:"):
+            do_custom_text(tool, request, [x["rel"] for x in refs if x.get("rel")], settings)
+        elif tool == "video":
+            do_text("video", request, director, settings)
+        elif tool == "song":
+            do_text("song", request, settings=settings)
+        elif tool == "song_reference":
+            audio = next((x for x in director if x.get("kind") == "audio" and x.get("rel")), None)
+            if not audio:
+                raise ValueError("참고할 음원이 필요해요.")
+            do_song_reference_rel(request, audio["rel"], settings)
+        elif tool == "klein":
+            board = list(refs)
+            board.extend({"type": "lora", "lora_name": x.get("name"), "lora_strength": x.get("strength", 1.0)}
+                         for x in settings.get("loras", []))
+            do_klein_board(board, request, settings)
+        elif tool == "faceswap":
+            do_klein_board(refs, request, settings, flags=["face_swap"])
+        else:
+            do_text("image", request, settings=settings)
+        browser_agent.update(
+            session_id, state="complete", completed_at=time.time(), results=_browser_results_since(started)
+        )
+    except Exception as e:
+        browser_agent.update(session_id, state="error", error=str(e))
+        raise
 
 def process_queue():
     try:
@@ -269,7 +509,13 @@ REFSHEET_VIDEO_SYS = (
     "Output only the final prompt, no analysis, no markdown fences, no alternatives."
 )
 SONG_SYS = (
-    "You are a professional songwriter and music producer. Given a theme (any language), respond "
+    "You are a professional songwriter and music producer. Follow the user's requested lyrics language exactly. "
+    "If no lyrics language is specified, write lyrics in the same primary language as the user's request; English TAGS never imply English lyrics. "
+    "Treat named songs, artists, animation titles, films, games, and OSTs as references for era, emotion, tempo, harmony, "
+    "instrumentation, arrangement, dynamics, and vocal delivery only. Unless explicitly requested, never turn those names or their literal plot "
+    "into the lyrics, and do not include their proper names in the lyrics. Translate the reference into concrete musical characteristics. "
+    "TAGS must contain 8-16 specific English production tags covering era/region, subgenre, tempo or BPM range, core instruments, rhythm, "
+    "vocal delivery, chorus shape, and emotional arc rather than only broad labels. Given a theme (any language), respond "
     "in EXACTLY this format and nothing else:\n"
     "TAGS: <comma-separated English genre/mood/instrument/vocal tags>\n"
     "LYRICS:\n<full song lyrics with [Verse]/[Chorus]/[Bridge] section tags>"
@@ -312,7 +558,9 @@ TG_BANNER = ("🦗▸ 너무바쁜베짱이 STUDIO ◂🦗\n"
              "░▒▓ made by 코다 & 크룩스 ▓▒░")
 
 HELP = (
-    "👾 아래 버튼/번호로 골라요 👾\n"
+    "🤖 그냥 말하면 핑퐁이 작업 방법을 정리해요\n"
+    "✧ .에이전트 비 오는 밤의 영화 같은 6초 영상\n"
+    "✧ 또는 아래 버튼/번호로 직접 골라도 돼요\n"
     "▰▰▰▰▰▰▰▰▰▰▰▰▰▰\n"
     "1️⃣ 이미지   2️⃣ 영상   3️⃣ 음악\n"
     "4️⃣ 인물합성(사진1장)\n"
@@ -392,11 +640,15 @@ def start_dashboard():
 MENU_KB = {"keyboard": [["1️⃣ 이미지", "2️⃣ 영상"],
                         ["3️⃣ 음악", "🎧 참고곡 음악"],
                         ["4️⃣ 인물합성", "5️⃣ 페이스스왑"],
+                        ["🤖 에이전트"],
                         ["❓ 도움말"],
                         ["⚔️ 모델대결"]],
            "resize_keyboard": True}
 
 def tg_send(text, kb=None):
+    if not telegram_enabled():
+        log("telegram disabled; message skipped:", str(text)[:180])
+        return None
     try:
         data = {"chat_id": CHAT, "text": text}
         if kb is not None:
@@ -411,7 +663,15 @@ def send_menu(msg="👇 아래 버튼으로 골라주세요"):
 PHOTO_KB = {"keyboard": [["🎭 인물합성/편집", "🔀 페이스스왑"],
                          ["🎬 사진으로 영상", "❎ 취소"]],
             "resize_keyboard": True}
+AGENT_CONFIRM_KB = {"keyboard": [["✅ 계획대로 실행", "✏️ 다시 말하기"], ["❎ 취소"]],
+                    "resize_keyboard": True}
+AGENT_RESULT_KB = {"keyboard": [["👍 딱 좋아", "👎 별로야"],
+                                ["✏️ 수정할게", "🔁 같은 계획 다시"], ["🏠 메뉴"]],
+                   "resize_keyboard": True}
 def tg_send_file(kind, path, caption=""):
+    if not telegram_enabled():
+        log("telegram disabled; generated file kept locally:", path)
+        return None
     method = {"photo": "sendPhoto", "video": "sendVideo", "audio": "sendAudio"}[kind]
     field  = kind
     path = _resolve_existing_media_path(path)
@@ -422,16 +682,80 @@ def tg_send_file(kind, path, caption=""):
                       files={field: f}, timeout=300)
 
 def tg_updates(offset):
-    r = requests.get(f"{TG}/getUpdates", params={"offset": offset, "timeout": 30}, timeout=40)
+    if not telegram_enabled():
+        return []
+    try:
+        poll_seconds = max(2, min(25, int(reload_runtime_config().get("telegram_poll_timeout", 5))))
+    except (TypeError, ValueError):
+        poll_seconds = 5
+    r = requests.get(
+        f"{TG}/getUpdates",
+        params={"offset": offset, "timeout": poll_seconds},
+        timeout=poll_seconds + 10,
+    )
     return r.json().get("result", [])
 
 def tg_download(file_id, dest):
+    if not telegram_enabled():
+        raise RuntimeError("텔레그램 연결이 꺼져 있어 파일을 내려받을 수 없어요.")
     fp = requests.get(f"{TG}/getFile", params={"file_id": file_id}, timeout=20).json()["result"]["file_path"]
     data = requests.get(f"https://api.telegram.org/file/bot{TOKEN}/{fp}", timeout=120).content
     os.makedirs(os.path.dirname(dest), exist_ok=True)
     with open(dest, "wb") as f:
         f.write(data)
     return dest
+
+
+def transcribe_local_audio(source):
+    """Local audio file -> Korean text using the configured Faster-Whisper-XXL bundle."""
+    source = os.path.abspath(str(source or ""))
+    if not os.path.isfile(source):
+        raise FileNotFoundError("음성 파일을 찾지 못했어요: " + source)
+    cfg = reload_runtime_config()
+    default_root = os.path.abspath(os.path.join(HERE, "..", "Faster-Whisper-XXL"))
+    exe = os.path.abspath(cfg.get("agent_whisper_exe") or os.path.join(default_root, "faster-whisper-xxl.exe"))
+    if not os.path.isfile(exe):
+        raise FileNotFoundError("Faster-Whisper-XXL을 찾지 못했어요: " + exe)
+    model = str(cfg.get("agent_whisper_model") or "medium")
+    work = tempfile.mkdtemp(prefix="pingpong_voice_result_")
+    try:
+        comfy_free()
+        cmd = [
+            exe, source, "-l", "Korean", "-m", model,
+            "-d", "cuda", "-ct", "float16",
+            "--task", "transcribe", "--output_format", "txt", "-o", work,
+        ]
+        flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
+        proc = subprocess.run(
+            cmd, cwd=os.path.dirname(exe), capture_output=True,
+            text=True, encoding="utf-8", errors="replace",
+            timeout=int(cfg.get("agent_whisper_timeout") or 240), creationflags=flags,
+        )
+        if proc.returncode != 0:
+            raise RuntimeError((proc.stderr or proc.stdout or "음성 전사 실패")[-1200:])
+        candidates = [os.path.join(work, name) for name in os.listdir(work) if name.lower().endswith(".txt")]
+        if not candidates:
+            raise RuntimeError("음성 전사 결과 파일이 만들어지지 않았어요")
+        text = open(candidates[0], encoding="utf-8-sig").read().strip()
+        text = re.sub(r"\s+", " ", text)
+        if not text:
+            raise RuntimeError("음성에서 문장을 인식하지 못했어요")
+        return text
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
+def transcribe_agent_voice(item):
+    """Telegram voice note -> Korean text using the local Faster-Whisper-XXL bundle."""
+    if not item or not item.get("file_id"):
+        raise ValueError("음성 메시지 file_id가 없습니다")
+    work = tempfile.mkdtemp(prefix="pingpong_voice_input_")
+    try:
+        source = os.path.join(work, "voice.ogg")
+        tg_download(item["file_id"], source)
+        return transcribe_local_audio(source)
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
 
 # ---------- LM Studio (LLM) ----------
 def lms(*args):
@@ -471,6 +795,57 @@ def _chat(model_id, system, user, max_tokens=800, temp=0.5, no_think=True):
     if "</think>" in out:
         out = out.split("</think>")[-1].strip()
     return out
+
+
+def agent_tools():
+    """현재 설치된 내장/커스텀 워크플로를 에이전트용 도구 목록으로 노출."""
+    return build_tool_catalog(reload_custom_workflows())
+
+
+AGENT_TOOL_STATUS_CACHE = {"time": 0.0, "tools": []}
+
+
+def agent_planning_tools():
+    """대시보드 준비 상태를 이용해 실행 가능한 도구만 플래너에 제공."""
+    now = time.time()
+    if AGENT_TOOL_STATUS_CACHE["tools"] and now - AGENT_TOOL_STATUS_CACHE["time"] < 30:
+        return AGENT_TOOL_STATUS_CACHE["tools"]
+    tools = agent_tools()
+    try:
+        url = f"http://{DASHBOARD_OPEN_HOST}:{DASHBOARD_PORT}/api/modes"
+        status = requests.get(url, timeout=12).json().get("status") or {}
+        ready = [tool for tool in tools if not status.get(tool.id) or status[tool.id].get("ready", False)]
+        if status and not ready:
+            raise RuntimeError("현재 실행 가능한 생성 기능이 없어요. 브라우저의 시작 안내에서 모델과 노드를 확인해주세요.")
+        if ready:
+            tools = ready
+    except Exception as e:
+        if "현재 실행 가능한" in str(e):
+            raise
+        log("agent readiness lookup skipped:", e)
+    AGENT_TOOL_STATUS_CACHE.update({"time": now, "tools": tools})
+    return tools
+
+
+def make_agent_plan(request, image_count=0, has_audio=False, previous_plan=None):
+    """거친 사용자 요청을 검증된 단일 실행 계획으로 정리한다."""
+    tools = agent_planning_tools()
+    comfy_free()
+    mid = llm_up()
+    try:
+        raw = _chat(
+            mid,
+            planner_system_prompt(tools),
+            planner_user_prompt(
+                request, image_count, has_audio, previous_plan,
+                preference_context=agent_preference_context(),
+            ),
+            max_tokens=900,
+            temp=0.2,
+        )
+    finally:
+        llm_down()
+    return parse_agent_plan(raw, tools, request, image_count, has_audio)
 
 def llm_prompt(model_id, system, user):
     out = _chat(model_id, system, user)
@@ -746,7 +1121,7 @@ def do_image_direct(prompt, request_text=None, settings=None):
     comfy_free()
     wf, save = inject_zit(prompt, settings)
     files = comfy_run(wf, save)
-    write_generation_meta(files, "image", request_text or prompt, prompt)
+    write_generation_meta(files, "image", request_text or prompt, prompt, extra={"settings": settings or {}})
     tg_send_file("photo", files[0], caption=prompt[:1000])
     comfy_free()
 
@@ -1054,7 +1429,8 @@ def _download_comfy_result(item):
     return None
 
 def load_wf(name):
-    return json.load(open(os.path.join(HERE, "workflows", name), encoding="utf-8"))
+    with open(os.path.join(HERE, "workflows", name), encoding="utf-8") as f:
+        return json.load(f)
 
 def _float_setting(settings, key, default, lo, hi):
     try:
@@ -1086,6 +1462,29 @@ def _bool_setting(settings, key, default=False):
     if isinstance(val, bool):
         return val
     return str(val).strip().lower() in ("1", "true", "yes", "on", "y")
+
+def _seed_setting(settings, default=None):
+    if (settings or {}).get("random_seed"):
+        return rseed()
+    try:
+        return max(0, min(2**63 - 1, int((settings or {}).get("seed"))))
+    except (TypeError, ValueError):
+        return rseed() if default is None else default
+
+def _apply_agent_node_overrides(wf, settings):
+    """Apply only node/field pairs discovered from the loaded workflow itself."""
+    for item in (settings or {}).get("agent_node_overrides", []) or []:
+        if not isinstance(item, (list, tuple)) or len(item) != 3:
+            continue
+        node, field, value = str(item[0]), str(item[1]), item[2]
+        inputs = (wf.get(node) or {}).get("inputs")
+        if not isinstance(inputs, dict) or field not in inputs:
+            continue
+        if field in ("steps", "cfg", "cfg_scale", "denoise") and isinstance(value, (int, float)):
+            inputs[field] = value
+        elif field in ("lora_name", "strength_model", "strength_clip"):
+            inputs[field] = value
+    return wf
 
 def safe_filename_title(text, fallback="song"):
     s = re.sub(r"\s+", "_", (text or "").strip())
@@ -1141,7 +1540,8 @@ def _set_any_megapixels(wf, megapixels):
 
 def inject_custom(spec, prompt, image_refs=None, settings=None, mode_name=None, tag=None):
     wf_path = os.path.join(HERE, spec["file"])
-    wf = json.load(open(wf_path, encoding="utf-8"))
+    with open(wf_path, encoding="utf-8-sig") as f:
+        wf = json.load(f)
     tag = tag or tag_now()
     for node, field in spec.get("prompt_nodes", []):
         wf[str(node)]["inputs"][field] = prompt
@@ -1170,8 +1570,9 @@ def inject_custom(spec, prompt, image_refs=None, settings=None, mode_name=None, 
             wf[node_id] = copy.deepcopy(wf[base_node])
             wf[node_id]["inputs"]["image"] = rel
             wf[encode_node]["inputs"][f"images.image_{i}"] = [node_id, 0]
+    seed = _seed_setting(settings)
     for node, field in spec.get("seed_nodes", []):
-        wf[str(node)]["inputs"][field] = rseed()
+        wf[str(node)]["inputs"][field] = seed
     for node, field, value in spec.get("set_nodes", []):
         wf[str(node)]["inputs"][field] = value
     if spec.get("enhancer_node"):
@@ -1193,15 +1594,28 @@ def inject_custom(spec, prompt, image_refs=None, settings=None, mode_name=None, 
         hi = float(dn[5]) if len(dn) > 5 else 1.0
         fallback = _float_setting(settings, f"denoise_{i}", cur, lo, hi)
         wf[node]["inputs"][field] = _float_setting(settings, f"tune_{i}", fallback, lo, hi)
-    if settings and spec.get("type") == "video" and spec.get("video_length_node"):
-        node, field = spec["video_length_node"]
-        fps = int(spec.get("fps", 24) or 24)
-        extra = int(spec.get("length_extra_frames", 1) or 0)
-        seconds = _int_setting(settings, "video_seconds", int(spec.get("default_seconds", 5) or 5), 1, 60)
-        wf[str(node)]["inputs"][field] = seconds * fps + extra
-    if settings and spec.get("type") == "image":
-        mp = _float_setting(settings, "image_megapixels", 1.0, 0.25, 2.0)
-        _set_any_megapixels(wf, mp)
+    if settings and spec.get("type") == "video":
+        max_seconds = float(spec.get("max_seconds", 60) or 60)
+        seconds = _float_setting(settings, "video_seconds", float(spec.get("default_seconds", 5) or 5), 1, max_seconds)
+        if spec.get("duration_node"):
+            node, field = spec["duration_node"]
+            wf[str(node)]["inputs"][field] = seconds
+        elif spec.get("video_length_node"):
+            node, field = spec["video_length_node"]
+            fps = int(spec.get("fps", 24) or 24)
+            extra = int(spec.get("length_extra_frames", 1) or 0)
+            wf[str(node)]["inputs"][field] = int(seconds * fps) + extra
+    if settings and spec.get("type") in ("image", "video"):
+        is_video = spec.get("type") == "video"
+        mp_key = "video_megapixels" if is_video else "image_megapixels"
+        mp_default = float(spec.get("default_megapixels", 1.0) or 1.0)
+        mp = _float_setting(settings, mp_key, mp_default, 0.1 if is_video else 0.25, 2.0)
+        megapixels_nodes = spec.get("megapixels_nodes") or []
+        if megapixels_nodes:
+            for node, field in megapixels_nodes:
+                wf[str(node)]["inputs"][field] = mp
+        elif not is_video:
+            _set_any_megapixels(wf, mp)
         if spec.get("ratio_node"):
             node, field = spec["ratio_node"]
             wf[str(node)]["inputs"][field] = _custom_ratio_value(spec, _ratio_setting(settings))
@@ -1228,22 +1642,38 @@ def inject_custom(spec, prompt, image_refs=None, settings=None, mode_name=None, 
                 continue
             wf[node]["inputs"]["filename_prefix"] = spec.get("prefix", "pingpong/custom_") + tag + f"_s{i}"
     apply_model_overrides(wf, mode_name or "custom", settings)
+    _apply_agent_node_overrides(wf, settings)
     return wf, str(spec["output_node"])
 
 def inject_zit(prompt, settings=None):
     wf = load_wf("toobusy_zimgt.json"); tag = tag_now()
+    seed = _seed_setting(settings)
     ratio = _ratio_setting(settings)
     upscale = _bool_setting(settings, "zit_upscale", CFG.get("send_upscaled", True))
     scale_by = _float_setting(settings, "zit_scale_by", 0.5, 0.25, 1.0)
     for n in ("1", "4"):
         wf[n]["inputs"]["positive"] = prompt
-        wf[n]["inputs"]["seed"] = rseed()
+        wf[n]["inputs"]["seed"] = seed
         wf[n]["inputs"]["ratio_preset"] = ratio
         wf[n]["inputs"]["width"] = 0
         wf[n]["inputs"]["height"] = 0
-    if not CFG.get("zit_lora", False):
+    loras = list((settings or {}).get("loras") or [])[:5]
+    if loras:
+        wf["1"]["inputs"]["lora_slots"] = len(loras)
+        for i, item in enumerate(loras, 1):
+            wf["1"]["inputs"][f"lora_{i}_enable"] = True
+            wf["1"]["inputs"][f"lora_{i}_name"] = item.get("name")
+            wf["1"]["inputs"][f"lora_{i}_strength"] = max(0.0, min(2.0, float(item.get("strength", 1))))
+        for i in range(len(loras) + 1, 6):
+            wf["1"]["inputs"][f"lora_{i}_enable"] = False
+    elif "loras" in set((settings or {}).get("_touched_controls") or []) or not CFG.get("zit_lora", False):
         wf["1"]["inputs"]["lora_slots"] = 0
-        wf["1"]["inputs"]["lora_1_enable"] = False
+        for i in range(1, 6):
+            wf["1"]["inputs"][f"lora_{i}_enable"] = False
+    wf["1"]["inputs"]["steps"] = _int_setting(settings, "steps", wf["1"]["inputs"].get("steps", 8), 1, 50)
+    for n in ("1", "4"):
+        wf[n]["inputs"]["cfg"] = _float_setting(settings, "cfg", wf[n]["inputs"].get("cfg", 1), 0, 20)
+    wf["4"]["inputs"]["denoise"] = _float_setting(settings, "denoise", wf["4"]["inputs"].get("denoise", 0.5), 0, 1)
     if MODELS.get("zit"):
         wf["1"]["inputs"]["model_name"] = wf["4"]["inputs"]["model_name"] = MODELS["zit"]
     wf["2"]["inputs"]["filename_prefix"] = f"pingpong\\img_{tag}"
@@ -1336,6 +1766,12 @@ def _compare_label(wf_id):
         return "Z-Image Turbo"
     if wf_id == "klein":
         return "Flux2 Klein"
+    if wf_id == "klein3":
+        return "Flux2 Klein 3Ref"
+    if wf_id == "klein4":
+        return "Flux2 Klein 4B"
+    if wf_id == "klein4_3":
+        return "Flux2 Klein 4B 3Ref"
     name = wf_id.split(":", 1)[1] if wf_id.startswith("custom:") else wf_id
     try:
         name, _ = resolve_custom_workflow(name)
@@ -1356,10 +1792,24 @@ def _compare_build(wf_id, prompt, seed, settings, prefix, image_refs=None):
         if "5" in wf:
             wf["5"]["inputs"]["filename_prefix"] = prefix + "_UPS"
         return wf, out
-    if wf_id == "klein":
-        if not (image_refs or []):
-            raise RuntimeError("Flux2 Klein 은 입력 사진(얼굴)이 필요해요")
-        wf, out = inject_klein(image_refs[0], prompt)
+    if wf_id in ("klein", "klein3", "klein4", "klein4_3"):
+        need_img = 3 if wf_id in ("klein3", "klein4_3") else 1
+        if len(image_refs or []) < need_img:
+            raise RuntimeError(f"Flux2 Klein 은 입력 사진 {need_img}장이 필요해요")
+        if need_img == 3:
+            roles = ("character_a", "character_b", "character_c")
+            assets = [{"rel": image_refs[i], "role": roles[i], "name": f"Reference {i + 1}", "enabled": True} for i in range(3)]
+            wf, out = inject_klein_board(assets, prompt)
+        else:
+            wf, out = inject_klein(image_refs[0], prompt)
+        if wf_id in ("klein4", "klein4_3"):
+            wf["3"]["inputs"]["model_name"] = r"FLUX2\flux-2-klein-4b-fp8.safetensors"
+            wf["3"]["inputs"]["clip_name"] = "qwen_3_4b-engineer-v4-bf16.safetensors"
+        wf["3"]["inputs"]["positive"] = prompt
+        wf["3"]["inputs"]["use_bundle_prompt"] = False
+        wf["3"]["inputs"]["toobusy_bundle"] = ["7", 0]
+        for nid in ("2", "5", "6", "8"):
+            wf.pop(nid, None)
         for n in ("2", "3"):
             if n in wf and isinstance(wf[n].get("inputs"), dict) and "seed" in wf[n]["inputs"]:
                 wf[n]["inputs"]["seed"] = seed
@@ -1370,7 +1820,7 @@ def _compare_build(wf_id, prompt, seed, settings, prefix, image_refs=None):
     name, spec = resolve_custom_workflow(name)
     if spec.get("type") != "image":
         raise RuntimeError(f"{name} 은(는) 이미지 워크플로가 아니라 비교에 쓸 수 없어요")
-    need_img = len(spec.get("image_nodes", []))
+    need_img = int(spec.get("compare_image_inputs") or len(spec.get("image_nodes", [])))
     if need_img and len(image_refs or []) < need_img:
         raise RuntimeError(f"{name} 은(는) 입력 사진 {need_img}장이 필요해요")
     wf, out = inject_custom(spec, prompt, image_refs or None, settings, "custom:" + name)
@@ -1774,11 +2224,15 @@ def inject_ltx(prompt, director_assets=None, settings=None):
     if MODELS.get("ltx_gguf"):
         wf["137"]["inputs"]["unet_name"] = MODELS["ltx_gguf"]
     apply_model_overrides(wf, "video", settings)
-    wf["30"]["inputs"]["noise_seed"] = rseed()
+    wf["30"]["inputs"]["noise_seed"] = _seed_setting(settings)
+    wf["33"]["inputs"]["steps"] = _int_setting(settings, "steps", wf["33"]["inputs"].get("steps", 8), 1, 50)
+    wf["33"]["inputs"]["denoise"] = _float_setting(settings, "denoise", wf["33"]["inputs"].get("denoise", 1), 0, 1)
+    for node in ("17", "28"):
+        wf[node]["inputs"]["cfg"] = _float_setting(settings, "cfg", wf[node]["inputs"].get("cfg", 1), 0, 20)
     wf["37"]["inputs"]["filename_prefix"] = f"pingpong/vid_{tag}"
     return wf, "37"
 
-def inject_ace(tags, lyrics, title_text="", reference_audio=""):
+def inject_ace(tags, lyrics, title_text="", reference_audio="", settings=None):
     wf = load_wf("audio_ace_step1_5_xl_turbo_API.json"); tag = tag_now()
     wf["94"]["inputs"]["tags"] = tags
     wf["94"]["inputs"]["lyrics"] = lyrics
@@ -1804,11 +2258,11 @@ def inject_ace(tags, lyrics, title_text="", reference_audio=""):
     if MODELS.get("ace"):
         wf["104"]["inputs"]["unet_name"] = MODELS["ace"]
     apply_model_overrides(wf, "song", {})
-    wf["109"]["inputs"]["value"] = rseed()
+    wf["109"]["inputs"]["value"] = _seed_setting(settings)
     wf["107"]["inputs"]["filename_prefix"] = f"pingpong/song_{tag}_{safe_filename_title(title_text, 'music')}"
     return wf, "107"
 
-def inject_klein(ref_relpath, goal_text):
+def inject_klein(ref_relpath, goal_text, settings=None):
     wf = load_wf("toobusy_flux2klein_vram.json"); tag = tag_now()
     board = {"version": 1, "global_note": "", "items": [
         {"id": "charA", "role": "character_a", "name": "Character A",
@@ -1823,13 +2277,15 @@ def inject_klein(ref_relpath, goal_text):
     wf["2"]["inputs"]["director_selection_json"] = json.dumps(sel, ensure_ascii=False)
     if MODELS.get("klein"):
         wf["3"]["inputs"]["model_name"] = MODELS["klein"]
-    apply_model_overrides(wf, "klein", {})
-    wf["2"]["inputs"]["seed"] = rseed()
-    wf["3"]["inputs"]["seed"] = rseed()
+    apply_model_overrides(wf, "klein", settings)
+    seed = _seed_setting(settings)
+    wf["2"]["inputs"]["seed"] = seed
+    wf["3"]["inputs"]["seed"] = seed
+    wf["3"]["inputs"]["steps"] = _int_setting(settings, "steps", wf["3"]["inputs"].get("steps", 4), 1, 50)
     wf["4"]["inputs"]["filename_prefix"] = f"pingpong/klein_{tag}"
     return wf, "4"
 
-def inject_klein_faceswap(char_rel, face_rel, goal_text):
+def inject_klein_faceswap(char_rel, face_rel, goal_text, settings=None):
     """character(몸/포즈/의상/장면) + face(얼굴 정체성)로 face_swap 합성."""
     wf = load_wf("toobusy_flux2klein_faceswap_direct.json"); tag = tag_now()
     prompt = (
@@ -1853,8 +2309,8 @@ def inject_klein_faceswap(char_rel, face_rel, goal_text):
         wf["4"]["inputs"]["height"] = h
     if MODELS.get("klein"):
         wf["4"]["inputs"]["model_name"] = MODELS["klein"]
-    apply_model_overrides(wf, "faceswap", {})
-    wf["4"]["inputs"]["seed"] = rseed()
+    apply_model_overrides(wf, "faceswap", settings)
+    wf["4"]["inputs"]["seed"] = _seed_setting(settings)
     wf["5"]["inputs"]["filename_prefix"] = f"pingpong/swap_{tag}"
     return wf, "5"
 
@@ -1944,8 +2400,10 @@ def inject_klein_board(assets, goal_text, settings=None, flags=None):
     if MODELS.get("klein"):
         wf["3"]["inputs"]["model_name"] = MODELS["klein"]
     apply_model_overrides(wf, "klein", settings)
-    wf["2"]["inputs"]["seed"] = rseed()
-    wf["3"]["inputs"]["seed"] = rseed()
+    seed = _seed_setting(settings)
+    wf["2"]["inputs"]["seed"] = seed
+    wf["3"]["inputs"]["seed"] = seed
+    wf["3"]["inputs"]["steps"] = _int_setting(settings, "steps", wf["3"]["inputs"].get("steps", 4), 1, 50)
     wf["4"]["inputs"]["filename_prefix"] = f"pingpong/klein_board_{tag}"
     return wf, "4"
 
@@ -2053,7 +2511,7 @@ def do_text(mode, body, director_assets=None, settings=None):
     if mode == "help" or not body:
         tg_send(help_text()); return
     if mode.startswith("custom:"):
-        do_custom_text(mode, body)
+        do_custom_text(mode, body, settings=settings)
         return
     if mode == "redcraft2":
         do_redcraft2(body, body, settings)
@@ -2071,7 +2529,7 @@ def do_text(mode, body, director_assets=None, settings=None):
     mid = llm_up()
     try:
         if mode == "song":
-            tags, lyrics = llm_song(mid, body)
+            tags, lyrics = llm_song(mid, prepare_song_request(body))
             payload_desc = f"🎵 태그: {tags}"
         elif mode == "video":
             prompt = llm_prompt(mid, VIDEO_SYS, body); payload_desc = prompt
@@ -2081,7 +2539,7 @@ def do_text(mode, body, director_assets=None, settings=None):
         llm_down()
     log("PAYLOAD:", payload_desc[:200])
     if mode == "song":
-        wf, save = inject_ace(tags, lyrics, body); kind = "audio"
+        wf, save = inject_ace(tags, lyrics, body, settings=settings); kind = "audio"
         tg_send(f"🎼▸ 작곡 중 ░▒▓█▓▒░ ♪♬\n{payload_desc}")
     elif mode == "video":
         wf, save = inject_ltx(prompt, director_assets, settings); kind = "video"
@@ -2091,18 +2549,17 @@ def do_text(mode, body, director_assets=None, settings=None):
         tg_send(f"🎨▸ 그리는 중 ░▒▓█▓▒░ ✧\n{prompt}")
     files = comfy_run(wf, save)
     if mode == "song":
-        write_generation_meta(files, mode, body, f"TAGS:\n{tags}\n\nLYRICS:\n{lyrics}")
+        write_generation_meta(files, mode, body, f"TAGS:\n{tags}\n\nLYRICS:\n{lyrics}", extra={"settings": settings or {}})
     else:
-        write_generation_meta(files, mode, body, prompt)
+        write_generation_meta(files, mode, body, prompt, extra={"settings": settings or {}})
     tg_send_file(kind, files[0], caption=payload_desc)
     comfy_free()
 
 def _telegram_audio(msg):
-    """Telegram audio/voice 또는 audio 문서를 하나의 메타 형식으로 반환."""
-    for field in ("audio", "voice"):
-        item = msg.get(field)
-        if isinstance(item, dict) and item.get("file_id"):
-            return item
+    """참고곡용 Telegram audio/document. voice note는 에이전트 말하기 입력으로 분리."""
+    item = msg.get("audio")
+    if isinstance(item, dict) and item.get("file_id"):
+        return item
     doc = msg.get("document")
     if isinstance(doc, dict) and str(doc.get("mime_type") or "").lower().startswith("audio/"):
         return doc
@@ -2131,7 +2588,7 @@ def download_audio_ref(item):
     tg_download(item["file_id"], os.path.join(INPUTDIR, "pingpong_audio_refs", filename))
     return rel
 
-def do_song_reference_rel(body, ref_rel):
+def do_song_reference_rel(body, ref_rel, settings=None):
     """ComfyUI input의 참고 음원을 조건으로 새 멜로디/가사의 곡을 생성."""
     body = (body or "참고곡의 분위기와 질감을 살린 새로운 곡").strip()
     tg_send(f"🎧▸ 참고곡 접수! 새 멜로디와 가사를 구상 중...\n> {body}")
@@ -2143,19 +2600,19 @@ def do_song_reference_rel(body, ref_rel):
         llm_down()
     payload_desc = f"🎵 태그: {tags}"
     log("REFERENCE SONG PAYLOAD:", payload_desc[:200], "ref=", ref_rel)
-    wf, save = inject_ace(tags, lyrics, body, reference_audio=ref_rel)
+    wf, save = inject_ace(tags, lyrics, body, reference_audio=ref_rel, settings=settings)
     tg_send(f"🎼▸ 참고곡 분위기로 작곡 중 ░▒▓█▓▒░ ♪♬\n{payload_desc}")
     files = comfy_run(wf, save)
     write_generation_meta(
         files, "song_reference", body, f"TAGS:\n{tags}\n\nLYRICS:\n{lyrics}",
-        extra={"reference_audio": ref_rel, "reference_mode": "timbre"},
+        extra={"reference_audio": ref_rel, "reference_mode": "timbre", "settings": settings or {}},
     )
     tg_send_file("audio", files[0], caption=("🎧 참고곡 분위기 반영 · 새 멜로디/가사\n" + payload_desc)[:1000])
     comfy_free()
 
-def do_song_reference(body, audio_item):
+def do_song_reference(body, audio_item, settings=None):
     """Telegram 참고 음원을 저장한 뒤 공통 참고곡 생성기로 전달."""
-    do_song_reference_rel(body, download_audio_ref(audio_item))
+    do_song_reference_rel(body, download_audio_ref(audio_item), settings)
 
 def download_ref(file_id):
     """텔레그램 사진을 ComfyUI input 폴더에 저장하고 상대경로 반환."""
@@ -2165,29 +2622,29 @@ def download_ref(file_id):
     tg_download(file_id, dest)
     return rel
 
-def _klein_core(rel, caption):
+def _klein_core(rel, caption, settings=None):
     tg_send(f"🎭▸ 합성 중 ░▒▓█▓▒░ (같은 얼굴, 새 장면)\n장면: {caption or '(자동)'}")
     comfy_free()
-    wf, save = inject_klein(rel, caption)
+    wf, save = inject_klein(rel, caption, settings)
     files = comfy_run(wf, save)
-    write_generation_meta(files, "klein", caption or "", caption or "")
+    write_generation_meta(files, "klein", caption or "", caption or "", extra={"settings": settings or {}})
     tg_send_file("photo", files[0], caption=caption or "✦ 합성 완료 ✦")
     comfy_free()
 
-def do_klein(file_id, caption):
-    _klein_core(download_ref(file_id), caption)
+def do_klein(file_id, caption, settings=None):
+    _klein_core(download_ref(file_id), caption, settings)
 
-def do_video_from_photo(file_id, caption):
+def do_video_from_photo(file_id, caption, settings=None):
     rel = download_ref(file_id)
     prompt = caption or "animate this image into a short cinematic video with natural motion"
-    do_text("video", prompt, [{"kind": "image", "rel": rel}])
+    do_text("video", prompt, [{"kind": "image", "rel": rel}], settings)
 
-def do_faceswap(char_rel, face_rel, goal):
+def do_faceswap(char_rel, face_rel, goal, settings=None):
     tg_send(f"🔀▸ 얼굴 교체 중 ░▒▓█▓▒░ 👤↔👤\n장면: {goal or '(원본 장면 유지)'}")
     comfy_free()
-    wf, save = inject_klein_faceswap(char_rel, face_rel, goal)
+    wf, save = inject_klein_faceswap(char_rel, face_rel, goal, settings)
     files = comfy_run(wf, save)
-    write_generation_meta(files, "faceswap", goal or "", goal or "")
+    write_generation_meta(files, "faceswap", goal or "", goal or "", extra={"settings": settings or {}})
     tg_send_file("photo", files[0], caption="✦ 페이스 스왑 완료 ✦ 👤↔👤")
     comfy_free()
 
@@ -2200,24 +2657,28 @@ def do_klein_board(reference_assets, goal, settings=None, flags=None):
         if not char_rel or not face_rel:
             tg_send("⚠️ 페이스스왑에는 몸/장면 이미지와 얼굴 이미지가 각각 1장씩 필요해요.")
             return
-        do_faceswap(char_rel, face_rel, goal)
+        do_faceswap(char_rel, face_rel, goal, settings)
         return
     tg_send(f"🎭▸ 레퍼런스 보드 생성 중 ░▒▓█▓▒░\n{goal or '(보드 기반 자동 생성)'}")
     comfy_free()
     wf, save = inject_klein_board(reference_assets, goal, settings, flags)
     files = comfy_run(wf, save)
-    write_generation_meta(files, "klein_board", goal or "", goal or "")
+    write_generation_meta(files, "klein_board", goal or "", goal or "", extra={"settings": settings or {}})
     tg_send_file("photo", files[0], caption=goal or "✦ 레퍼런스 보드 생성 완료 ✦")
     comfy_free()
 
 # 단계별 대화 상태 (단일 사용자 가정)
 STATE = {"flow": None, "goal": "", "char_rel": None, "pending_photo": None, "pending_cap": "",
          "pending_audio": None,
-         "cmp_a": None, "cmp_b": None, "cmp_enhance": False}
+         "cmp_a": None, "cmp_b": None, "cmp_enhance": False,
+         "agent_plan": None, "agent_photos": [], "agent_audio": None,
+         "agent_settings": {}, "agent_changes": []}
 def reset_state():
     STATE.update({"flow": None, "goal": "", "char_rel": None, "pending_photo": None, "pending_cap": "",
                   "pending_audio": None,
-                  "cmp_a": None, "cmp_b": None, "cmp_enhance": False})
+                  "cmp_a": None, "cmp_b": None, "cmp_enhance": False,
+                  "agent_plan": None, "agent_photos": [], "agent_audio": None,
+                  "agent_settings": {}, "agent_changes": []})
 
 SWAP_KW = ("/페이스스왑", "/faceswap", "/얼굴바꾸기", "/얼굴")
 
@@ -2226,15 +2687,27 @@ def menu_pick(text):
     t = text.strip()
     if t and t[0] in "12345" and len(t) <= 2:   # "1" ~ "5" (이모지 숫자 키 제외)
         return {"1": "image", "2": "video", "3": "song", "4": "klein", "5": "faceswap"}[t[0]]
-    for kw, m in (("참고곡 음악", "song_ref"), ("모델대결", "compare"), ("이미지", "image"), ("영상", "video"), ("음악", "song"),
-                  ("인물합성", "klein"), ("페이스스왑", "faceswap"), ("도움말", "help")):
-        if kw in t:
-            return m
-    return None
+    # 자연어 문장 속의 '영상/이미지/음악'은 메뉴 선택이 아니라 에이전트 요청이다.
+    # 아래 키보드 버튼 또는 짧은 정확한 이름만 수동 모드로 해석한다.
+    exact = {
+        "🤖 에이전트": "agent", "에이전트": "agent",
+        "🎧 참고곡 음악": "song_ref", "참고곡 음악": "song_ref",
+        "⚔️ 모델대결": "compare", "모델대결": "compare",
+        "1️⃣ 이미지": "image", "이미지": "image",
+        "2️⃣ 영상": "video", "영상": "video",
+        "3️⃣ 음악": "song", "음악": "song",
+        "4️⃣ 인물합성": "klein", "인물합성": "klein",
+        "5️⃣ 페이스스왑": "faceswap", "페이스스왑": "faceswap",
+        "❓ 도움말": "help", "도움말": "help",
+    }
+    return exact.get(t)
 
 def start_mode(mode):
     reset_state()
-    if mode == "image":
+    if mode == "agent":
+        STATE["flow"] = "await_agent"
+        tg_send("🤖 하고 싶은 걸 편하게 말해주세요. 문장이 엉켜도 괜찮아요. 사진이나 음원을 같이 보내도 됩니다.")
+    elif mode == "image":
         STATE["flow"] = "await_image"; tg_send("🎨 무엇을 그릴까요? 설명을 보내주세요.")
     elif mode == "video":
         STATE["flow"] = "await_video"; tg_send("🎬 어떤 영상? 설명을 보내주세요. (대사는 \"따옴표\")")
@@ -2255,13 +2728,374 @@ def start_mode(mode):
         STATE["flow"] = "compare_a"
         tg_send("⚔️ 모델 대결!\n① A 워크플로를 골라주세요 👇", compare_kb())
 
+
+def _telegram_photo_file_id(msg):
+    """현재 메시지 사진 또는 답장 대상의 사진 중 가장 큰 Telegram file_id."""
+    for source in (msg, msg.get("reply_to_message") or {}):
+        photos = source.get("photo") if isinstance(source, dict) else None
+        if isinstance(photos, list) and photos:
+            item = photos[-1]
+            if isinstance(item, dict) and item.get("file_id"):
+                return item["file_id"]
+    return None
+
+
+def _agent_selected_tool(plan=None):
+    plan = plan or STATE.get("agent_plan") or {}
+    wanted = str(plan.get("tool") or "")
+    return next((tool for tool in agent_tools() if tool.id == wanted), None)
+
+
+_AGENT_LORA_CACHE = {"time": 0.0, "names": []}
+
+
+def installed_loras():
+    if time.time() - float(_AGENT_LORA_CACHE["time"]) < 30:
+        return list(_AGENT_LORA_CACHE["names"])
+    names = []
+    try:
+        payload = requests.get(COMFY + "/object_info", timeout=8).json()
+        for info in (payload or {}).values():
+            required = (((info.get("input") or {}).get("required") or {}) if isinstance(info, dict) else {})
+            raw = required.get("lora_name") or []
+            if isinstance(raw, list) and raw and isinstance(raw[0], list):
+                names.extend(str(x) for x in raw[0] if str(x).strip())
+    except Exception as e:
+        log("LoRA list probe failed:", e)
+    names = sorted(set(names), key=str.lower)
+    _AGENT_LORA_CACHE.update({"time": time.time(), "names": names})
+    return names
+
+
+def _workflow_control_bindings(wf):
+    bindings = {"steps": [], "cfg": [], "denoise": [], "lora": []}
+    for node_id, node in (wf or {}).items():
+        inputs = node.get("inputs") if isinstance(node, dict) else None
+        if not isinstance(inputs, dict):
+            continue
+        for key in ("steps", "cfg", "cfg_scale", "denoise"):
+            if key in inputs and isinstance(inputs[key], (int, float)):
+                canonical = "cfg" if key == "cfg_scale" else key
+                bindings[canonical].append([str(node_id), key, inputs[key]])
+        if "lora_name" in inputs:
+            bindings["lora"].append({
+                "node": str(node_id),
+                "name_field": "lora_name",
+                "strength_fields": [x for x in ("strength_model", "strength_clip") if x in inputs],
+            })
+    return bindings
+
+
+def agent_tool_capabilities(tool_id):
+    controls = {}
+    bindings = {"steps": [], "cfg": [], "denoise": [], "lora": []}
+    supports_lora = False
+    if tool_id == "image":
+        wf = load_wf("toobusy_zimgt.json")
+        controls = {
+            "steps": {"default": wf["1"]["inputs"].get("steps", 8), "min": 1, "max": 50},
+            "cfg": {"default": wf["1"]["inputs"].get("cfg", 1), "min": 0, "max": 20},
+            "denoise": {"default": wf["4"]["inputs"].get("denoise", 0.5), "min": 0, "max": 1},
+            "seed": {"default": None, "min": 0, "max": 2**63 - 1},
+            "image_ratio": {"default": "3:4"},
+        }
+        supports_lora = True
+    elif tool_id == "video":
+        wf = load_wf("LTX_Director_2_Workflow_ggufdis_API.json")
+        controls = {
+            "steps": {"default": wf["33"]["inputs"].get("steps", 8), "min": 1, "max": 50},
+            "cfg": {"default": wf["17"]["inputs"].get("cfg", 1), "min": 0, "max": 20},
+            "denoise": {"default": wf["33"]["inputs"].get("denoise", 1), "min": 0, "max": 1},
+            "seed": {"default": None, "min": 0, "max": 2**63 - 1},
+        }
+    elif tool_id == "klein":
+        wf = load_wf("toobusy_flux2klein_vram.json")
+        controls = {
+            "steps": {"default": wf["3"]["inputs"].get("steps", 4), "min": 1, "max": 50},
+            "seed": {"default": None, "min": 0, "max": 2**63 - 1},
+        }
+        supports_lora = True
+    elif tool_id == "faceswap":
+        controls = {"seed": {"default": None, "min": 0, "max": 2**63 - 1}}
+    elif tool_id in ("song", "song_reference"):
+        controls = {"seed": {"default": None, "min": 0, "max": 2**63 - 1}}
+    elif str(tool_id).startswith("custom:"):
+        try:
+            _, spec = resolve_custom_workflow(str(tool_id).split(":", 1)[1])
+            with open(os.path.join(HERE, spec["file"]), encoding="utf-8-sig") as f:
+                wf = json.load(f)
+            bindings = _workflow_control_bindings(wf)
+            ranges = {"steps": (1, 100), "cfg": (0, 30), "denoise": (0, 1)}
+            for key in ("steps", "cfg", "denoise"):
+                if bindings[key]:
+                    lo, hi = ranges[key]
+                    controls[key] = {"default": bindings[key][0][2], "min": lo, "max": hi}
+            if spec.get("seed_nodes"):
+                controls["seed"] = {"default": None, "min": 0, "max": 2**63 - 1}
+            if spec.get("type") == "image" and (spec.get("ratio_node") or spec.get("width_nodes")):
+                controls["image_ratio"] = {"default": "3:4"}
+            supports_lora = bool(bindings["lora"])
+        except Exception as e:
+            log("agent capability probe failed:", tool_id, e)
+    return {"controls": controls, "supports_lora": supports_lora, "bindings": bindings}
+
+
+def prepare_agent_settings(tool_id, existing=None):
+    capabilities = agent_tool_capabilities(tool_id)
+    settings = {}
+    for key, spec in capabilities["controls"].items():
+        if spec.get("default") is not None:
+            settings[key] = spec["default"]
+    for key, value in dict(existing or {}).items():
+        if key in capabilities["controls"] or key in (
+            "loras", "random_seed", "_touched_controls", "_control_deltas", "agent_binding_values"
+        ):
+            settings[key] = copy.deepcopy(value)
+    if "seed" in capabilities["controls"]:
+        settings["seed"] = _seed_setting(settings)
+        settings.pop("random_seed", None)
+    overrides = []
+    touched = set(settings.get("_touched_controls") or [])
+    deltas = dict(settings.pop("_control_deltas", {}) or {})
+    binding_values = dict(settings.get("agent_binding_values") or {})
+    for key in ("steps", "cfg", "denoise"):
+        if key not in settings or key not in touched:
+            continue
+        for node, field, default in capabilities["bindings"].get(key, []):
+            binding_key = node + "|" + field
+            value = settings[key]
+            if key in deltas:
+                value = float(binding_values.get(binding_key, default)) + float(deltas[key])
+                limits = capabilities["controls"].get(key) or {}
+                value = max(float(limits.get("min", 0)), min(float(limits.get("max", 100)), value))
+                if key == "steps":
+                    value = int(round(value))
+            binding_values[binding_key] = value
+            overrides.append([node, field, value])
+    if settings.get("loras") and capabilities["bindings"].get("lora"):
+        lora = settings["loras"][-1]
+        binding = capabilities["bindings"]["lora"][0]
+        overrides.append([binding["node"], binding["name_field"], lora["name"]])
+        for field in binding["strength_fields"]:
+            overrides.append([binding["node"], field, lora.get("strength", 1.0)])
+    elif "loras" in touched:
+        for binding in capabilities["bindings"].get("lora", []):
+            for field in binding["strength_fields"]:
+                overrides.append([binding["node"], field, 0.0])
+    if overrides:
+        settings["agent_node_overrides"] = overrides
+        settings["agent_binding_values"] = binding_values
+    return settings
+
+
+def _agent_refresh_missing():
+    plan = dict(STATE.get("agent_plan") or {})
+    tool = _agent_selected_tool(plan)
+    missing = []
+    if tool:
+        have_images = len(STATE.get("agent_photos") or [])
+        if have_images < tool.min_images:
+            missing.append(f"image:{tool.min_images - have_images}")
+        if tool.needs_audio and not STATE.get("agent_audio"):
+            missing.append("audio:1")
+    plan["missing_inputs"] = missing
+    STATE["agent_plan"] = plan
+    return missing
+
+
+def _agent_offer_confirmation():
+    plan = STATE.get("agent_plan") or {}
+    brief = str(plan.get("normalized_request") or plan.get("intent") or "").strip()
+    text = format_plan(plan, agent_tools())
+    changes = list(STATE.get("agent_changes") or [])
+    if changes:
+        text += "\n\n⚙️ 설정 변경\n" + format_control_changes(changes)
+    if brief:
+        text += "\n\n📝 정리된 요청\n" + brief
+    missing = _agent_refresh_missing()
+    if missing:
+        STATE["flow"] = "agent_collect_inputs"
+        text = format_plan(STATE["agent_plan"], agent_tools()) + ("\n\n📝 정리된 요청\n" + brief if brief else "")
+        if changes:
+            text += "\n\n⚙️ 설정 변경\n" + format_control_changes(changes)
+        prompts = []
+        if any(str(x).startswith("image:") for x in missing):
+            prompts.append("필요한 사진을 차례로 보내주세요.")
+        if any(str(x).startswith("audio:") for x in missing):
+            prompts.append("참고할 음원을 보내주세요.")
+        tg_send(text + "\n\n" + " ".join(prompts))
+        return
+    cfg = reload_runtime_config()
+    policy = str(cfg.get("agent_confirmation") or "always").strip().lower()
+    try:
+        threshold = max(0.0, min(1.0, float(cfg.get("agent_auto_confidence") or 0.9)))
+    except (TypeError, ValueError):
+        threshold = 0.9
+    try:
+        confidence = float(plan.get("confidence") or 0)
+    except (TypeError, ValueError):
+        confidence = 0.0
+    if policy == "never" or (policy == "uncertain" and confidence >= threshold):
+        STATE["flow"] = "agent_confirm"
+        tg_send(text + "\n\n⚡ 확신이 높아 바로 실행할게요.")
+        execute_agent_plan()
+        return
+    STATE["flow"] = "agent_confirm"
+    tg_send(text + "\n\n이 계획으로 진행할까요?", AGENT_CONFIRM_KB)
+
+
+def start_agent_request(request, photo_file_id=None, audio_item=None, previous_session=None):
+    request = str(request or "").strip()
+    previous_session = previous_session if isinstance(previous_session, dict) else None
+    if previous_session and is_settings_only_request(request):
+        previous_plan = dict(previous_session.get("plan") or {})
+        tool_id = str(previous_plan.get("tool") or "")
+        capabilities = agent_tool_capabilities(tool_id)
+        current = prepare_agent_settings(tool_id, previous_session.get("settings"))
+        if "seed" not in dict(previous_session.get("settings") or {}):
+            current.pop("seed", None)
+        parsed = parse_control_request(request, current, capabilities, installed_loras())
+        if parsed.matched:
+            if parsed.errors:
+                tg_send("⚠️ 설정을 바꾸지 못했어요.\n" + "\n".join("• " + x for x in parsed.errors))
+                return
+            reset_state()
+            previous_plan["reason"] = "직전 결과의 생성 설정만 조정"
+            STATE["agent_plan"] = previous_plan
+            STATE["agent_photos"] = list(previous_session.get("photos") or [])
+            STATE["agent_audio"] = previous_session.get("audio")
+            STATE["agent_settings"] = prepare_agent_settings(tool_id, parsed.settings)
+            STATE["agent_changes"] = parsed.changes
+            agent_event("settings_adjusted", raw_request=request, plan=previous_plan,
+                        changes=parsed.changes, settings=STATE["agent_settings"])
+            _agent_offer_confirmation()
+            return
+    prior_photos = list((previous_session or {}).get("photos") or [])
+    prior_audio = (previous_session or {}).get("audio")
+    if not request:
+        STATE["flow"] = "await_agent"
+        if photo_file_id:
+            STATE["agent_photos"] = [photo_file_id]
+        elif prior_photos:
+            STATE["agent_photos"] = prior_photos
+        if audio_item:
+            STATE["agent_audio"] = audio_item
+        elif prior_audio:
+            STATE["agent_audio"] = prior_audio
+        tg_send("🤖 자료로 무엇을 만들고 싶은지 편하게 말해주세요.")
+        return
+    photos = [photo_file_id] if photo_file_id else prior_photos
+    selected_audio = audio_item or prior_audio
+    tg_send("🧠 요청을 정리하고 가장 알맞은 작업 방법을 찾는 중이에요...")
+    try:
+        plan = make_agent_plan(
+            request, len(photos), bool(selected_audio),
+            previous_plan=(previous_session or {}).get("plan"),
+        )
+    except Exception as e:
+        log("agent planning failed:", traceback.format_exc())
+        if "현재 실행 가능한 생성 기능이 없어요" in str(e):
+            reset_state()
+            agent_event("blocked", raw_request=request, reason="no_ready_tools")
+            tg_send("🧰 아직 실행 가능한 생성 기능이 없어요. 브라우저의 시작 안내에서 필요한 모델과 노드를 먼저 확인해주세요.")
+            return
+        tools = agent_tools()
+        plan = parse_agent_plan("{}", tools, request, len(photos), bool(selected_audio))
+        tg_send(f"⚠️ 에이전트 두뇌 연결이 불안정해서 기본 판단으로 계획했어요: {e}")
+    reset_state()
+    STATE["agent_plan"] = plan.to_dict()
+    STATE["agent_photos"] = photos
+    STATE["agent_audio"] = selected_audio
+    previous_settings = (previous_session or {}).get("settings") if (
+        (previous_session or {}).get("plan", {}).get("tool") == plan.tool
+    ) else None
+    STATE["agent_settings"] = prepare_agent_settings(plan.tool, previous_settings)
+    if is_control_request(request):
+        parsed = parse_control_request(request, STATE["agent_settings"], agent_tool_capabilities(plan.tool), installed_loras())
+        if parsed.ok:
+            STATE["agent_settings"] = prepare_agent_settings(plan.tool, parsed.settings)
+            STATE["agent_changes"] = parsed.changes
+        elif parsed.matched:
+            errors = "\n".join("• " + x for x in parsed.errors)
+            agent_event("settings_blocked", raw_request=request, plan=plan.to_dict(), errors=parsed.errors)
+            reset_state()
+            tg_send("⚠️ 요청한 생성 설정을 적용하지 못했어요.\n" + errors)
+            return
+    agent_event("planned", raw_request=request, plan=plan.to_dict(), image_count=len(photos), has_audio=bool(selected_audio))
+    _agent_offer_confirmation()
+
+
+def execute_agent_plan():
+    plan = dict(STATE.get("agent_plan") or {})
+    photos = list(STATE.get("agent_photos") or [])
+    audio_item = STATE.get("agent_audio")
+    settings = dict(STATE.get("agent_settings") or {})
+    missing = _agent_refresh_missing()
+    if missing:
+        _agent_offer_confirmation()
+        return
+    if not _agent_selected_tool(plan):
+        tg_send("⚠️ 선택한 작업 도구가 현재 목록에 없어요. 요청을 다시 정리해주세요.")
+        reset_state()
+        return
+    tool = str(plan.get("tool") or "image")
+    request = str(plan.get("normalized_request") or plan.get("intent") or "").strip()
+    save_agent_session(plan, photos, audio_item, settings)
+    agent_event("execution_started", plan=plan, image_count=len(photos), has_audio=bool(audio_item), settings=settings)
+    reset_state()
+    try:
+        if tool.startswith("custom:"):
+            refs = [download_ref(fid) for fid in photos]
+            do_custom_text(tool, request, refs, settings)
+        elif tool == "video":
+            if photos:
+                do_video_from_photo(photos[0], request, settings)
+            else:
+                do_text("video", request, settings=settings)
+        elif tool == "song":
+            do_text("song", request, settings=settings)
+        elif tool == "song_reference":
+            do_song_reference(request, audio_item, settings)
+        elif tool == "klein":
+            refs = [{"type": "image", "rel": download_ref(fid),
+                     "role": "character_a" if i == 0 else "prop_a"}
+                    for i, fid in enumerate(photos)]
+            refs.extend({"type": "lora", "lora_name": x.get("name"),
+                         "lora_strength": x.get("strength", 1.0)}
+                        for x in settings.get("loras", []))
+            do_klein_board(refs, request, settings)
+        elif tool == "faceswap":
+            char_rel = download_ref(photos[0])
+            face_rel = download_ref(photos[1])
+            do_faceswap(char_rel, face_rel, request, settings)
+        else:
+            do_text("image", request, settings=settings)
+    except Exception as e:
+        agent_event("execution_failed", plan=plan, error=str(e))
+        raise
+    agent_event("executed", plan=plan, image_count=len(photos), has_audio=bool(audio_item))
+    tg_send("✦･ﾟ: 에이전트 작업 완료! 마음에 드는지 알려주세요. :ﾟ･✦", AGENT_RESULT_KB)
+
 def handle_message(msg):
     text = (msg.get("caption") or msg.get("text") or "").strip()
-    low = text.lower()
-    command_low = _slash_command(low)
     photo = msg.get("photo")
+    photo_file_id = _telegram_photo_file_id(msg)
+    voice = msg.get("voice") if isinstance(msg.get("voice"), dict) else None
     audio = _telegram_audio(msg)
     f = STATE["flow"]
+
+    if voice:
+        tg_send("🎙️ 말한 내용을 듣고 정리하는 중이에요...")
+        try:
+            text = transcribe_agent_voice(voice)
+            tg_send("📝 이렇게 들었어요\n" + text)
+        except Exception as e:
+            log("voice transcription failed:", traceback.format_exc())
+            tg_send(f"⚠️ 음성을 글로 바꾸지 못했어요: {e}\n텍스트로 다시 보내주세요.")
+            return
+
+    low = text.lower()
+    command_low = _slash_command(low)
 
     # 취소
     if command_low in ("/취소", "/cancel", "취소") or text == "❎ 취소":
@@ -2270,6 +3104,90 @@ def handle_message(msg):
     # 메뉴/도움말
     if command_low in ("/start", "/메뉴", "/menu", "메뉴"):
         send_menu("🏓 핑퐁 봇\n" + help_text()); return
+
+    if text == "🏠 메뉴":
+        reset_state(); send_menu("🏓 무엇을 만들까요?"); return
+    if text == "👍 딱 좋아":
+        session = recent_agent_session()
+        record_agent_preference("good", session)
+        agent_event("feedback", rating="good", plan=(session or {}).get("plan"))
+        tg_send("👍 이 선택을 좋은 결과로 기억해둘게요. 다음 요청도 그냥 편하게 말해주세요.", AGENT_RESULT_KB)
+        return
+    if text == "👎 별로야":
+        session = recent_agent_session()
+        record_agent_preference("bad", session)
+        agent_event("feedback", rating="bad", plan=(session or {}).get("plan"))
+        reset_state(); STATE["flow"] = "agent_refine"
+        tg_send("알겠어요. 무엇이 별로였는지 편하게 말해주세요. 다음 계획에서 바꿀게요.")
+        return
+    if text == "✏️ 수정할게":
+        if not recent_agent_session():
+            tg_send("이어 수정할 최근 에이전트 작업이 없어요. 새 요청을 편하게 말해주세요.")
+            return
+        reset_state(); STATE["flow"] = "agent_refine"
+        tg_send("✏️ 무엇을 바꿀까요? 예: 얼굴은 그대로 두고 카메라만 더 천천히")
+        return
+    if text == "🔁 같은 계획 다시":
+        session = recent_agent_session()
+        if not session:
+            tg_send("다시 실행할 최근 에이전트 작업이 없어요.")
+            return
+        reset_state()
+        STATE["agent_plan"] = dict(session.get("plan") or {})
+        STATE["agent_photos"] = list(session.get("photos") or [])
+        STATE["agent_audio"] = session.get("audio")
+        STATE["agent_settings"] = prepare_agent_settings(
+            str(STATE["agent_plan"].get("tool") or ""), session.get("settings")
+        )
+        agent_event("retry_requested", plan=STATE["agent_plan"])
+        _agent_offer_confirmation()
+        return
+
+    if f == "agent_refine":
+        if not text:
+            tg_send("✏️ 바꾸고 싶은 점을 말해주세요.")
+            return
+        start_agent_request(text, photo_file_id, audio, previous_session=recent_agent_session())
+        return
+
+    # 에이전트 파일럿: 거친 요청을 먼저 정리하고 도구/워크플로 선택을 확인받는다.
+    agent_commands = ("/에이전트", "/agent")
+    agent_command = next((k for k in agent_commands if command_low.startswith(k)), None)
+    if agent_command:
+        body = text[len(agent_command):].strip()
+        start_agent_request(body, photo_file_id, audio)
+        return
+
+    if f == "await_agent":
+        stored_photos = list(STATE.get("agent_photos") or [])
+        stored_audio = STATE.get("agent_audio")
+        photo_id = photo_file_id or (stored_photos[0] if stored_photos else None)
+        start_agent_request(text, photo_id, audio or stored_audio)
+        return
+
+    if f == "agent_collect_inputs":
+        if photo_file_id:
+            STATE.setdefault("agent_photos", []).append(photo_file_id)
+        if audio:
+            STATE["agent_audio"] = audio
+        missing = _agent_refresh_missing()
+        if missing:
+            tg_send(format_plan(STATE["agent_plan"], agent_tools()) + "\n\n아직 필요한 자료를 더 보내주세요.")
+        else:
+            _agent_offer_confirmation()
+        return
+
+    if f == "agent_confirm":
+        if text == "✅ 계획대로 실행":
+            execute_agent_plan()
+            return
+        if text == "✏️ 다시 말하기":
+            reset_state()
+            STATE["flow"] = "await_agent"
+            tg_send("✏️ 원하는 결과를 다시 편하게 말해주세요.")
+            return
+        tg_send("아래에서 실행하거나 다시 말하기를 골라주세요.", AGENT_CONFIRM_KB)
+        return
 
     # `.음악참고 설명` + 음원, 또는 명령 후 음원/설명을 차례로 입력.
     ref_commands = ("/음악참고", "/참고음악", "/musicref")
@@ -2440,7 +3358,12 @@ def handle_message(msg):
                     send_menu("✦･ﾟ: 크레아2 캐니 완성! :ﾟ･✦  다음은?")
                     return
 
-    # 기본: 사진은 '뭘 할지' 물어보고, 텍스트는 이미지 생성
+    # 기본 에이전트 모드: 워크플로를 먼저 고르지 않고 의도부터 해석한다.
+    explicit_command = text.startswith(("/", "."))
+    if agent_default_enabled() and not explicit_command and (text or photo_file_id or audio):
+        previous = recent_agent_session() if (is_likely_followup(text) or is_control_request(text)) else None
+        start_agent_request(text, photo_file_id, audio, previous_session=previous)
+        return
     if photo:
         STATE["flow"] = "photo_action"
         STATE["pending_photo"] = photo[-1]["file_id"]; STATE["pending_cap"] = text
@@ -2526,21 +3449,28 @@ def main():
     for ln in lines:
         print("   " + ln, flush=True)
     print("  +---------------------------------------------------+", flush=True)
-    print("  >> INSERT COIN... 폰에서 봇에게 메시지를 보내세요 <<\n", flush=True)
+    tel_on = telegram_enabled()
+    channel_msg = "폰에서 봇에게 메시지를 보내세요" if tel_on else "브라우저 대시보드에서 요청을 보내세요"
+    print(f"  >> INSERT COIN... {channel_msg} <<\n", flush=True)
     # 텔레그램엔 짧게(상세 점검은 콘솔에만). 실패한 항목만 요약.
     fails = [ln for ln in lines if ln.lstrip().startswith(("❌", "⚠️"))]
     health = "✅ 점검 통과" if (comfy_ok and not fails) else ("⚠️ 점검 주의:\n" + "\n".join(fails[:6]))
-    send_menu(TG_BANNER + "\n✦ 가동 완료! ✦\n" + health)
-    init = tg_updates(0)
+    if tel_on:
+        send_menu(TG_BANNER + "\n✦ 가동 완료! ✦\n" + health)
+    init = tg_updates(0) if tel_on else []
     offset = (init[-1]["update_id"] + 1) if init else 0
     beat = 0
     while True:
         try:
             process_queue()
-            ups = tg_updates(offset)
+            tel_on = telegram_enabled()
+            ups = tg_updates(offset) if tel_on else []
             if not ups:  # 대기 중 — 살아있다는 표시
                 beat += 1
-                print(f"  [{time.strftime('%H:%M:%S')}] 대기 중... (메시지 기다리는 중) #{beat}", flush=True)
+                waiting = "메시지" if tel_on else "브라우저 작업"
+                print(f"  [{time.strftime('%H:%M:%S')}] 대기 중... ({waiting} 기다리는 중) #{beat}", flush=True)
+                if not tel_on:
+                    time.sleep(2)
             for upd in ups:
                 offset = upd["update_id"] + 1
                 msg = upd.get("message") or {}

@@ -145,3 +145,18 @@
 - rAF 대신 setInterval을 써서 탭이 가려져도 동기화 루프가 멈추지 않게 함
 - 변형(칩) 교체 시 현재 재생 위치를 유지한 채 이어서 비교
 - 이미지 비교·번들 비교·CONTROL SOURCE 기존 동작은 그대로 유지 (실서버에서 이미지/영상 양쪽 회귀 확인)
+
+## 2026-08-08 0.3.0 로컬 작업 발행 (8/1~8/5 작업분)
+
+- 자연어 제작 에이전트 (`agent_core.py`, `agent_controls.py`)
+  - 워크플로를 직접 고르지 않아도 요청을 해석해 알맞은 생성 기능을 계획·선택 (인텐트 라우터 + 도구 카탈로그 + 계획 검증)
+  - 기술 후속 요청(해상도·길이·비율 등)은 LLM 재호출 없이 최근 계획을 재사용하는 결정적 파서로 처리
+  - `agent_default`, `agent_confirmation`, `agent_auto_confidence` 설정 추가
+- 브라우저 퍼스트 온보딩 (`onboarding.py`)
+  - 텔레그램 없이 시작 가능(`telegram_enabled`), 첫 실행 시 config 자동 생성과 준비 상태 진단 제공
+- 선택형 음성 입력
+  - Faster-Whisper 설치 시 텔레그램 음성 요청을 자연어 작업으로 연결 (`agent_whisper_*` 설정)
+- 인앱 패치/업데이트 매니저 (`update_manager.py`, `patches.json`)
+  - 패치 목록 발견, 개인 설정·커스텀 워크플로 백업, 멱등 config 마이그레이션
+- 대시보드/워커에 에이전트 세션 스토어(`browser_agent.py`)와 컨트롤·엔드포인트 연결
+- 테스트 40개 추가(`tests/`) — 전부 통과 확인 후 발행

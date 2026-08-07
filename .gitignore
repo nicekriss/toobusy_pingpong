@@ -3,6 +3,11 @@ config.json
 dashboard_hidden.json
 dashboard_reference_presets.json
 dashboard_comfy_progress.json
+agent_session.json
+agent_preferences.json
+browser_agent_sessions/
+update_state.json
+backups/
 
 # 런타임 생성물
 queue/
@@ -26,3 +31,7 @@ logs/
 *.log
 config.*backup*.json
 config.codex_*.json
+config.before_*.json
+
+# 로컬 리뷰용 생성 이미지(용량 큼)
+review_assets/

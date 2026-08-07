@@ -13,6 +13,9 @@ import urllib.error
 import html as html_lib
 import xml.etree.ElementTree as ET
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from onboarding import ensure_config, first_run_status
+import update_manager
+import browser_agent
 
 try:
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -21,7 +24,7 @@ except Exception:
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 CFG_PATH = os.path.join(HERE, "config.json")
-CFG = json.load(open(CFG_PATH, encoding="utf-8"))
+CFG, CONFIG_CREATED = ensure_config(CFG_PATH)
 CUSTOM = CFG.get("custom_workflows", {}) or {}
 def _auto(k, *parts):
     base = os.path.join(os.environ.get("LOCALAPPDATA", ""), "Comfy-Desktop", "ComfyUI-Shared")
@@ -47,7 +50,7 @@ QUEUE    = os.path.join(HERE, "queue")
 HIDDEN   = os.path.join(HERE, "dashboard_hidden.json")
 PRESETS  = os.path.join(HERE, "dashboard_reference_presets.json")
 PROGRESS = os.path.join(HERE, "dashboard_comfy_progress.json")
-PORT     = int(CFG.get("dashboard_port", 8910))
+PORT     = int(os.environ.get("PINGPONG_DASHBOARD_PORT") or CFG.get("dashboard_port", 8910))
 BIND_HOST = CFG.get("dashboard_host", "127.0.0.1")
 OPEN_HOST = "127.0.0.1" if BIND_HOST in ("0.0.0.0", "::", "") else BIND_HOST
 EVENTS   = []
@@ -113,7 +116,7 @@ def read_config():
         return dict(CFG)
 
 def write_config(data):
-    global CFG, CUSTOM, LMAPI
+    global CFG, CUSTOM, LMAPI, COMFY
     tmp = CFG_PATH + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
@@ -122,14 +125,16 @@ def write_config(data):
     CFG = data
     CUSTOM = CFG.get("custom_workflows", {}) or {}
     LMAPI = CFG.get("lmstudio_api", "http://127.0.0.1:1234").rstrip("/")
+    COMFY = CFG.get("comfy_api", "http://127.0.0.1:8188").rstrip("/")
     MODE_STATUS_CACHE["t"] = 0
 
 def refresh_runtime_config():
-    global CFG, CUSTOM, LMAPI
+    global CFG, CUSTOM, LMAPI, COMFY
     cfg = read_config()
     CFG = cfg
     CUSTOM = cfg.get("custom_workflows", {}) or {}
     LMAPI = cfg.get("lmstudio_api", "http://127.0.0.1:1234").rstrip("/")
+    COMFY = cfg.get("comfy_api", "http://127.0.0.1:8188").rstrip("/")
     return cfg
 
 def dashboard_key():
@@ -159,6 +164,12 @@ def needs_dashboard_key(path):
         "/api/compare_score",
         "/api/compare_hide",
         "/api/compare_delete",
+        "/api/onboarding/save",
+        "/api/onboarding/finish",
+        "/api/onboarding/start",
+        "/api/update/apply",
+        "/api/agent/plan",
+        "/api/agent/confirm",
     }
 
 def _add_model(out, seen, model_id, label=None, source=""):
@@ -852,6 +863,11 @@ def custom_modes():
             "llm": spec.get("llm", "none"),
             "image_inputs": len(spec.get("image_nodes", [])),
             "ratio": bool(spec.get("ratio_node") or spec.get("width_nodes")),
+            "default_ratio": str(spec.get("default_ratio", "3:4") or "3:4"),
+            "megapixels": bool(spec.get("megapixels_nodes")),
+            "default_megapixels": float(spec.get("default_megapixels", 1.0) or 1.0),
+            "default_seconds": float(spec.get("default_seconds", 5) or 5),
+            "max_seconds": float(spec.get("max_seconds", 20) or 20),
             "enhancer": bool(spec.get("enhancer_node")),
             "stages": [str(s[1]) if isinstance(s, (list, tuple)) and len(s) > 1 else f"단계{i}"
                        for i, s in enumerate(spec.get("stage_nodes", []), 1)],
@@ -869,7 +885,10 @@ def compare_workflows():
     image_inputs>0 이면 편집형(입력 사진 필요) — 프론트에서 같은 종류끼리만 붙임."""
     refresh_runtime_config()
     out = [{"id": "zit", "label": "Z-Image Turbo", "builtin": True, "ratio": True, "image_inputs": 0},
-           {"id": "klein", "label": "Flux2 Klein", "builtin": True, "ratio": False, "image_inputs": 1}]
+           {"id": "klein", "label": "Flux2 Klein", "builtin": True, "ratio": False, "image_inputs": 1},
+           {"id": "klein3", "label": "Flux2 Klein 3Ref", "builtin": True, "ratio": False, "image_inputs": 3},
+           {"id": "klein4", "label": "Flux2 Klein 4B", "builtin": True, "ratio": False, "image_inputs": 1},
+           {"id": "klein4_3", "label": "Flux2 Klein 4B 3Ref", "builtin": True, "ratio": False, "image_inputs": 3}]
     for name, spec in CUSTOM.items():
         if spec.get("type") != "image":
             continue
@@ -878,7 +897,7 @@ def compare_workflows():
             "label": name,
             "builtin": False,
             "ratio": bool(spec.get("ratio_node") or spec.get("width_nodes")),
-            "image_inputs": len(spec.get("image_nodes", [])),
+            "image_inputs": int(spec.get("compare_image_inputs") or len(spec.get("image_nodes", []))),
         })
     return out
 
@@ -1422,6 +1441,8 @@ def custom_mode_status(name, spec, online):
 def mode_status_for(mode, online=None):
     if online is None:
         online = comfy_is_online()
+    if mode in ("image_direct", "image_fanout"):
+        mode = "image"
     if mode in BUILTIN_MODE_CHECKS:
         return builtin_mode_status(mode, online)
     if isinstance(mode, str) and mode.startswith("custom:"):
@@ -1754,6 +1775,26 @@ def restart_self():
     threading.Timer(0.8, lambda: os._exit(0)).start()
 
 
+def worker_is_alive():
+    try:
+        return time.time() - os.path.getmtime(ALIVE) < 45
+    except OSError:
+        return False
+
+
+def start_worker():
+    if worker_is_alive():
+        return {"ok": True, "already_running": True}
+    flags = HIDDEN_SUBPROCESS_FLAGS
+    if os.name == "nt":
+        flags |= getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+    subprocess.Popen(
+        [sys.executable, os.path.join(HERE, "pingpong.py")], cwd=HERE,
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=flags,
+    )
+    return {"ok": True, "already_running": False}
+
+
 class H(BaseHTTPRequestHandler):
     def log_message(self, *a):
         pass
@@ -1774,7 +1815,24 @@ class H(BaseHTTPRequestHandler):
         parsed = urllib.parse.urlparse(self.path)
         p = parsed.path
         if p == "/" or p == "/index.html":
-            page = PAGE.replace("__PP_KEY__", json.dumps(dashboard_key()))
+            template = FIRST_RUN_PAGE if CFG.get("onboarding_complete") is False else PAGE
+            page = template.replace("__PP_KEY__", json.dumps(dashboard_key()))
+            b = page.encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(b)))
+            self.end_headers()
+            self.wfile.write(b)
+        elif p == "/welcome":
+            page = FIRST_RUN_PAGE.replace("__PP_KEY__", json.dumps(dashboard_key()))
+            b = page.encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(b)))
+            self.end_headers()
+            self.wfile.write(b)
+        elif p == "/updates":
+            page = UPDATE_PAGE.replace("__PP_KEY__", json.dumps(dashboard_key()))
             b = page.encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
@@ -1805,6 +1863,19 @@ class H(BaseHTTPRequestHandler):
             self._json(scan(qs.get("page", ["1"])[0], qs.get("per", ["48"])[0]))
         elif p == "/api/status":
             self._json(status())
+        elif p == "/api/agent/status":
+            qs = urllib.parse.parse_qs(parsed.query)
+            self._json(browser_agent.public(browser_agent.read(qs.get("id", [""])[0])))
+        elif p == "/api/onboarding/status":
+            self._json(first_run_status(read_config(), mode_statuses(True)))
+        elif p == "/api/update/status":
+            qs = urllib.parse.parse_qs(parsed.query)
+            if qs.get("auto", ["0"])[0] in ("1", "true", "yes"):
+                self._json(update_manager.automatic_update_status())
+            else:
+                self._json(update_manager.update_status(qs.get("refresh", ["0"])[0] in ("1", "true", "yes")))
+        elif p == "/api/update/progress":
+            self._json({"ok": True, **update_manager.read_apply_state()})
         elif p == "/api/modes":
             qs = urllib.parse.parse_qs(parsed.query)
             force = qs.get("force", ["0"])[0] in ("1", "true", "yes")
@@ -1863,6 +1934,80 @@ class H(BaseHTTPRequestHandler):
             body = self._body()
         except Exception:
             return self._json({"ok": False, "err": "bad body"}, 400)
+        if p == "/api/onboarding/save":
+            cfg = read_config()
+            for key in ("comfy_api", "lmstudio_api", "llm_model"):
+                if key in body:
+                    cfg[key] = str(body.get(key) or "").strip()
+            new_token = str(body.get("telegram_token") or "").strip()
+            if new_token:
+                cfg["telegram_token"] = new_token
+            if "telegram_chat_id" in body:
+                raw_chat = str(body.get("telegram_chat_id") or "").strip()
+                try:
+                    cfg["telegram_chat_id"] = int(raw_chat) if raw_chat else 0
+                except ValueError:
+                    return self._json({"ok": False, "err": "chat ID는 숫자로 입력해주세요."}, 400)
+            if "telegram_enabled" in body:
+                cfg["telegram_enabled"] = bool(body.get("telegram_enabled"))
+            if cfg.get("telegram_enabled") and not cfg.get("telegram_token"):
+                return self._json({"ok": False, "err": "텔레그램을 켜려면 BotFather 토큰을 입력해주세요."}, 400)
+            write_config(cfg)
+            return self._json({"ok": True, "status": first_run_status(cfg, mode_statuses(True))})
+        if p == "/api/agent/plan":
+            text = str(body.get("text") or "").strip()
+            if not text:
+                return self._json({"ok": False, "err": "무엇을 만들지 편하게 적어주세요."}, 400)
+            previous = browser_agent.read(str(body.get("session_id") or "")) or {}
+            assets = body.get("assets") if isinstance(body.get("assets"), list) else []
+            images = body.get("images") if isinstance(body.get("images"), list) else []
+            if assets or images:
+                references = save_reference_assets(assets, images)
+                director = [save_director_asset(item, i) for i, item in enumerate(assets)]
+                director = [item for item in director if item]
+            else:
+                references = list(previous.get("reference_assets") or [])
+                director = list(previous.get("director_assets") or [])
+            session = browser_agent.create(
+                text,
+                reference_assets=references,
+                director_assets=director,
+                previous_plan=dict(previous.get("plan") or {}),
+                previous_settings=dict(previous.get("settings") or {}),
+            )
+            enqueue({"mode": "agent_plan_browser", "session_id": session["id"]})
+            event("browser agent planning: " + text[:80])
+            return self._json(browser_agent.public(session))
+        if p == "/api/agent/confirm":
+            session_id = str(body.get("session_id") or "")
+            session = browser_agent.read(session_id)
+            if not session:
+                return self._json({"ok": False, "err": "에이전트 계획을 찾지 못했어요."}, 404)
+            if session.get("state") != "planned":
+                return self._json({"ok": False, "err": "아직 실행할 수 있는 계획이 아니에요."}, 400)
+            if (session.get("plan") or {}).get("missing_inputs"):
+                return self._json({"ok": False, "err": "필요한 사진이나 음원을 먼저 추가해주세요."}, 400)
+            browser_agent.update(session_id, state="queued", queued_at=time.time())
+            enqueue({"mode": "agent_execute_browser", "session_id": session_id})
+            event("browser agent queued: " + str((session.get("plan") or {}).get("tool") or ""))
+            return self._json(browser_agent.public(browser_agent.read(session_id)))
+        if p == "/api/onboarding/finish":
+            cfg = read_config()
+            cfg["onboarding_complete"] = True
+            write_config(cfg)
+            return self._json({"ok": True})
+        if p == "/api/onboarding/start":
+            try:
+                return self._json(start_worker())
+            except Exception as e:
+                return self._json({"ok": False, "err": str(e)}, 500)
+        if p == "/api/update/apply":
+            if body.get("accepted") is not True:
+                return self._json({"ok": False, "err": "패치 내용을 확인하고 수락해주세요."}, 400)
+            result = update_manager.start_apply(str(body.get("target_release") or ""))
+            if not result.get("ok"):
+                return self._json({"ok": False, "err": result.get("error") or "패치를 시작하지 못했어요."}, 400)
+            return self._json(result)
         if p == "/api/generate":
             mode = body.get("mode", "image")
             text = body.get("text", "")
@@ -2182,6 +2327,59 @@ class H(BaseHTTPRequestHandler):
                 remain -= len(chunk)
 
 
+UPDATE_PAGE = r'''<!doctype html><html lang="ko"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>핑퐁 패치</title>
+<style>
+:root{color-scheme:dark;--bg:#090b12;--card:#161a26;--line:#2c3242;--text:#f5f6fa;--muted:#aeb5c5;--accent:#8b7cff;--ok:#55d98b;--warn:#ffca65;--bad:#ff718f}*{box-sizing:border-box}body{margin:0;background:radial-gradient(circle at 85% 0,#29204c 0,transparent 38%),var(--bg);color:var(--text);font:16px/1.55 system-ui,"Noto Sans KR",sans-serif}.wrap{width:min(820px,calc(100% - 32px));margin:46px auto 80px}.back{color:#b8b0ff;text-decoration:none}.hero h1{font-size:clamp(34px,7vw,58px);line-height:1.08;margin:18px 0 10px}.hero p{color:var(--muted);font-size:18px}.card{background:rgba(22,26,38,.94);border:1px solid var(--line);border-radius:20px;padding:23px;margin:16px 0}.release{display:flex;justify-content:space-between;gap:12px;align-items:center}.version{font-size:24px;font-weight:900}.badge{border-radius:999px;padding:6px 11px;background:#23283a;color:var(--warn);font-size:13px;font-weight:800}.badge.ok{color:var(--ok)}.patch{padding:15px 0;border-top:1px solid var(--line)}.patch:first-child{border-top:0}.patch b{font-size:17px}.patch p{color:var(--muted);margin:5px 0}.kind{display:inline-block;font-size:11px;border:1px solid #494066;color:#cfc9ff;border-radius:5px;padding:2px 6px;margin-right:7px}.notice{color:var(--warn);background:#17150e;border:1px solid #54451e;border-radius:12px;padding:12px 14px;margin:14px 0}.safe{color:var(--muted);font-size:14px}.accept{display:flex;gap:8px;align-items:flex-start;margin:18px 0}.accept input{margin-top:5px;accent-color:var(--accent)}button{border:0;border-radius:12px;background:var(--accent);color:white;padding:13px 18px;font-weight:850;font-size:15px;cursor:pointer}button.secondary{background:#2a3040}button:disabled{opacity:.42;cursor:not-allowed}.row{display:flex;gap:10px;flex-wrap:wrap}.bar{height:9px;background:#0b0d14;border-radius:99px;overflow:hidden;margin:16px 0}.fill{height:100%;width:0;background:linear-gradient(90deg,var(--accent),#55d9ca);transition:.3s}.msg{min-height:26px;color:var(--warn);margin-top:10px}.hidden{display:none}@media(max-width:600px){.release{display:block}.badge{display:inline-block;margin-top:8px}.row button{width:100%}}
+</style></head><body><main class="wrap"><a class="back" href="/">← 스튜디오로 돌아가기</a><section class="hero"><h1>핑퐁 패치</h1><p>무엇이 바뀌는지 확인하고 수락하면, 개인 설정을 백업한 뒤 안전하게 적용합니다.</p></section>
+<section class="card"><div class="release"><div><div id="versions" class="version">새 버전 확인 중...</div><div id="date" class="safe"></div></div><span id="badge" class="badge">확인 중</span></div><div id="reason" class="notice hidden"></div><div id="patches"></div></section>
+<section class="card"><b>패치 전에 자동으로 보호하는 항목</b><p class="safe">개인 설정 · 에이전트 선호도 · 텔레그램 연결 · 등록한 워크플로를 별도 백업합니다. 새 설정은 기존 값을 덮지 않고 없는 항목만 추가합니다. 모델처럼 큰 파일은 이 패치에 포함하지 않습니다.</p><label class="accept"><input id="accept" type="checkbox" onchange="toggleApply()"><span>위 변경 내용과 재시작이 필요할 수 있음을 확인했습니다.</span></label><div class="row"><button class="secondary" onclick="check(true)">새로 확인</button><button id="apply" onclick="applyPatch()" disabled>패치 수락하고 적용</button><button id="restart" class="hidden" onclick="restart()">완료 · 핑퐁 재시작</button></div><div class="bar"><div id="fill" class="fill"></div></div><div id="msg" class="msg"></div></section>
+</main><script>
+const KEY=__PP_KEY__;let STATUS=null;
+function api(path,body){let o={headers:{'Content-Type':'application/json','X-PP-Key':KEY}};if(body!==undefined){o.method='POST';o.body=JSON.stringify(body)}return fetch(path,o).then(async r=>{let j=await r.json();if(!r.ok||j.ok===false)throw new Error(j.err||j.error||'요청 실패');return j})}
+function esc(s){return String(s||'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
+function check(refresh){msg.textContent=refresh?'배포 서버에서 새 패치를 확인하는 중...':'';api('/api/update/status'+(refresh?'?refresh=1':'')).then(render).catch(e=>msg.textContent=e.message)}
+function render(s){STATUS=s;versions.textContent=(s.current_release||'현재 버전')+' → '+(s.available?(s.target_release||'새 버전'):'최신');date.textContent=s.published_at||'';badge.textContent=s.available?'새 패치 '+s.behind+'개':'최신 버전';badge.className='badge'+(s.available?'':' ok');let ps=s.patches||[];patches.innerHTML=ps.map(p=>`<div class="patch"><span class="kind">${esc(p.kind||'core')}</span><b>${esc(p.title||p.id)}</b><p>${esc(p.summary||'프로그램 개선')}</p></div>`).join('')||'<div class="patch"><p>적용할 새 패치가 없습니다.</p></div>';reason.className=s.reason?'notice':'notice hidden';reason.textContent=s.reason||'';msg.textContent=s.available?(s.can_apply?'백업 후 적용할 수 있어요.':'현재 자동 적용을 멈췄어요.'):'핑퐁이 최신 상태예요.';toggleApply()}
+function toggleApply(){apply.disabled=!(STATUS&&STATUS.available&&STATUS.can_apply&&accept.checked)}
+function applyPatch(){if(!STATUS)return;apply.disabled=true;msg.textContent='패치를 준비하는 중...';api('/api/update/apply',{accepted:true,target_release:STATUS.target_release}).then(()=>poll()).catch(e=>{msg.textContent=e.message;toggleApply()})}
+function poll(){api('/api/update/progress').then(s=>{fill.style.width=(s.progress||0)+'%';let labels={queued:'패치 대기 중...',backing_up:'개인 설정을 백업하는 중...',installing:'새 프로그램 파일을 적용하는 중...',migrating:'설정을 안전하게 옮기는 중...',complete:'패치가 완료됐어요.',error:'패치 적용 중 문제가 생겼어요.'};msg.textContent=labels[s.state]||s.state||'';if(s.state==='complete'){restart.classList.remove('hidden');return}if(s.state==='error'){msg.textContent+=' '+(s.error||'')+' 백업: '+(s.backup||'');return}setTimeout(poll,1000)}).catch(e=>{msg.textContent=e.message;setTimeout(poll,2000)})}
+function restart(){api('/api/restart_dashboard',{}).then(()=>setTimeout(()=>location.href='/',2200)).catch(e=>msg.textContent=e.message)}
+check(true);api('/api/update/progress').then(s=>{if(['queued','backing_up','installing','migrating','complete'].includes(s.state))poll()});
+</script></body></html>'''
+
+FIRST_RUN_PAGE = r'''<!doctype html><html lang="ko"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>핑퐁 시작하기</title>
+<style>
+:root{color-scheme:dark;--bg:#090b12;--card:#151925;--line:#2a3040;--text:#f4f5f8;--muted:#a9b0c0;--ok:#55d98b;--warn:#ffca65;--accent:#8b7cff}
+*{box-sizing:border-box}body{margin:0;background:radial-gradient(circle at 20% 0,#211d42 0,transparent 38%),var(--bg);color:var(--text);font:16px/1.55 system-ui,"Noto Sans KR",sans-serif}
+.wrap{width:min(920px,calc(100% - 32px));margin:50px auto 80px}.hero{margin-bottom:28px}.eyebrow{color:#a99cff;font-weight:800;letter-spacing:.12em}.hero h1{font-size:clamp(34px,7vw,62px);line-height:1.08;margin:8px 0 14px}.hero p{color:var(--muted);font-size:18px;max-width:680px}
+.panel{background:rgba(21,25,37,.93);border:1px solid var(--line);border-radius:22px;padding:24px;margin:18px 0;box-shadow:0 18px 60px #0005}.panel h2{margin:0 0 8px}.sub{color:var(--muted);margin:0 0 18px}.checks{display:grid;grid-template-columns:repeat(3,1fr);gap:12px}.check{border:1px solid var(--line);border-radius:16px;padding:16px;background:#10131d}.dot{display:inline-block;width:10px;height:10px;border-radius:50%;background:#596071;margin-right:8px}.check.ok .dot{background:var(--ok);box-shadow:0 0 16px var(--ok)}.check.wait .dot{background:var(--warn)}.check small{display:block;color:var(--muted);margin-top:5px}
+label{display:block;color:#cdd1dc;font-size:14px;margin:13px 0 6px}input{width:100%;border:1px solid var(--line);border-radius:12px;background:#0c0f17;color:var(--text);padding:13px;font:inherit}button,.button{border:0;border-radius:12px;padding:13px 18px;font-weight:800;font-size:15px;cursor:pointer;background:var(--accent);color:white}.secondary{background:#282d3c}.ghost{background:transparent;border:1px solid var(--line)}button:disabled{opacity:.45;cursor:not-allowed}.row{display:flex;gap:10px;flex-wrap:wrap;margin-top:18px}.row>*{flex:1;min-width:150px}.next{padding:14px 16px;border-radius:13px;background:#0d1720;color:#c8e9d5;margin-top:14px}.optional{margin-top:14px}.optional summary{cursor:pointer;color:#c9c4ff;font-weight:700}.test{display:flex;gap:10px}.test input{flex:1}.test button{white-space:nowrap}.msg{min-height:24px;color:var(--warn);margin-top:12px}.fine{font-size:13px;color:var(--muted)}
+@media(max-width:680px){.wrap{margin-top:28px}.checks{grid-template-columns:1fr}.panel{padding:19px}.test{display:block}.test button{width:100%;margin-top:10px}}
+</style></head><body><main class="wrap">
+<section class="hero"><div class="eyebrow">PING · PONG</div><h1>설정보다 먼저,<br>만들고 싶은 것부터.</h1><p>핑퐁이 이 PC에서 가능한 기능을 찾아드릴게요. 텔레그램과 음성 입력은 나중에 연결해도 됩니다.</p></section>
+<section class="panel"><h2>지금 준비된 기능</h2><p class="sub">기술 용어 대신 실제로 할 수 있는 일을 기준으로 확인합니다.</p><div id="checks" class="checks"></div><div id="next" class="next">확인하는 중...</div><div class="row"><button class="secondary" onclick="refreshStatus()">다시 확인</button><button onclick="startPingpong()">핑퐁 작업 엔진 켜기</button></div></section>
+<section class="panel"><h2>연결 설정</h2><p class="sub">자동으로 찾은 값이 맞으면 그대로 두세요.</p>
+<label>ComfyUI 주소</label><input id="comfy" placeholder="http://127.0.0.1:8188">
+<label>LM Studio 주소</label><input id="lmapi" placeholder="http://127.0.0.1:1234">
+<label>요청을 정리할 LM Studio 모델</label><input id="llm" placeholder="비워두면 직접 생성 기능부터 사용">
+<details class="optional"><summary>휴대폰 텔레그램 연결 · 선택사항</summary><label><input id="tgon" type="checkbox" style="width:auto"> 텔레그램 사용</label><label>BotFather 토큰</label><input id="token" type="password"><label>Chat ID</label><input id="chat" inputmode="numeric"></details>
+<div class="row"><button onclick="saveConfig()">설정 저장하고 검사</button></div><div id="saveMsg" class="msg"></div></section>
+<section class="panel"><h2>첫 결과 만들기</h2><p class="sub">이미지 기능이 준비됐다면 워크플로를 고르지 않고 바로 큐에 넣을 수 있어요.</p><div class="test"><input id="prompt" value="비 오는 서울의 밤, 네온 불빛 아래 걷는 고양이"><button id="testBtn" onclick="firstImage()">첫 이미지 만들기</button></div><div id="testMsg" class="msg"></div><div class="row"><button class="ghost" onclick="finish()">스튜디오로 들어가기</button></div><p class="fine">모델과 커스텀 노드는 용량과 라이선스 때문에 자동 설치 범위를 순차적으로 넓히는 중입니다.</p></section>
+</main><script>
+const KEY=__PP_KEY__;let STATUS=null;
+function api(path,body){let opt={headers:{'Content-Type':'application/json','X-PP-Key':KEY}};if(body!==undefined){opt.method='POST';opt.body=JSON.stringify(body)}return fetch(path,opt).then(async r=>{let j=await r.json();if(!r.ok||j.ok===false)throw new Error(j.err||'요청 실패');return j})}
+function esc(s){return String(s||'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
+function refreshStatus(){document.getElementById('next').textContent='PC와 생성 환경을 확인하는 중...';api('/api/onboarding/status').then(render).catch(e=>document.getElementById('next').textContent=e.message)}
+function render(s){STATUS=s;let keys=['comfy','workflow','llm','telegram','voice'];document.getElementById('checks').innerHTML=keys.map(k=>{let x=s.checks[k],extra=x.count!==undefined?x.count+'개 준비':(x.optional?'나중에 연결 가능':(x.ready?'사용 가능':'확인 필요'));return `<div class="check ${x.ready?'ok':'wait'}"><div><span class="dot"></span><b>${esc(x.label)}</b></div><small>${esc(extra)}</small></div>`}).join('');document.getElementById('next').textContent=s.next_action;let c=s.config;document.getElementById('comfy').value=c.comfy_api||'';document.getElementById('lmapi').value=c.lmstudio_api||'';document.getElementById('llm').value=c.llm_model||'';document.getElementById('tgon').checked=!!c.telegram_enabled;document.getElementById('token').placeholder=c.telegram_token_set?'이미 저장됨 · 바꿀 때만 입력':'123456:ABC...';document.getElementById('chat').value=c.telegram_chat_id||'';document.getElementById('testBtn').disabled=(s.ready_modes||[]).indexOf('image')<0}
+function saveConfig(){let body={comfy_api:comfy.value.trim(),lmstudio_api:lmapi.value.trim(),llm_model:llm.value.trim(),telegram_enabled:tgon.checked,telegram_token:token.value.trim(),telegram_chat_id:chat.value.trim()};saveMsg.textContent='저장하는 중...';api('/api/onboarding/save',body).then(j=>{saveMsg.textContent='저장했어요.';render(j.status)}).catch(e=>saveMsg.textContent=e.message)}
+function startPingpong(){document.getElementById('next').textContent='핑퐁 작업 엔진을 시작하는 중...';api('/api/onboarding/start',{}).then(j=>{document.getElementById('next').textContent=j.already_running?'이미 실행 중이에요.':'실행했어요. 잠시 뒤 첫 요청을 보낼 수 있어요.';setTimeout(refreshStatus,2500)}).catch(e=>document.getElementById('next').textContent=e.message)}
+function firstImage(){let text=prompt.value.trim();if(!text)return;testMsg.textContent='작업 큐에 넣는 중...';api('/api/generate',{mode:'image_direct',text:text,images:[],assets:[],settings:{}}).then(j=>testMsg.textContent='첫 요청을 받았어요. 스튜디오 갤러리에서 진행 상황을 볼 수 있어요.').catch(e=>testMsg.textContent=e.message)}
+function finish(){api('/api/onboarding/finish',{}).then(()=>location.href='/').catch(e=>alert(e.message))}
+refreshStatus();
+</script></body></html>'''
+
 COMPARE_PAGE = r'''<!doctype html><html lang="ko"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>모델 대결 · 핑퐁</title>
@@ -2268,6 +2466,7 @@ textarea:focus{outline:none;border-color:var(--cyan);box-shadow:0 0 0 2px rgba(8
 .editup{display:none;align-items:center;gap:10px;margin-bottom:11px;padding:9px 11px;border:1px solid var(--amb);border-radius:9px;background:rgba(255,209,102,.06);font-size:15px;color:var(--mut);flex-wrap:wrap}
 .editup.on{display:flex}
 .editprev img{height:46px;border-radius:6px;border:1px solid var(--ln);vertical-align:middle}
+.editprev img+img{margin-left:4px}
 .board{display:none;margin-top:20px}.board.on{display:block}
 .btool{position:sticky;top:0;z-index:5;display:flex;align-items:center;gap:14px;flex-wrap:wrap;
   padding:11px 13px;margin-bottom:6px;background:rgba(10,8,20,.94);border:1px solid var(--ln);border-radius:11px;backdrop-filter:blur(4px)}
@@ -2383,9 +2582,9 @@ textarea:focus{outline:none;border-color:var(--cyan);box-shadow:0 0 0 2px rgba(8
 </div>
 <div class="panel promptpanel" id="promptpanel">
   <h3>⚙ 대결 설정</h3>
-  <div class="editup" id="editup">📷 편집할 원본(얼굴) 이미지 →
+  <div class="editup" id="editup"><span id="editlabel">📷 편집할 원본 이미지 →</span>
     <button class="minib" onclick="document.getElementById('editfile').click()">사진 선택</button>
-    <input type="file" id="editfile" accept="image/*" style="display:none" onchange="pickEditImg(event)">
+    <input type="file" id="editfile" accept="image/*" multiple style="display:none" onchange="pickEditImg(event)">
     <span id="editprev" class="editprev"></span>
   </div>
   <div class="prompthead">
@@ -2487,10 +2686,14 @@ function pick(side,id){
   refresh();
 }
 function pickEditImg(e){
-  var f=e.target.files&&e.target.files[0];if(!f)return;
-  var rd=new FileReader();
-  rd.onload=function(){EDITIMG=[rd.result];document.getElementById('editprev').innerHTML='<img src="'+rd.result+'"> 준비됨';refresh()};
-  rd.readAsDataURL(f);
+  var fs=Array.prototype.slice.call(e.target.files||[]).slice(0,needImgs());if(!fs.length)return;
+  Promise.all(fs.map(function(f){return new Promise(function(resolve,reject){
+    var rd=new FileReader();rd.onload=function(){resolve(rd.result)};rd.onerror=reject;rd.readAsDataURL(f);
+  })})).then(function(imgs){
+    EDITIMG=imgs;
+    document.getElementById('editprev').innerHTML=imgs.map(function(src){return '<img src="'+src+'">'}).join('')+' '+imgs.length+'/'+needImgs()+'장 준비됨';
+    refresh();
+  }).catch(function(){showErr('사진을 읽지 못했습니다.')});
 }
 function lines(){return document.getElementById('prompts').value.split(/\r?\n/).map(function(s){return s.trim()}).filter(Boolean).slice(0,20)}
 function refresh(){
@@ -2500,6 +2703,7 @@ function refresh(){
   var em=editModeOn();
   var mixed=!single&&selA&&selB&&((wfImgInputs(selA)>0)!=(wfImgInputs(selB)>0));
   document.getElementById('editup').classList.toggle('on',em);
+  document.getElementById('editlabel').textContent='📷 편집 레퍼런스 '+needImgs()+'장 →';
   var sameEl=document.getElementById('same');
   if(mixed){sameEl.textContent='⚠ 편집(📷)·t2i 는 서로 못 붙여요. 같은 종류끼리 골라주세요.';sameEl.classList.add('on');}
   else if(!single&&selA&&selA===selB){sameEl.textContent='⚠ 같은 워크플로끼리 골랐어요 — 시드/설정 테스트용으로는 괜찮아요.';sameEl.classList.add('on');}
@@ -2866,9 +3070,9 @@ body{margin:0;background:#0a0814;color:var(--ink);font-family:'VT323',monospace;
 .heart.on{animation:beat 1s infinite}@keyframes beat{0%,100%{transform:scale(1)}45%{transform:scale(1.32)}}
 .dot{width:8px;height:8px;border-radius:50%;display:inline-block;background:#555}
 .dot.a{background:var(--grn);box-shadow:0 0 8px var(--grn);animation:blink 1s steps(2) infinite}@keyframes blink{50%{opacity:.25}}
-.genbar{display:flex;gap:8px;align-items:flex-start;margin-bottom:16px;background:var(--b1);border:1px solid var(--pur);border-radius:10px;padding:10px}
+.genbar{position:relative;display:flex;flex-wrap:wrap;gap:8px;align-items:flex-start;margin-bottom:16px;background:var(--b1);border:1px solid var(--pur);border-radius:10px;padding:10px;transition:border-color .15s,box-shadow .15s,background .15s}.genbar.agentdrag{border-color:var(--cyan);background:linear-gradient(135deg,rgba(86,225,255,.15),rgba(157,123,255,.12));box-shadow:inset 0 0 0 2px rgba(86,225,255,.2),0 0 28px rgba(86,225,255,.18)}.agentdropnote{flex:1 0 100%;height:24px;display:flex;align-items:center;justify-content:center;border:1px dashed rgba(86,225,255,.24);border-radius:6px;color:var(--mut);font-size:15px;pointer-events:none}.genbar.agentdrag .agentdropnote{border-color:var(--cyan);color:var(--cyan);font-size:18px}.genbar.agentdrag .agentdropnote::before{content:'↓ '}
 .msel,.gi{background:#0a0814;border:1px solid var(--ln);color:var(--ink);border-radius:7px;min-height:38px;font-family:'VT323';font-size:19px;padding:0 8px}
-.msel{height:38px}.gi{flex:1}.gi::placeholder{color:var(--mut)}
+.msel{height:38px;flex:0 0 220px}.gi{flex:1 1 440px;min-width:320px}.gi::placeholder{color:var(--mut)}
 .promptbox{min-height:72px;max-height:220px;line-height:1.35;padding:8px 10px;resize:vertical;overflow:auto}
 .up{background:#0a0814;border:1px solid var(--ln);color:var(--mut);height:38px;padding:0 10px;border-radius:7px;cursor:pointer;font-family:'VT323';font-size:17px}.up:hover{color:var(--cyan);border-color:var(--cyan)}
 .genb{background:var(--pink);border:none;color:#220812;font-family:'Press Start 2P';font-size:10px;border-radius:7px;padding:0 14px;height:38px;cursor:pointer}.genb:hover:not(:disabled){background:#ff85a8}.genb:disabled{opacity:.42;cursor:default;filter:saturate(.35)}
@@ -2962,6 +3166,8 @@ body{margin:0;background:#0a0814;color:var(--ink);font-family:'VT323',monospace;
 .cmpitems{display:grid;grid-template-columns:repeat(auto-fill,minmax(118px,1fr));gap:7px}.cmpempty{grid-column:1/-1;min-height:120px;display:flex;align-items:center;justify-content:center;text-align:center;color:var(--mut);font-size:17px}.cmpitem{position:relative;border:1px solid var(--ln);border-radius:7px;overflow:hidden;background:var(--b1);cursor:pointer}.cmpitem img,.cmpitem video{width:100%;height:86px;object-fit:cover;display:block;background:#000}.cmpitem .vbadge{position:absolute;left:4px;top:4px;padding:1px 5px;border-radius:4px;background:rgba(0,0,0,.72);color:var(--cyan);font-size:12px;pointer-events:none}.cmpitem span{display:block;padding:4px 24px 5px 6px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;color:var(--ink);font-size:14px}.cmpitem button{position:absolute;right:4px;bottom:4px;width:20px;height:20px;border:0;border-radius:4px;background:rgba(0,0,0,.7);color:#fff;cursor:pointer}.cmpitem.sel{border-color:var(--amb);box-shadow:0 0 12px rgba(255,193,77,.35)}
 .cfs.manual .cfsgrp{border-style:dashed}.cfs.manual .cfsgrp.drag{border-color:var(--cyan);background:rgba(86,225,255,.08)}.cfschip.manual{display:grid;grid-template-columns:44px minmax(0,1fr) 20px;gap:6px;align-items:center;padding:5px}.cfschip.manual img,.cfschip.manual video{width:44px;height:38px;object-fit:cover;border-radius:4px;background:#000}.cfschip.manual span{min-width:0;overflow:hidden;text-overflow:ellipsis}.cfschip.manual i{font-style:normal;text-align:center;color:var(--mut)}
 body.cmpbenchopen{padding-bottom:296px}
+.agentpanel{display:none;margin:0 12px 10px;padding:12px 14px;border:1px solid rgba(86,225,255,.48);border-radius:10px;background:linear-gradient(135deg,rgba(86,225,255,.08),rgba(157,123,255,.08));box-shadow:0 10px 32px rgba(0,0,0,.22)}
+.agentpanel.on{display:block}.agenthead{display:flex;align-items:center;gap:9px;margin-bottom:8px}.agenthead b{font-family:'Press Start 2P';font-size:9px;color:var(--cyan)}.agenthead span{flex:1;color:var(--mut);font-size:16px}.agenthead button,.agentacts button{height:30px;padding:0 11px;border:1px solid var(--ln);border-radius:6px;background:var(--b2);color:var(--ink);font-family:'VT323';font-size:17px;cursor:pointer}.agentacts{display:flex;gap:8px;flex-wrap:wrap;margin-top:10px}.agentacts .run{border-color:var(--cyan);background:rgba(86,225,255,.18);color:var(--cyan)}.agentacts button:disabled{opacity:.4;cursor:not-allowed}.agentstate{color:var(--amb);font-size:18px}.agentplan{display:grid;gap:5px;margin-top:7px;color:var(--ink);font-size:17px;line-height:1.35}.agentplan .why{color:var(--mut)}.agentplan .change{color:var(--cyan)}.agentresults{display:flex;gap:7px;flex-wrap:wrap;margin-top:9px}.agentresults a{display:block;border:1px solid var(--ln);border-radius:6px;overflow:hidden}.agentresults img,.agentresults video{display:block;width:92px;height:92px;object-fit:cover;background:#000}.agentb{border-color:var(--cyan)!important;color:var(--cyan)!important;background:rgba(86,225,255,.1)!important}.manualonly{display:none!important}body.directmode .manualonly{display:inline-flex!important}body.directmode select.manualonly{display:block!important}body:not(.directmode) #up,body:not(.directmode) .manualblock{display:none!important}.directtoggle.on{border-color:var(--amb)!important;color:var(--amb)!important;background:rgba(255,193,77,.12)!important}
 .cfs{display:none;position:fixed;inset:0;background:rgba(4,3,10,.98);z-index:70;flex-direction:column}
 .cfs.on{display:flex}
 .cfsbar{display:grid;grid-template-columns:minmax(0,1fr) 48px 36px;align-items:center;gap:8px;padding:8px 14px;border-bottom:1px solid var(--ln);flex:none;background:rgba(10,8,20,.9)}
@@ -2998,18 +3204,30 @@ body.cmpbenchopen{padding-bottom:296px}
   <div class="brand pix">너무바쁜베짱이 <b>STUDIO</b><small>PING·PONG GALLERY v1.0</small></div>
   <div class="stat pix"><span id="lanurl" class="lanurl" title="LAN address"></span><span id="hbox"></span><span><span class="dot" id="dot"></span> <span id="hstate">…</span></span></div>
 </div>
-<div class="genbar">
-  <select id="mode" class="msel" onchange="modeChg()"><option value="image">이미지</option><option value="video">영상</option><option value="song">음악</option><option value="song_reference">참고곡 음악</option><option value="klein">인물합성</option><option value="faceswap">페이스스왑</option></select>
+<div class="genbar" id="agentdrop">
+  <select id="mode" class="msel manualonly" onchange="modeChg()"><option value="image">이미지</option><option value="video">영상</option><option value="song">음악</option><option value="song_reference">참고곡 음악</option><option value="klein">인물합성</option><option value="faceswap">페이스스왑</option></select>
   <textarea id="prompt" class="gi promptbox" rows="2" placeholder="무엇을 만들까요? /레크2 프롬프트"></textarea>
   <button class="up" id="up" style="display:none" onclick="document.getElementById('files').click()">📷 사진</button>
   <input type="file" id="files" accept="image/*" multiple style="display:none" onchange="filePick()">
-  <button class="genb pix" id="genbtn" onclick="gen()">생성 ▸</button>
+  <button class="folderb" onclick="document.getElementById('agentfiles').click()" title="에이전트 요청에 사진이나 음원 추가">＋ 사진·음원</button>
+  <button class="folderb agentb" onclick="agentPlan()" title="워크플로를 고르지 않고 핑퐁에게 맡기기">🤖 핑퐁에게 맡기기</button>
+  <button class="genb pix manualonly" id="genbtn" onclick="gen()">직접 생성 ▸</button>
+  <button class="folderb directtoggle" id="directtoggle" onclick="toggleDirectMode()" title="카테고리와 세부 옵션을 직접 선택">⚙ 직접 선택</button>
   <button class="folderb" id="stopbtn" onclick="stopComfy()" disabled title="큐가 돌 때 활성화돼요">■ 정지</button>
   <button class="folderb" onclick="openGallery()">📁 폴더</button>
   <button class="folderb" onclick="window.open('/compare','_blank')" title="A vs B 모델 대결 탭 열기">⚔️ 모델비교</button>
   <button class="folderb" onclick="toggleManualBench()" title="갤러리 이미지를 직접 좌우로 묶어 비교">🧲 직접비교</button>
+  <button class="folderb" id="patchbtn" onclick="location.href='/updates'" title="새 기능과 안전 패치 확인">⬆ 패치</button>
   <button class="lansw" id="lansw" onclick="toggleLan()" title="다른 PC에서 대시보드 접속 허용"><span>LAN</span><span class="knob"></span><span id="lanstate">로컬</span></button>
   <button class="folderb" onclick="restartDash()">↻ 재시작</button>
+  <div class="agentdropnote" id="agentdropnote">사진·음원·영상 파일을 이곳에 끌어놓아도 돼요</div>
+</div>
+<div class="agentpanel" id="agentpanel">
+  <div class="agenthead"><b>PINGPONG AGENT</b><span>워크플로를 고르지 않아도 돼요. 위에 원하는 결과를 적고 계획을 확인하세요.</span><button onclick="agentNew()">새 작업</button><button onclick="agentClose()">×</button></div>
+  <div class="agentstate" id="agentstate">요청을 기다리고 있어요.</div>
+  <div class="agentplan" id="agentplan"></div>
+  <div class="agentresults" id="agentresults"></div>
+  <div class="agentacts"><button onclick="document.getElementById('agentfiles').click()">＋ 사진·음원</button><input id="agentfiles" type="file" accept="image/*,audio/*,video/*" multiple hidden onchange="agentFilePick()"><button class="run" id="agentconfirm" onclick="agentConfirm()" disabled>이 계획으로 실행 ▸</button></div>
 </div>
 <div class="modehint" id="modehint"></div>
 <div class="llmbar">
@@ -3018,7 +3236,7 @@ body.cmpbenchopen{padding-bottom:296px}
   <button onclick="loadLlmModels()">새로고침</button>
   <span class="llmstat" id="llmstat"></span>
 </div>
-<div class="optbar" id="optbar">
+<div class="optbar manualblock" id="optbar">
   <span class="ok pix">OPTIONS</span>
   <div class="optgrp" id="imgopts">
     <label>RATIO <select id="iratio"><option>1:1</option><option selected>3:4</option><option>4:3</option><option>2:3</option><option>3:2</option><option>9:16</option><option>16:9</option><option>21:9</option></select></label>
@@ -3033,13 +3251,15 @@ body.cmpbenchopen{padding-bottom:296px}
   </div>
   <div class="optgrp" id="vidopts">
     <label>SECONDS <input id="vsec" type="number" min="1" max="20" value="5"></label>
-    <label>WIDTH <select id="vwidth"><option value="0" selected>AUTO</option><option value="512">512</option><option value="640">640</option><option value="768">768</option><option value="960">960</option><option value="1024">1024</option></select></label>
-    <label>FPS <select id="vfps"><option value="16">16</option><option value="24" selected>24</option><option value="30">30</option></select></label>
+    <label id="vrlab" style="display:none">RATIO <select id="vratio"><option>1:1</option><option>3:4</option><option>4:3</option><option>2:3</option><option>3:2</option><option>9:16</option><option selected>16:9</option><option>21:9</option></select></label>
+    <label id="vmplab" style="display:none">SIZE <select id="vmp"><option value="0.2">0.2MP</option><option value="0.3">0.3MP</option><option value="0.4">0.4MP</option><option value="0.5" selected>0.5MP</option><option value="0.6">0.6MP</option><option value="0.7">0.7MP</option><option value="0.8">0.8MP</option><option value="0.9">0.9MP</option><option value="1">1.0MP</option><option value="1.2">1.2MP</option><option value="1.5">1.5MP</option><option value="2">2.0MP</option></select></label>
+    <label id="vwidthlab">WIDTH <select id="vwidth"><option value="0" selected>AUTO</option><option value="512">512</option><option value="640">640</option><option value="768">768</option><option value="960">960</option><option value="1024">1024</option></select></label>
+    <label id="vfpslab">FPS <select id="vfps"><option value="16">16</option><option value="24" selected>24</option><option value="30">30</option></select></label>
   </div>
 </div>
-<div class="modelPanel" id="modelopts"></div>
+<div class="modelPanel manualblock" id="modelopts"></div>
 <div class="assets" id="assets"></div>
-<div class="director" id="director">
+<div class="director manualblock" id="director">
   <div class="dhead pix"><span>LTX DIRECTOR BUILDER</span><button onclick="clearDirector()">비우기</button></div>
   <div class="dtbar"><button onclick="openPicker('image')">+ 이미지</button><button onclick="addTextSegment()">+ 텍스트</button><button onclick="openPicker('video')">+ 모션</button><button onclick="openPicker('audio')">+ 오디오</button><span class="hint" id="dthint">블록을 드래그하고 양끝을 잡아 길이를 조절해요</span></div>
   <div class="dtwrap">
@@ -3050,7 +3270,7 @@ body.cmpbenchopen{padding-bottom:296px}
   </div>
   <div class="dtedit" id="dtedit"><span class="pix">TEXT</span><textarea id="dttext" placeholder="이 구간에서 일어날 일을 적어주세요"></textarea><button onclick="applyTextSegment()">적용</button></div>
 </div>
-<div class="refboard" id="refboard">
+<div class="refboard manualblock" id="refboard">
   <div class="dhead pix"><span>TOOBUSY REFERENCE BOARD</span><span><button onclick="applyReferenceBoard()">APPLY</button> <button onclick="closeReferenceBoard()">CLOSE</button></span></div>
   <div class="rbody">
     <div class="rphoto" id="rphoto">CHARACTER A</div>
@@ -3138,13 +3358,25 @@ body.cmpbenchopen{padding-bottom:296px}
 <script>
 var PP_KEY=__PP_KEY__;
 var IMGS=[],VIDS=[],AUDS=[],CUSTOMS=[],LORAS=[],BOARD_PRESETS=[],AUDDUR={},MODE_STATUS={},DOWNLOAD_SEEN={},SHUFFLE=false,MODELPANEL=false,DTDRAG=null,DTEDIT=-1,ai=0,cur=0,curAudioRel='',IMGKEY='',VIDKEY='',AUDKEY='',DURATION_FRAMES=120,IMGPAGE=1,IMGPAGES=1,IMGTOTAL=0,IMGFILETOTAL=0,IMGPER=48;
+var AGENT_ID='',AGENT_TIMER=0;
+var DIRECTMODE=localStorage.getItem('pp_direct_mode')==='1';
 function api(p,b){return fetch(p,{method:'POST',headers:{'Content-Type':'application/json','X-PP-Key':PP_KEY},body:JSON.stringify(b)})}
 function el(t,c){var e=document.createElement(t);if(c)e.className=c;return e}
 function esc(s){return String(s||'').replace(/[&<>"']/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]})}
+function applyDirectMode(){document.body.classList.toggle('directmode',DIRECTMODE);var b=document.getElementById('directtoggle');if(b){b.classList.toggle('on',DIRECTMODE);b.textContent=DIRECTMODE?'✓ 직접 선택 중':'⚙ 직접 선택'}if(DIRECTMODE)modeChg()}
+function toggleDirectMode(){DIRECTMODE=!DIRECTMODE;localStorage.setItem('pp_direct_mode',DIRECTMODE?'1':'0');applyDirectMode()}
+function agentFilePick(){addPickedFiles(document.getElementById('agentfiles').files,'',true);document.getElementById('agentfiles').value=''}
+function agentClose(){document.getElementById('agentpanel').classList.remove('on')}
+function agentNew(){AGENT_ID='';clearTimeout(AGENT_TIMER);document.getElementById('agentstate').textContent='새 요청을 적어주세요.';document.getElementById('agentplan').innerHTML='';document.getElementById('agentresults').innerHTML='';document.getElementById('agentconfirm').disabled=true;document.getElementById('prompt').focus()}
+function agentPlan(){var t=document.getElementById('prompt').value.trim();if(!t){document.getElementById('prompt').classList.add('shake');setTimeout(function(){document.getElementById('prompt').classList.remove('shake')},300);return}var panel=document.getElementById('agentpanel');panel.classList.add('on');document.getElementById('agentstate').textContent='요청을 이해하고 가능한 작업 방법을 찾는 중...';document.getElementById('agentplan').innerHTML='';document.getElementById('agentresults').innerHTML='';document.getElementById('agentconfirm').disabled=true;var imgs=picked.filter(function(x){return x&&x.kind==='image'&&x.enabled!==false}).map(function(x){return x.data});api('/api/agent/plan',{text:t,session_id:AGENT_ID,images:imgs,assets:picked}).then(function(r){return r.json()}).then(function(j){if(!j.ok)throw new Error(j.err||j.error||'계획 요청 실패');AGENT_ID=j.id;agentPoll()}).catch(function(e){document.getElementById('agentstate').textContent='⚠ '+e.message})}
+function agentPoll(){if(!AGENT_ID)return;fetch('/api/agent/status?id='+encodeURIComponent(AGENT_ID)).then(function(r){return r.json()}).then(function(j){agentRender(j);if(['planning','queued','running'].indexOf(j.state)>=0)AGENT_TIMER=setTimeout(agentPoll,1200)}).catch(function(){AGENT_TIMER=setTimeout(agentPoll,1800)})}
+function agentRender(j){var state=document.getElementById('agentstate'),box=document.getElementById('agentplan'),btn=document.getElementById('agentconfirm'),res=document.getElementById('agentresults');var labels={planning:'생각하는 중...',planned:'계획이 준비됐어요.',queued:'작업 큐에서 기다리는 중...',running:'ComfyUI로 생성하는 중...',complete:'완료됐어요. 위 입력창에 수정할 내용을 말하면 이어서 작업할 수 있어요.',error:'작업을 진행하지 못했어요.'};state.textContent=labels[j.state]||j.state||'';btn.disabled=j.state!=='planned'||!!((j.plan||{}).missing_inputs||[]).length;if(j.error)box.innerHTML='<div>⚠ '+esc(j.error)+'</div>';else if(j.plan){var p=j.plan,missing=p.missing_inputs||[],changes=j.changes||[];box.innerHTML='<div><b>선택한 방법:</b> '+esc(p.tool||'')+'</div><div><b>정리한 요청:</b> '+esc(p.normalized_request||p.intent||'')+'</div><div class="why">판단 이유: '+esc(p.reason||'')+' · 확신 '+Math.round(Number(p.confidence||0)*100)+'%</div>'+(missing.length?'<div>필요한 자료: '+esc(missing.join(', '))+'</div>':'')+(changes.length?'<div class="change">설정 변경<br>'+changes.map(function(x){return'• '+esc(x)}).join('<br>')+'</div>':'')}if(j.state==='complete'){btn.disabled=true;res.innerHTML=(j.results||[]).map(function(rel){var u='/media/'+encodeURIComponent(rel).replace(/%2F/g,'/'),low=rel.toLowerCase();if(/\.(mp4|webm|mov)$/.test(low))return'<a href="'+u+'" target="_blank"><video src="'+u+'" muted></video></a>';if(/\.(png|jpe?g|webp|gif)$/.test(low))return'<a href="'+u+'" target="_blank"><img src="'+u+'"></a>';return'<a href="'+u+'" target="_blank" style="padding:10px">'+esc(rel)+'</a>'}).join('');load()}}
+function agentConfirm(){if(!AGENT_ID)return;var b=document.getElementById('agentconfirm');b.disabled=true;api('/api/agent/confirm',{session_id:AGENT_ID}).then(function(r){return r.json()}).then(function(j){if(!j.ok)throw new Error(j.err||j.error||'실행 실패');agentRender(j);agentPoll()}).catch(function(e){document.getElementById('agentstate').textContent='⚠ '+e.message})}
 function openGallery(){api('/api/open_gallery',{}).then(function(r){return r.json()}).then(function(j){if(!j.ok)alert(j.err||'폴더를 열 수 없어요')})}
 function setStopEnabled(on){var b=document.getElementById('stopbtn');if(!b)return;b.disabled=!on;b.title=on?'현재 ComfyUI 생성을 정지합니다':'큐가 돌 때 활성화돼요'}
 function stopComfy(){var b=document.getElementById('stopbtn');if(b&&b.disabled)return;if(!confirm('현재 ComfyUI 생성을 정지할까요?'))return;api('/api/interrupt',{}).then(function(r){return r.json()}).then(function(j){if(!j.ok)alert(j.err||'정지 요청 실패');else{document.getElementById('upinfo').textContent='ComfyUI 정지 요청 보냄';setStopEnabled(false)}})}
 function restartDash(){if(!confirm('대시보드를 다시 시작할까요?'))return;api('/api/restart_dashboard',{}).then(function(){setTimeout(function(){location.reload()},1800)})}
+function checkPatchBadge(){fetch('/api/update/status?auto=1').then(function(r){return r.json()}).then(function(s){var b=document.getElementById('patchbtn');if(b&&s.available){b.textContent='⬆ 새 패치';b.style.borderColor='var(--amb)';b.style.color='var(--amb)'}}).catch(function(){})}
 function setLanSwitch(s){
   var b=document.getElementById('lansw'),t=document.getElementById('lanstate');if(!b||!t)return;
   var on=(s.configured_dashboard_host||s.dashboard_host)==='0.0.0.0';
@@ -3223,11 +3455,11 @@ function loadBoardPreset(){var s=document.getElementById('presetSel'),id=s&&s.va
 function optVal(id){var e=document.getElementById(id);return e?e.value:''}
 function optNum(id,def){var v=parseFloat(optVal(id));return isNaN(v)?def:v}
 function loadGenOptions(){
-  ['iratio','zup','zscale','emp','enh','slimit','vsec','vwidth','vfps'].forEach(function(id){var v=localStorage.getItem('pingpong_'+id),e=document.getElementById(id);if(e&&v!==null)e.value=v});
+  ['iratio','zup','zscale','emp','enh','slimit','vsec','vratio','vmp','vwidth','vfps'].forEach(function(id){var v=localStorage.getItem('pingpong_'+id),e=document.getElementById(id);if(e&&v!==null)e.value=v});
   updateDurationFrames()
 }
 function saveGenOptions(){
-  ['iratio','zup','zscale','emp','enh','slimit','vsec','vwidth','vfps'].forEach(function(id){var e=document.getElementById(id);if(e)localStorage.setItem('pingpong_'+id,e.value)})
+  ['iratio','zup','zscale','emp','enh','slimit','vsec','vratio','vmp','vwidth','vfps'].forEach(function(id){var e=document.getElementById(id);if(e)localStorage.setItem('pingpong_'+id,e.value)})
 }
 function updateDurationFrames(){
   var sec=Math.max(1,Math.min(20,parseInt(optVal('vsec')||'5',10)||5));
@@ -3240,7 +3472,7 @@ function gatherSettings(){
   var m=document.getElementById('mode').value,custom=CUSTOMS.find(function(x){return x.mode===m});
   var s={};
   if(m==='image'){s.image_ratio=optVal('iratio');s.zit_upscale=optVal('zup')==='1';s.zit_scale_by=optNum('zscale',0.5)}
-  else if(m==='video'||(custom&&custom.type==='video')){s.video_seconds=optNum('vsec',5);s.video_width=optNum('vwidth',0);s.video_fps=optNum('vfps',24)}
+  else if(m==='video'||(custom&&custom.type==='video')){s.video_seconds=optNum('vsec',5);s.video_width=optNum('vwidth',0);s.video_fps=optNum('vfps',24);if(custom&&custom.ratio)s.image_ratio=optVal('vratio');if(custom&&custom.megapixels)s.video_megapixels=optNum('vmp',custom.default_megapixels||1)}
   else if(custom&&custom.type==='image'){s.image_megapixels=optNum('emp',1);if(custom.ratio)s.image_ratio=optVal('iratio')}
   if(custom&&custom.enhancer)s.builtin_enhancer=optVal('enh')==='1';
   if(custom&&(custom.stages||[]).length>1)s.stage_limit=Math.max(1,parseInt(optVal('slimit'),10)||custom.stages.length);
@@ -3251,7 +3483,7 @@ function gatherSettings(){
   }
   return s
 }
-['iratio','zup','zscale','emp','enh','slimit','vsec','vwidth','vfps'].forEach(function(id){setTimeout(function(){var e=document.getElementById(id);if(e)e.onchange=function(){saveGenOptions();updateDurationFrames();renderAssets()}},0)});
+['iratio','zup','zscale','emp','enh','slimit','vsec','vratio','vmp','vwidth','vfps'].forEach(function(id){setTimeout(function(){var e=document.getElementById(id);if(e)e.onchange=function(){saveGenOptions();var m=document.getElementById('mode').value,c=CUSTOMS.find(function(x){return x.mode===m});if(c&&c.type==='video'&&['vsec','vratio','vmp'].indexOf(id)>=0)localStorage.setItem('pingpong_'+id+'_'+m,e.value);updateDurationFrames();renderAssets()}},0)});
 function setVideoFold(fold){var m=document.querySelector('.mon'),b=document.getElementById('vtog'),s=document.getElementById('vstate');m.classList.toggle('collapsed',fold);b.classList.toggle('open',!fold);b.setAttribute('aria-expanded',fold?'false':'true');b.title=fold?'비디오 플레이어 펼치기':'비디오 플레이어 접기';if(s)s.textContent=fold?'접힘 · 펼치기':'열림 · 접기';localStorage.setItem('pingpong_video_fold',fold?'1':'0')}
 function toggleVideo(){setVideoFold(!document.querySelector('.mon').classList.contains('collapsed'))}
 function initVideoFold(){setVideoFold(localStorage.getItem('pingpong_video_fold')!=='0')}
@@ -3713,6 +3945,13 @@ function modeChg(){var m=document.getElementById('mode').value,p=document.getEle
       inp.onchange=function(){localStorage.setItem('pingpong_dn_'+m+'_'+inp.dataset.i,inp.value)}
     })}
   vo.classList.toggle('on',m==='video'||!!(c&&c.type==='video'));
+  var customVideo=!!(c&&c.type==='video'),vrl=document.getElementById('vrlab'),vml=document.getElementById('vmplab'),vwl=document.getElementById('vwidthlab'),vfl=document.getElementById('vfpslab');
+  if(vrl)vrl.style.display=customVideo&&c.ratio?'flex':'none';
+  if(vml)vml.style.display=customVideo&&c.megapixels?'flex':'none';
+  if(vwl)vwl.style.display=customVideo?'none':'flex';
+  if(vfl)vfl.style.display=customVideo?'none':'flex';
+  document.getElementById('vsec').max=customVideo?(c.max_seconds||20):20;
+  if(customVideo){var sv=localStorage.getItem('pingpong_vsec_'+m),rv=localStorage.getItem('pingpong_vratio_'+m),mv=localStorage.getItem('pingpong_vmp_'+m);document.getElementById('vsec').value=sv!==null?Math.min(Number(sv),c.max_seconds||20):(c.default_seconds||5);document.getElementById('vratio').value=rv!==null?rv:(c.default_ratio||'16:9');if(c.megapixels)document.getElementById('vmp').value=mv!==null?mv:(c.default_megapixels||1)}
   renderModeHint(m);
   loadModelFields();
   pickRole='';
@@ -3724,8 +3963,8 @@ var picked=[];
 function kindOf(f){return f.type.indexOf('image/')===0?'image':(f.type.indexOf('video/')===0?'video':(f.type.indexOf('audio/')===0?'audio':'file'))}
 function nextDirectorStart(kind){var tr=(kind==='video')?'motion':(kind==='audio'?'audio':'main'),end=0;picked.forEach(function(a){if(directorTrackFor(a)===tr)end=Math.max(end,(a.start||0)+(a.length||1))});return clampFrame(end,0,DURATION_FRAMES-1)}
 var pickRole='';
-function addPickedFiles(files, role){files=Array.prototype.slice.call(files||[]);if(!files.length){renderAssets();return}
-  var m=document.getElementById('mode').value,c=CUSTOMS.find(function(x){return x.mode===m}),done=0,append=(m==='video'||needsReferenceBoard(m,c));if(append)picked=picked.slice();else picked=[];
+function addPickedFiles(files, role, forceAppend){files=Array.prototype.slice.call(files||[]);if(!files.length){renderAssets();return}
+  var m=document.getElementById('mode').value,c=CUSTOMS.find(function(x){return x.mode===m}),done=0,append=(!!forceAppend||m==='video'||needsReferenceBoard(m,c));if(append)picked=picked.slice();else picked=[];
   var cursors={main:nextDirectorStart('image'),motion:nextDirectorStart('video'),audio:nextDirectorStart('audio')};
   files.forEach(function(f){var k=kindOf(f);if((role==='image'||role==='swap-body'||role==='swap-face')&&k!=='image'){done++;if(done===files.length)renderAssets();return}if(role&&role!=='image'&&role!=='swap-body'&&role!=='swap-face'&&k!==role){done++;if(done===files.length)renderAssets();return}var tr=(k==='video')?'motion':(k==='audio'?'audio':'main'),st=(m==='video')?cursors[tr]:0,ln=(m==='video'&&k==='image'?1:DURATION_FRAMES);if(m==='video')cursors[tr]=clampFrame(st+ln,0,DURATION_FRAMES-1);var fr=new FileReader();fr.onload=function(){var item={data:fr.result,name:f.name,type:f.type,kind:k,start:st,length:ln,trimStart:0,isEndFrame:false};if(m==='faceswap'&&role==='swap-face'){item.role='face_a';picked[1]=item}else if(m==='faceswap'&&role==='swap-body'){item.role='character_a';picked[0]=item}else{if(m==='klein'&&k==='image'&&!item.role){var roles=['character_a','face_a','background_a','pose_a','style_a','prop_a'];item.role=roles[Math.min(picked.filter(function(x){return x&&x.kind==='image'}).length,roles.length-1)]}picked.push(item)}done++;if(done===files.length)renderAssets()};fr.readAsDataURL(f)})}
 function openPicker(role){pickRole=role||'';var f=document.getElementById('files');
@@ -3838,12 +4077,14 @@ function boardTools(a,i){var role=a.role||'',face=role.indexOf('face_')===0||rol
   return h
 }
 function addLoraCard(){var sel=document.getElementById('loraAddSel'),n=sel?sel.value:'';picked.push({kind:'lora',type:'lora',role:'lora_a',name:n||'LoRA',lora_name:n||'',lora_strength:1,lora_enabled:true,enabled:true});renderAssets()}
+function updateAgentDropNote(message){var note=document.getElementById('agentdropnote');if(!note)return;if(message){note.textContent=message;return}var count=picked.filter(function(a){return a&&(a.kind==='image'||a.kind==='audio'||a.kind==='video')}).length;note.textContent=count?('첨부 '+count+'개 · 파일을 더 끌어놓을 수 있어요'):'사진·음원·영상 파일을 이곳에 끌어놓아도 돼요'}
 function renderAssets(){var box=document.getElementById('assets'),m=document.getElementById('mode').value,c=CUSTOMS.find(function(x){return x.mode===m});box.innerHTML='';box.className='assets'+(picked.length&&m!=='video'?' on':'');
   var boardMode=needsReferenceBoard(m,c),roleBoard=usesRoleBoard(m);
   picked.forEach(function(a,i){if(!a)return;if(a.enabled===undefined)a.enabled=true;var row=el('div','asset'+(a.enabled===false?' off':''));var board=(a.kind==='image'&&boardMode&&roleBoard),lora=((a.kind==='lora'||a.type==='lora')&&boardMode&&roleBoard);var role=board?roleSelect(a,i):'';var use=(board||lora||(a.kind==='image'&&boardMode))?'<label class="use"><input type="checkbox" '+(a.enabled!==false?'checked':'')+' onchange="picked['+i+'].enabled=this.checked;picked['+i+'].lora_enabled=this.checked;renderAssets()">USE</label>':'';var tools=board?boardTools(a,i):'';if(lora){tools=loraSelect('',a.lora_name||a.name||'','picked['+i+'].lora_name=this.value;picked['+i+'].name=this.value;renderAssets()')+'<input class="short" type="number" step="0.05" value="'+(a.lora_strength||1)+'" onchange="picked['+i+'].lora_strength=parseFloat(this.value||1);renderReferenceBoard()">'}row.innerHTML='<b>'+esc((lora?'LORA':a.kind).toUpperCase())+'</b>'+use+role+tools+'<span>'+esc(a.name||a.lora_name||'')+'</span><button>×</button>';row.querySelector('button').onclick=function(){picked.splice(i,1);renderAssets()};box.appendChild(row)});
   if(boardMode&&roleBoard){var add=el('div','asset');add.innerHTML='<b>LORA</b>'+loraSelect('loraAddSel','','')+'<button onclick="addLoraCard()">+ ADD</button>';box.appendChild(add);box.classList.add('on')}
   renderDirectorTimeline();
   renderReferenceBoard();
+  updateAgentDropNote();
   document.getElementById('upinfo').textContent=picked.length?(m==='video'?'Director 자료 '+picked.length+'개':(m==='song_reference'?'참고곡 '+picked.filter(function(a){return a&&a.kind==='audio'}).length+'개 첨부됨':'사진 '+picked.length+'장 첨부됨')):''
 }
 function filePick(){var fs=document.getElementById('files').files,done=0;
@@ -3878,6 +4119,14 @@ if(boardDrop){
   boardDrop.addEventListener('dragleave',function(){boardDrop.classList.remove('drag')});
   boardDrop.addEventListener('drop',function(e){var m=document.getElementById('mode').value,c=CUSTOMS.find(function(x){return x.mode===m});if(!needsReferenceBoard(m,c))return;e.preventDefault();boardDrop.classList.remove('drag');var raw=e.dataTransfer.getData('application/x-pingpong-gallery');if(raw){var it;try{it=JSON.parse(raw)}catch(_){it=null}if(it&&it.kind==='image'){picked.push({kind:'image',name:it.name||'gallery image',data:it.url,gallery_rel:it.rel});renderAssets();return}if(it&&it.kind==='audio'){picked.push({kind:'audio',name:it.name||'audio',data:it.url,gallery_rel:it.rel});renderAssets();return}}addPickedFiles(Array.prototype.filter.call(e.dataTransfer.files||[],function(f){return f.type.indexOf('image/')===0||f.type.indexOf('audio/')===0}), '')});
 }
+var agentDrop=document.getElementById('agentdrop'),agentDragDepth=0;
+function agentDropTypes(e){var types=Array.prototype.slice.call((e.dataTransfer&&e.dataTransfer.types)||[]);return types.indexOf('Files')>=0||types.indexOf('application/x-pingpong-gallery')>=0}
+if(agentDrop){
+  agentDrop.addEventListener('dragenter',function(e){if(!agentDropTypes(e))return;e.preventDefault();agentDragDepth++;agentDrop.classList.add('agentdrag');updateAgentDropNote('놓으면 바로 첨부돼요')});
+  agentDrop.addEventListener('dragover',function(e){if(!agentDropTypes(e))return;e.preventDefault();agentDrop.classList.add('agentdrag');if(e.dataTransfer)e.dataTransfer.dropEffect='copy'});
+  agentDrop.addEventListener('dragleave',function(e){if(!agentDropTypes(e))return;agentDragDepth=Math.max(0,agentDragDepth-1);if(!agentDragDepth){agentDrop.classList.remove('agentdrag');updateAgentDropNote()}});
+  agentDrop.addEventListener('drop',function(e){if(!agentDropTypes(e))return;e.preventDefault();agentDragDepth=0;agentDrop.classList.remove('agentdrag');var raw=e.dataTransfer.getData('application/x-pingpong-gallery'),it=null;try{it=raw?JSON.parse(raw):null}catch(_){}if(it&&(it.kind==='image'||it.kind==='audio'||it.kind==='video')){picked.push({kind:it.kind,name:it.name||'gallery media',data:it.url,gallery_rel:it.rel||'',duration:it.duration||0,enabled:true});renderAssets();return}var files=Array.prototype.filter.call(e.dataTransfer.files||[],function(f){return f.type.indexOf('image/')===0||f.type.indexOf('audio/')===0||f.type.indexOf('video/')===0});if(!files.length){updateAgentDropNote('지원하는 파일: 이미지 · 음원 · 영상');setTimeout(function(){updateAgentDropNote()},1800);return}updateAgentDropNote(files.length+'개 파일 읽는 중...');addPickedFiles(files,'',true)});
+}
 ['track-main','track-audio'].forEach(function(id){var t=document.getElementById(id);if(!t)return;t.addEventListener('dragover',function(e){directorDragOver(t,e)});t.addEventListener('dragleave',function(){t.classList.remove('drop')});t.addEventListener('drop',function(e){directorDropAsset(t,e)})});
 
 function poll(){fetch('/api/status').then(function(r){return r.json()}).then(function(s){
@@ -3895,7 +4144,7 @@ var faceOpt=document.querySelector('#mode option[value="faceswap"]');if(faceOpt)
 var kleinOpt=document.querySelector('#mode option[value="klein"]');if(kleinOpt)kleinOpt.textContent='Flux2 Klein';
 document.getElementById('multibtn').onclick=function(e){e.preventDefault();toggleMultiMode()};
 document.getElementById('multidel').onclick=function(e){e.preventDefault();deleteMultiSelected()};
-loadGenOptions();initVideoFold();loadModes();loadLlmModels();loadLoras();loadBoardPresets();load();loadYoutube();poll();pollSystem();setInterval(load,5000);setInterval(poll,2000);setInterval(pollSystem,3000);setInterval(pollLog,3000);setInterval(pollModelDownloads,2500);setInterval(loadYoutube,1800000);
+applyDirectMode();loadGenOptions();initVideoFold();loadModes();loadLlmModels();loadLoras();loadBoardPresets();load();loadYoutube();poll();pollSystem();setTimeout(checkPatchBadge,2500);setInterval(load,5000);setInterval(poll,2000);setInterval(pollSystem,3000);setInterval(pollLog,3000);setInterval(pollModelDownloads,2500);setInterval(loadYoutube,1800000);
 </script></body></html>'''
 
 
@@ -3910,10 +4159,11 @@ def main():
         print("  LAN 접속: http://<미니PC_IP>:%d" % PORT)
     print("  생성 폴더:", GALLERY)
     print("=" * 52, flush=True)
-    try:
-        threading.Timer(1.0, lambda: webbrowser.open(url)).start()
-    except Exception:
-        pass
+    if os.environ.get("PINGPONG_NO_BROWSER", "").lower() not in ("1", "true", "yes"):
+        try:
+            threading.Timer(1.0, lambda: webbrowser.open(url)).start()
+        except Exception:
+            pass
     try:
         srv.serve_forever()
     except KeyboardInterrupt:

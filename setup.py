@@ -2,6 +2,7 @@
 """핑퐁 봇 설정 마법사 — 텔레그램 토큰/chat_id/경로/모델을 자동으로 잡아 config.json 작성."""
 import os, sys, json, time, subprocess, shutil
 import urllib.request
+from onboarding import default_config
 
 try:
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -124,39 +125,36 @@ def main():
     except Exception:
         print(f"   ⚠️ {comfy_api} 응답 없음 (꺼져있을 수 있음 — 나중에 켜면 됩니다)")
 
-    # 2) 텔레그램 토큰
-    print("\n[2] 텔레그램 봇 토큰")
-    print("   @BotFather 에서 /newbot 으로 만든 토큰을 붙여넣으세요.")
-    token = input("   토큰: ").strip()
-    try:
-        me = get(f"https://api.telegram.org/bot{token}/getMe")
-        if not me.get("ok"):
-            print("   ❌ 토큰이 올바르지 않아요."); return
-        bot_name = me["result"]["username"]
-        print(f"   ✅ 봇 확인: @{bot_name}")
-    except Exception as e:
-        print("   ❌ 토큰 확인 실패:", e); return
-
-    # 3) chat_id 자동 추출
-    print(f"\n[3] chat_id 잡기 — 지금 텔레그램에서 @{bot_name} 에게")
-    print("   아무 메시지나 한 번 보내세요 (예: 안녕). 기다리는 중...")
+    # 2) 텔레그램은 첫 실행의 필수 조건이 아니다.
+    print("\n[2] 텔레그램 연결 (선택사항)")
+    print("   휴대폰에서 쓰고 싶을 때만 @BotFather 토큰을 붙여넣으세요.")
+    print("   지금 건너뛰어도 브라우저에서 핑퐁을 사용할 수 있습니다.")
+    token = input("   토큰 (건너뛰기=엔터): ").strip()
     chat_id = None
-    for _ in range(60):  # 최대 ~2분
+    bot_name = ""
+    if token:
         try:
-            r = get(f"https://api.telegram.org/bot{token}/getUpdates?offset=-1")
-            res = r.get("result", [])
-            if res:
-                msg = res[-1].get("message") or {}
-                cid = msg.get("chat", {}).get("id")
-                if cid:
-                    chat_id = cid
-                    print(f"   ✅ chat_id = {chat_id} ({msg.get('chat',{}).get('first_name','')})")
-                    break
-        except Exception:
-            pass
-        time.sleep(2)
-    if not chat_id:
-        print("   ❌ 메시지를 못 받았어요. 봇에게 메시지 보낸 뒤 다시 실행해주세요."); return
+            me = get(f"https://api.telegram.org/bot{token}/getMe")
+            if not me.get("ok"):
+                raise ValueError("토큰이 올바르지 않아요")
+            bot_name = me["result"]["username"]
+            print(f"   ✅ 봇 확인: @{bot_name}")
+            print(f"   지금 텔레그램에서 @{bot_name}에게 아무 메시지나 보내세요.")
+            for _ in range(60):
+                r = get(f"https://api.telegram.org/bot{token}/getUpdates?offset=-1")
+                res = r.get("result", [])
+                if res:
+                    msg = res[-1].get("message") or {}
+                    chat_id = msg.get("chat", {}).get("id")
+                    if chat_id:
+                        print(f"   ✅ chat_id = {chat_id}")
+                        break
+                time.sleep(2)
+            if not chat_id:
+                print("   ⚠️ 메시지를 찾지 못해 텔레그램은 꺼둡니다. 웹 설정에서 나중에 연결하세요.")
+        except Exception as e:
+            print("   ⚠️ 텔레그램 연결을 건너뜁니다:", e)
+            token = ""
 
     # 4) 로컬 LLM 선택
     print("\n[4] 프롬프트 작성용 로컬 LLM 선택 (LM Studio)")
@@ -176,30 +174,23 @@ def main():
         model = input("   사용할 모델 식별자를 직접 입력(없으면 엔터): ").strip()
 
     # 5) config.json 작성
-    cfg = {
+    cfg = default_config()
+    cfg.update({
+        "onboarding_complete": False,
+        "telegram_enabled": bool(token and chat_id),
         "telegram_token": token,
-        "telegram_chat_id": chat_id,
+        "telegram_chat_id": chat_id or 0,
         "llm_model": model,
         "comfy_api": comfy_api,
-        "lmstudio_api": "http://127.0.0.1:1234",
         "comfy_output_dir": out_dir,
         "comfy_input_dir": in_dir,
-        "send_upscaled": True,
-        "zit_lora": False,
-        "video_width": 0,
-        "models": {
-            "zit": "ZIT\\zImageTurbo_turbo.safetensors",
-            "ltx_gguf": "LTX23\\ltx23DEVGGUFUnsloth_q4km.gguf",
-            "klein": "FLUX2\\flux-2-klein-9b-kv-fp8.safetensors",
-            "ace": "aceStepAudioGen_v15XLTurbo.safetensors",
-        },
         "custom_workflows": example_custom_workflows(),
-    }
+    })
     with open(CFG_PATH, "w", encoding="utf-8") as f:
         json.dump(cfg, f, ensure_ascii=False, indent=2)
     print("\n" + "=" * 54)
     print("  ✅ 설정 완료! config.json 저장됨")
-    print("  이제 'run_bot.bat' 으로 봇을 켜세요.")
+    print("  이제 '핑퐁시작.bat'으로 열고 브라우저 안내를 따라가세요.")
     print("=" * 54)
 
 if __name__ == "__main__":

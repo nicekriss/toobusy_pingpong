@@ -340,6 +340,34 @@ def infer_type(wf):
     return "image"
 
 
+def infer_agent_description(name, wtype, image_nodes=None, workflow_file=""):
+    """Give the planner a useful description without adding another setup question."""
+    label = str(name or "custom workflow")
+    source = f"{label} {workflow_file}".lower()
+    if wtype == "video":
+        purpose = "참조 사진이나 장면 설명을 짧은 영상으로 만드는"
+    elif wtype == "audio":
+        purpose = "분위기와 가사 설명으로 음악을 만드는"
+    elif image_nodes:
+        purpose = "참조 사진을 바탕으로 이미지를 편집하거나 변형하는"
+    else:
+        purpose = "텍스트 설명으로 이미지를 만드는"
+    hints = []
+    for key, hint in (
+        ("canny", "윤곽선과 구도를 유지"),
+        ("sketch", "스케치 기반 변환"),
+        ("refsheet", "캐릭터 레퍼런스 시트"),
+        ("identity", "인물 정체성 유지"),
+        ("edit", "이미지 편집"),
+        ("hires", "고해상도 결과"),
+        ("turbo", "빠른 생성"),
+    ):
+        if key in source:
+            hints.append(hint)
+    suffix = f". 특징: {', '.join(hints)}" if hints else ""
+    return f"{label}: {purpose} 커스텀 워크플로{suffix}"
+
+
 def _comfy_api():
     try:
         return json.loads(CONFIG.read_text(encoding="utf-8")).get("comfy_api", "http://127.0.0.1:8188").rstrip("/")
@@ -584,11 +612,14 @@ def main():
     if image_nodes:
         print("   사진 입력 칸       : ✓ 있음 (사진 넣는 워크플로 같아요)")
 
+    agent_description = infer_agent_description(name, wtype, image_nodes, dest.name)
     spec = {
         "file": "workflows/" + dest.name,
         "trigger": trigger,
         "type": wtype,
         "llm": llm,
+        "agent_enabled": True,
+        "agent_description": agent_description,
         "prompt_nodes": prompt_nodes,
         "seed_nodes": seed_nodes,
         "prefix_node": prefix_node,
@@ -676,6 +707,7 @@ def main():
     print("✅ 등록 완료!")
     print(f"   이름   : {name}")
     print(f"   명령어 : {trigger}")
+    print(f"   에이전트: 자동 등록됨 — {agent_description}")
     print("👉 대시보드를 새로고침(Ctrl+Shift+R)하면")
     print("   '⚔️ 모델비교' 목록과 봇 메뉴에 바로 떠요.")
     print("=" * 58)

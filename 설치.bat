@@ -27,11 +27,12 @@ if errorlevel 1 (
   exit /b 1
 )
 
-echo [2/2] Starting config wizard...
-echo.
-"%~dp0.venv\Scripts\python.exe" setup.py
-echo.
-echo [check] Running install health check...
-"%~dp0.venv\Scripts\python.exe" healthcheck.py
-echo.
-pause
+echo [2/2] Preparing the browser setup...
+"%~dp0.venv\Scripts\python.exe" -c "from onboarding import ensure_config; ensure_config()"
+if errorlevel 1 (
+  echo [!] Could not create the first-run configuration.
+  pause
+  exit /b 1
+)
+echo [OK] Opening Ping-Pong. Follow the browser guide.
+call "%~dp0run_bot.bat"

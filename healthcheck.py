@@ -149,11 +149,17 @@ def check_config(rep):
         cfg = {}
     else:
         rep.ok("config.json 읽기 성공")
-    for key in ("telegram_token", "telegram_chat_id", "llm_model"):
-        if cfg.get(key):
-            rep.ok(f"config.{key} 설정됨")
+    if cfg.get("telegram_enabled", bool(cfg.get("telegram_token") and cfg.get("telegram_chat_id"))):
+        if cfg.get("telegram_token") and cfg.get("telegram_chat_id"):
+            rep.ok("텔레그램 연결 설정됨")
         else:
-            rep.warn(f"config.{key} 비어 있음")
+            rep.warn("텔레그램을 켰지만 토큰 또는 chat ID가 비어 있음")
+    else:
+        rep.info("텔레그램 꺼짐 (선택 기능 · 브라우저 사용 가능)")
+    if cfg.get("llm_model"):
+        rep.ok("요청 정리용 LM Studio 모델 설정됨")
+    else:
+        rep.info("LM Studio 모델 미선택 (직접 생성은 사용 가능, 에이전트 정리는 제한됨)")
     return cfg, example
 
 

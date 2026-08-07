@@ -1,0 +1,48 @@
+{
+  "schema": 1,
+  "release": "0.3.0",
+  "published_at": "2026-08-01",
+  "patches": [
+    {
+      "id": "agent-intent-router-v1",
+      "kind": "feature",
+      "title": "자연어 제작 에이전트",
+      "summary": "워크플로를 직접 고르지 않아도 요청을 정리하고 알맞은 생성 기능을 선택합니다.",
+      "requires_restart": true,
+      "config_defaults": {
+        "agent_default": true,
+        "agent_confirmation": "always",
+        "agent_auto_confidence": 0.9
+      }
+    },
+    {
+      "id": "browser-first-onboarding-v1",
+      "kind": "experience",
+      "title": "브라우저 첫 실행 안내",
+      "summary": "텔레그램 없이 시작하고 PC에서 준비된 생성 기능을 자동으로 확인합니다.",
+      "requires_restart": true
+    },
+    {
+      "id": "optional-voice-input-v1",
+      "kind": "optional",
+      "title": "선택형 음성 입력",
+      "summary": "Faster-Whisper가 설치된 경우 텔레그램 음성 요청을 자연어 작업으로 연결합니다.",
+      "requires_restart": true,
+      "config_defaults": {
+        "agent_whisper_exe": "",
+        "agent_whisper_model": "medium",
+        "agent_whisper_timeout": 240
+      }
+    },
+    {
+      "id": "browser-agent-v1",
+      "kind": "feature",
+      "title": "브라우저 제작 에이전트",
+      "summary": "텔레그램 없이 대시보드에서 자연어 계획, 첨부, 실행 확인, 결과 후속 수정을 이어갑니다.",
+      "requires_restart": true,
+      "config_defaults": {
+        "telegram_poll_timeout": 5
+      }
+    }
+  ]
+}

@@ -7,11 +7,6 @@ echo  ==========================================
 echo    Ping-Pong Gallery Dashboard
 echo  ==========================================
 echo.
-if not exist "config.json" (
-  echo [!] config.json was not found. Run install.bat first.
-  pause
-  exit /b 1
-)
 call "%~dp0ensure_venv.bat"
 if errorlevel 1 (
   pause
