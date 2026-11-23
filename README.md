@@ -10,9 +10,9 @@
 
 > **너무바쁜베짱이** 제작 · 코다 & 크룩스 🦗 · 무료 오픈소스
 
-[![핑퐁 소개 사이트](docs/pingpong-site.jpg)](https://pingpong.higgsfield.app)
+[![핑퐁 소개 사이트](docs/pingpong-site.jpg)](https://toobusy-pingpong.higgsfield.app)
 
-**소개 사이트:** https://pingpong.higgsfield.app (사이트의 사진·영상은 AI로 만든 이미지입니다)
+**소개 사이트:** https://toobusy-pingpong.higgsfield.app (사이트의 사진·영상은 AI로 만든 이미지입니다)
 
 한 줄로 요청하면 **로컬 LLM이 프롬프트를 짜고 → 자리를 비켜 주고 → ComfyUI가 VRAM을 통째로 써서 생성 → 결과를 보내 줍니다.** 다음 요청이 오면 LLM이 다시 올라옵니다.
 24GB 그래픽카드 한 장(RTX 3090급)에서 로컬 LLM과 ComfyUI가 **VRAM을 번갈아 쓰는(핑퐁)** 구조라 둘 다 무리 없이 돌아갑니다.
